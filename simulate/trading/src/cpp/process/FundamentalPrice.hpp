@@ -61,8 +61,8 @@ private:
     double m_hurst;
     std::normal_distribution<double> m_fractional_gaussian;
     double m_BH{};
-    void cholesky_step(int i);
-    double gamma_fn(int k, double H) const;
+    void cholesky_step(int64_t i);
+    double gamma_fn(int64_t k, double H) const;
     //end
     std::normal_distribution<double> m_jump;
     std::poisson_distribution<int> m_poisson;

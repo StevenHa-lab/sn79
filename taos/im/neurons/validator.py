@@ -252,7 +252,11 @@ if __name__ != "__mp_main__":
                             "sharpe_values": self.sharpe_values,
                             "unnormalized_scores": self.unnormalized_scores,
                             "trade_volumes" : self.trade_volumes,
-                            "deregistered_uids" : self.deregistered_uids
+                            "deregistered_uids" : self.deregistered_uids,
+                            "to_reward": list(getattr(self, "to_reward", [])),
+                            "to_reward_states": {
+                                ts: state for ts, state in getattr(self, "to_reward_states", {}).items()
+                            },
                         }, use_bin_type=True
                     )
                     file.write(packed_data)
@@ -396,6 +400,12 @@ if __name__ != "__mp_main__":
                         self.activity_factors[uid] = {k : v for k, v in self.activity_factors[uid].items() if k < self.simulation.book_count}
                 if reorg:
                     self._save_state()
+                if 'to_reward' in validator_state:
+                    self.to_reward = set(validator_state.get("to_reward", []))
+                    self.to_reward_states = {ts : state for ts, state in validator_state.get("to_reward_states", {}).items()}
+                    if getattr(self, "to_reward", None):
+                        bt.logging.info(f"Resuming {len(self.to_reward)} pending reward rounds after load...")
+                        self.resume_pending_rewards()
                 bt.logging.success(f"Loaded validator state.")
             else:
                 # If no state exists or the neuron.reset flag is set, re-initialize the validator state
@@ -459,7 +469,10 @@ if __name__ != "__mp_main__":
             self.last_state_time = None
             self.step_rates = []
             self.maintaining = False
-            self.rewarding = False
+            self.to_reward = set()
+            self.to_reward_states = {}
+            self.rewarding = set()
+            self.rewarded = set()
             self.reporting = False
             self.saving = False
             self.compressing = False
@@ -618,27 +631,99 @@ if __name__ != "__mp_main__":
                 else:
                     bt.logging.warning(f"Skipping reporting at step {self.step} ({duration_from_timestamp(self.simulation_timestamp)}) - still busy with previous report.")
 
-        def _reward(self, state : MarketSimulationStateUpdate):
-            # Calculate the rewards for the miner based on the latest simulation state.
+        def _reward(self, state):
+            """
+            Calculate and apply rewards for the given simulation state.
+            Only runs when all previous timestamps are completed.
+            Reports number of pending rounds.
+            """
+            timestamp = state.timestamp
+            duration = duration_from_timestamp(timestamp)
+
+            self.to_reward.add(timestamp)
+            bt.logging.debug(f"Reward request received for timestamp {timestamp}. "
+                            f"{len(self.to_reward)-1} pending before it.")
+            self.to_reward_states[timestamp] = msgpack.packb(state.model_dump(mode='json', warnings=False), use_bin_type=True)
+            if len(self.to_reward) >= 10:
+                self.pagerduty_alert(f"{len(self.to_reward)} Reward Calculations Pending!", details={"to_reward" : self.to_reward})
+
+            while True:
+                if sorted(list(self.to_reward))[0] == timestamp:
+                    break
+                bt.logging.debug(f"Waiting to reward timestamp {timestamp} "
+                                f"({list(self.to_reward).index(timestamp)} pending ahead)...")
+                time.sleep(0.2)
+
+            self.rewarding.add(timestamp)
+            bt.logging.debug(f"Starting reward round for timestamp {timestamp}. "
+                            f"{len(self.to_reward)-1} remaining in queue.")
+
             try:
-                bt.logging.info(f"Updating Agent Scores at Step {self.step} (Workers={self.config.scoring.sharpe.parallel_workers})...")
-                self.rewarding = True
+                bt.logging.info(f"Updating Agent Scores at Step {self.step} (Workers={self.config.scoring.sharpe.parallel_workers} | Pending={len(self.to_reward)-1})...")
                 start = time.time()
-                rewards = get_rewards(self, state)
-                bt.logging.debug(f"Agent Rewards Recalculated:\n{rewards}")
-                # Update the miner scores.
-                self.update_scores(rewards, self.metagraph.uids)
-                bt.logging.info(f"Agent Scores Updated ({time.time()-start:.4f}s)")
-                bt.logging.debug(f"{self.scores}")
+                rewards, updated = get_rewards(self, state)
+                if updated:
+                    bt.logging.debug(f"Agent Rewards Recalculated for {duration} ({time.time()-start:.4f}s):\n{rewards}")
+                    self.update_scores(rewards, self.metagraph.uids)
+                    bt.logging.info(f"Agent Scores Updated for {duration} ({time.time()-start:.4f}s)")
+                    bt.logging.debug(f"{self.scores}")
+                else:
+                    bt.logging.info(f"Agent Scores Data Updated for {duration} ({time.time()-start:.4f}s)")
             finally:
-                self.rewarding = False
+                self.rewarding.remove(timestamp)
+                self.rewarded.add(timestamp)
+                if timestamp in self.to_reward:
+                    self.to_reward.remove(timestamp)
+                if timestamp in self.to_reward_states:
+                    del self.to_reward_states[timestamp]
+                bt.logging.info(
+                    f"Completed rewarding for timestamp {timestamp}. "
+                    f"{len(self.to_reward)} pending remaining."
+                )
 
         def reward(self, state) -> None:
             """
             Update agent rewards and recalculate scores.
+            Ensures previous timestamps complete before current one starts.
             """
-            if not self.rewarding:
-                Thread(target=self._reward, args=(state,), daemon=True, name=f'reward_{self.step}').start()
+            timestamp = state.timestamp
+            if timestamp not in self.to_reward:
+                self.to_reward.add(timestamp)
+                self.to_reward_states[timestamp] = msgpack.packb(state.model_dump(mode='json', warnings=False), use_bin_type=True)
+            thread = Thread(target=self._reward, args=(state,), daemon=True, name=f'reward_{self.step}')
+            thread.start()
+            
+        def resume_pending_rewards(self) -> None:
+            """
+            Deserialize and resume all pending reward rounds from stored state data.
+            This should be called after load_state() completes.
+            """
+            if not getattr(self, "to_reward_states", None):
+                bt.logging.info("No pending reward states to resume.")
+                return
+
+            for timestamp in sorted(list(self.to_reward)):
+                try:
+                    raw_state = self.to_reward_states.get(timestamp)
+                    if not raw_state:
+                        bt.logging.warning(f"No serialized state found for pending timestamp {timestamp}, skipping.")
+                        continue
+
+                    # Deserialize back into MarketSimulationStateUpdate
+                    state_dict = msgpack.unpackb(raw_state, use_list=True, strict_map_key=False)
+                    state = MarketSimulationStateUpdate.parse_dict(state_dict)
+
+                    bt.logging.info(f"Resuming reward computation for timestamp {timestamp}...")
+                    thread = Thread(
+                        target=self._reward,
+                        args=(state,),
+                        daemon=True,
+                        name=f"resume_reward_{timestamp}",
+                    )
+                    thread.start()
+
+                except Exception as e:
+                    bt.logging.error(f"Failed to deserialize or resume reward for {timestamp}: {e}")
 
         async def handle_state(self, message : dict, state : MarketSimulationStateUpdate, receive_start : int) -> dict:
             # Every 1H of simulation time, check if there are any changes to the validator - if updates exist, pull them and restart.
@@ -687,9 +772,9 @@ if __name__ != "__mp_main__":
             # Process deregistration notices
             self.process_resets(state)
 
-            # Await state saving, rewarding and metagraph maintenance to complete before proceeding with next step
-            while self.rewarding or self.maintaining:
-                bt.logging.info(f"Waiting for {'rewarding' if self.rewarding else ''}{', ' if self.rewarding and self.maintaining else ''}{'maintaining' if self.maintaining else ''} to complete before querying...")
+            # Await metagraph maintenance to complete before proceeding with next step
+            while self.maintaining:
+                bt.logging.info(f"Waiting for maintaining to complete before querying...")
                 time.sleep(0.5)
 
             # Calculate latest rewards and update miner scores
@@ -722,7 +807,7 @@ if __name__ != "__mp_main__":
                     packed_data = mm.read(byte_size_req)
                 bt.logging.info(f"Retrieved State Update ({time.time() - receive_start}s)")
                 start = time.time()
-                result = msgpack.unpackb(packed_data, raw=False, use_list=False, strict_map_key=False)
+                result = msgpack.unpackb(packed_data, raw=False, use_list=True, strict_map_key=False)
                 bt.logging.info(f"Unpacked state update ({time.time() - start}s)")
                 return result, receive_start
 

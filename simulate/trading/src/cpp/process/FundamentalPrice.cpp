@@ -40,13 +40,14 @@ FundamentalPrice::FundamentalPrice(
 {
     m_updatePeriod = updatePeriod;
     m_value = m_X0;
-
-    Timestamp N = 86'400'000'000'000/updatePeriod;
+ 
+    const auto sim = dynamic_cast<Simulation*>(simulation);
+    Timestamp N = sim->duration()/updatePeriod;
     m_hurst = hurst;
     const double dtH = std::pow(N,-m_hurst);
-    m_L = Eigen::MatrixXd::Zero(N, N);
-    m_X = Eigen::VectorXd::Zero(N);
-    m_V.resize(N);
+    m_L = Eigen::MatrixXd::Zero(N + 2, N + 2);
+    m_X = Eigen::VectorXd::Zero(N + 2);
+    m_V.resize(N + 2);
     // random normal generator to initialize V
     // TODO seed
     std::mt19937 rng(std::random_device{}());
@@ -112,7 +113,7 @@ void FundamentalPrice::update(Timestamp timestamp)
         // Jump part
         m_dJ += m_poisson(m_rng)* m_jump(m_rng);
         //fBM
-        int step = m_t/m_dt;
+        int64_t step = timestamp/m_updatePeriod;
         cholesky_step(step);
         m_BH += m_X(step);
         const double fBM_comp =  m_epsilon*m_BH - (0.5*m_epsilon*m_epsilon *std::pow(m_t,2*m_hurst));
@@ -125,7 +126,7 @@ void FundamentalPrice::update(Timestamp timestamp)
 }
 
 //-------------------------------------------------------------------------
-void FundamentalPrice::cholesky_step(int i)
+void FundamentalPrice::cholesky_step(int64_t i)
 {
     m_L(i, 0) = gamma_fn(i, m_hurst);
     m_V(i + 1) = m_fractional_gaussian(m_rng);
@@ -142,7 +143,7 @@ void FundamentalPrice::cholesky_step(int i)
     m_X(i) = m_L.row(i).head(i + 1).dot(m_V.head(i + 1));
 }
 //-------------------------------------------------------------------------
-double FundamentalPrice::gamma_fn(int k, double H) const
+double FundamentalPrice::gamma_fn(int64_t k, double H) const
 {
     return 0.5 * (std::pow(std::abs(k - 1), 2.0 * H)
                 - 2.0 * std::pow(std::abs(k), 2.0 * H)
@@ -198,7 +199,8 @@ std::unique_ptr<FundamentalPrice> FundamentalPrice::fromXML(
     };
 
     const auto updatePeriod = node.attribute("updatePeriod").as_ullong(1);
-    const float dt = updatePeriod / 86'400'000'000'000.0;
+    const auto sim = dynamic_cast<Simulation*>(simulation);
+    const float dt = (float) updatePeriod / sim->duration();
 
     auto getNonNegativeUint64Attribute = [&](pugi::xml_node node, const char* name) {
         pugi::xml_attribute attr = node.attribute(name);

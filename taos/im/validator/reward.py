@@ -24,7 +24,7 @@ import traceback
 import random
 import bittensor as bt
 import numpy as np
-from typing import Dict
+from typing import Dict, Tuple
 from taos.im.neurons.validator import Validator
 from taos.im.protocol import MarketSimulationStateUpdate, FinanceAgentResponse
 from taos.im.protocol.models import Account, Book, TradeInfo
@@ -177,7 +177,7 @@ def score_inventory_values(self, inventory_values):
                        for uid in self.metagraph.uids}
     return inventory_scores
 
-def reward(self: Validator, synapse: MarketSimulationStateUpdate) -> list[float]:
+def reward(self: Validator, synapse: MarketSimulationStateUpdate) -> Tuple[list[float], bool]:
     """
     Calculate and store the scores for a particular miner.
 
@@ -269,9 +269,13 @@ def reward(self: Validator, synapse: MarketSimulationStateUpdate) -> list[float]
                     
         except Exception as ex:
             bt.logging.error(f"Failed to update reward data for UID {uid} at step {self.step} : {traceback.format_exc()}")
-    
+
+    if synapse.timestamp % self.config.scoring.interval != 0:
+        return None, False
+
     inventory_scores = score_inventory_values(self, self.inventory_history)
-    return list(inventory_scores.values())
+    rewards = list(inventory_scores.values())
+    return rewards, True
 
 def distribute_rewards(self: Validator, rewards: torch.FloatTensor):
     rng = np.random.default_rng(self.config.rewarding.seed)
@@ -281,7 +285,7 @@ def distribute_rewards(self: Validator, rewards: torch.FloatTensor):
     distributed_rewards = distribution * sorted_rewards
     return torch.gather(distributed_rewards, 0, sorted_indices.argsort())
 
-def get_rewards(self: Validator, synapse: MarketSimulationStateUpdate) -> torch.FloatTensor:
+def get_rewards(self: Validator, synapse: MarketSimulationStateUpdate) -> Tuple[torch.FloatTensor, bool]:
     """
     Returns a tensor of rewards for the given query and responses.
 
@@ -292,7 +296,11 @@ def get_rewards(self: Validator, synapse: MarketSimulationStateUpdate) -> torch.
     Returns:
         torch.FloatTensor: A tensor of rewards for the given query and responses.
     """
-    return distribute_rewards(self, torch.FloatTensor(reward(self, synapse)).to(self.device))
+    rewards, updated = reward(self, synapse)
+    if updated:
+        return distribute_rewards(self, torch.FloatTensor(rewards).to(self.device)), True
+    else:
+        return None, False
 
 def set_delays(self: Validator, synapse_responses: dict[int, MarketSimulationStateUpdate]) -> list[FinanceAgentResponse]:
     """

@@ -273,10 +273,28 @@ class MarketSimulationStateUpdate(SimulationStateUpdate):
     def parse_dict(cls, data):
         start = time.time()
         ret = MarketSimulationStateUpdate(timestamp=data['timestamp'])
-        object.__setattr__(ret, "books", data.get("books", {}))
-        object.__setattr__(ret, "accounts", data.get("accounts", {}))
-        object.__setattr__(ret, "accounts", data.get("accounts", {}))
-        object.__setattr__(ret, "notices", data.get("notices", {}))        
+
+        def normalize_int_keys(d):
+            """Recursively convert string keys that look like integers to int keys."""
+            if not isinstance(d, dict) or not d:
+                return d
+            new_dict = {}
+            for k, v in d.items():
+                key = int(k) if isinstance(k, str) and k.isdigit() else k
+                if isinstance(v, dict):
+                    new_dict[key] = normalize_int_keys(v)
+                else:
+                    new_dict[key] = v
+            return new_dict
+
+        books = normalize_int_keys(data.get("books", {}))
+        accounts = normalize_int_keys(data.get("accounts", {}))
+        notices = normalize_int_keys(data.get("notices", {}))
+
+        object.__setattr__(ret, "books", books)
+        object.__setattr__(ret, "accounts", accounts)
+        object.__setattr__(ret, "notices", notices)
+
         bt.logging.info(f"Parsed state dict ({time.time() - start:.4f}s)")
         return ret
 

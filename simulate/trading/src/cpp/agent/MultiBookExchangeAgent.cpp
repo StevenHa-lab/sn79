@@ -1343,10 +1343,6 @@ void MultiBookExchangeAgent::handleLocalPlaceMarketOrder(Message::Ptr msg)
 
 void MultiBookExchangeAgent::handleLocalPlaceLimitOrder(Message::Ptr msg)
 {
-    if (msg->source == "STYLIZED_TRADER_AGENT_134") {
-        fmt::println("{}", taosim::json::jsonSerializable2str(msg));
-    }
-
     const auto& payload = std::dynamic_pointer_cast<PlaceOrderLimitPayload>(msg->payload);
 
     if (m_replayLog) {
@@ -1374,10 +1370,6 @@ void MultiBookExchangeAgent::handleLocalPlaceLimitOrder(Message::Ptr msg)
             "Invalid Limit Order Placement by Local Agent - {} : {}",
             orderResult.ec,
             taosim::json::jsonSerializable2str(payload));
-        if (msg->source == "STYLIZED_TRADER_AGENT_134") {
-            fmt::println("Invalid Limit Order Placement by Local Agent - {}", orderResult.ec);
-            exit(1);
-        }
         if (m_replayMode && !simulation()->isReplacedAgent(msg->source)) return;
         return fastRespondToMessage(
             msg,

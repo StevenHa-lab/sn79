@@ -160,7 +160,12 @@ struct pack<taosim::simulation::serialization::ValidatorRequest>
 
                 const auto& buyQueue = book->buyQueue();
                 o.pack("b"s);
-                o.pack_array(maxDepth);
+                o.pack_array(std::min(buyQueue.size(), maxDepth));
+                if (buyQueue.size() < maxDepth) [[unlikely]] {
+                    fmt::println(
+                        "Book {} buy side level count ({}) less than maxDepth ({})",
+                        bookIdCanon, buyQueue.size(), maxDepth);
+                }
                 for (const auto& level : buyQueue | views::reverse | views::take(detailedDepth)) {
                     packLevel(o, level);
                 }
@@ -174,7 +179,12 @@ struct pack<taosim::simulation::serialization::ValidatorRequest>
     
                 const auto& sellQueue = book->sellQueue();
                 o.pack("a"s);
-                o.pack_array(maxDepth);
+                o.pack_array(std::min(sellQueue.size(), maxDepth));
+                if (sellQueue.size() < maxDepth) [[unlikely]] {
+                    fmt::println(
+                        "Book {} sell side level count ({}) less than maxDepth ({})",
+                        bookIdCanon, sellQueue.size(), maxDepth);
+                }
                 for (const auto& level : sellQueue | views::take(detailedDepth)) {
                     packLevel(o, level);
                 }

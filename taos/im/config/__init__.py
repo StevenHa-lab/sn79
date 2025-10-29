@@ -108,6 +108,13 @@ def add_im_validator_args(cls, parser):
     )
     
     parser.add_argument(
+        "--scoring.interval",
+        type=int,
+        help="The simulation time interval at which reward calculation is executed.",
+        default=5_000_000_000,
+    )
+    
+    parser.add_argument(
         "--scoring.max_instructions_per_book",
         type=int,
         help="Maximum number of instructions that can be submitted by miners for each book in a single response.",
