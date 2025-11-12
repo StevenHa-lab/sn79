@@ -36,42 +36,39 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 class DendriteManager:
     @staticmethod
-    async def configure_session(validator):
-        if validator.dendrite._session and not validator.dendrite._session.closed:
-            try:
-                await validator.dendrite._session.close()
-            except Exception:
-                pass
+    def configure_session(validator):
+        if not validator.dendrite._session or validator.dendrite._session.closed:
+            connector = aiohttp.TCPConnector(
+                ssl=False,
+                limit=0,
+                limit_per_host=0,
+                ttl_dns_cache=300,
+                enable_cleanup_closed=True,
+            )
 
-        connector = aiohttp.TCPConnector(
-            ssl=False,
-            limit=0,
-            limit_per_host=0,
-            ttl_dns_cache=300,
-            enable_cleanup_closed=True,
-            force_close=True,
-        )
+            timeout = aiohttp.ClientTimeout(
+                total=validator.config.neuron.timeout,
+                connect=1.0,
+                sock_read=1.0,
+                sock_connect=1.0,
+            )
 
-        timeout = aiohttp.ClientTimeout(
-            total=validator.config.neuron.timeout,
-            connect=1.0,
-            sock_read=1.0,
-            sock_connect=1.0,
-        )
+            validator.dendrite._session = aiohttp.ClientSession(
+                connector=connector,
+                timeout=timeout,
+                skip_auto_headers={'User-Agent'},
+            )
+            bt.logging.debug("Created new aiohttp session")
+        else:
+            bt.logging.debug("Reusing existing aiohttp session")
 
-        validator.dendrite._session = aiohttp.ClientSession(
-            connector=connector,
-            timeout=timeout,
-            skip_auto_headers={'User-Agent'},
-        )
-
-def validate_responses(self : Validator, synapses : dict[int, MarketSimulationStateUpdate]) -> None:
+def validate_responses(self: Validator, synapses: dict[int, MarketSimulationStateUpdate]) -> None:
     """
     Checks responses from miners for any attempts at invalid actions, and enforces limits on instruction counts
 
     Args:
         self (taos.im.neurons.validator.Validator): The intelligent markets simulation validator.
-        synapses (list[taos.im.protocol.MarketSimulationStateUpdate]): The synapses with attached agent responses to be validated.
+        synapses (dict[int, MarketSimulationStateUpdate]): The synapses with attached agent responses to be validated.
     Returns:
         None
     """
@@ -80,6 +77,7 @@ def validate_responses(self : Validator, synapses : dict[int, MarketSimulationSt
     success = 0
     timeouts = 0
     failures = 0
+    volume_cap = round(self.config.scoring.activity.capital_turnover_cap * self.simulation.miner_wealth, self.simulation.volumeDecimals)
     for uid, synapse in synapses.items():
         valid_instructions = []
         if synapse.is_timeout:
@@ -105,8 +103,10 @@ def validate_responses(self : Validator, synapses : dict[int, MarketSimulationSt
                 bt.logging.warning(f"Invalid response submitted by agent {uid} (Mismatched Agent Ids) : {synapse.response}")
                 synapse.response = None
                 continue
-            volume_cap =  round(self.config.scoring.activity.capital_turnover_cap * (self.simulation.miner_wealth), self.simulation.volumeDecimals)
-            miner_volumes = {book_id : round(sum(book_volume['total'].values()), self.simulation.volumeDecimals) for book_id, book_volume in self.trade_volumes[uid].items()}
+            miner_volumes = {}
+            for book_id in range(self.simulation.book_count):
+                cache_key = (uid, book_id)
+                miner_volumes[book_id] = self.volume_sums.get(cache_key, 0.0)            
             for instruction in synapse.response.instructions:
                 try:
                     if instruction.agentId != uid or instruction.type == 'RESET_AGENT':
@@ -136,7 +136,12 @@ def validate_responses(self : Validator, synapses : dict[int, MarketSimulationSt
                 if instructions_per_book[instruction.bookId] <= self.config.scoring.max_instructions_per_book:
                     final_instructions.append(instruction)
             if len(final_instructions) < len(valid_instructions):
-                bt.logging.warning(f"Agent {uid} sent {len(valid_instructions)} instructions (Avg. {len(valid_instructions) / len(instructions_per_book)} / book), with more than {self.config.scoring.max_instructions_per_book} instructions on some books - excess instructions were dropped.  Final instruction count {len(final_instructions)}.")
+                bt.logging.warning(
+                    f"Agent {uid} sent {len(valid_instructions)} instructions "
+                    f"(Avg. {len(valid_instructions) / len(instructions_per_book):.2f} / book), "
+                    f"with more than {self.config.scoring.max_instructions_per_book} instructions on some books - "
+                    f"excess instructions were dropped. Final instruction count {len(final_instructions)}."
+                )
                 for book_id, count in instructions_per_book.items():
                     bt.logging.debug(f"Agent {uid} Book {book_id} : {count} Instructions")
             # Update the synapse response with only the validated instructions
@@ -179,41 +184,20 @@ async def forward(self: Validator, synapse: MarketSimulationStateUpdate) -> List
         List[FinanceAgentResponse] : Successfully validated responses generated by queried agents.
     """
     responses = []
+    if not hasattr(self, '_query_done_event'):
+        self._query_done_event = asyncio.Event()
+        self._query_done_event.set()
     if self.deregistered_uids != []:
         response = FinanceAgentResponse(agent_id=self.uid)
         response.reset_agents(agent_ids=self.deregistered_uids)
         responses.append(response)
 
     bt.logging.info(f"Querying Miners...")
-    session_start = time.time()
-    try:
-        await asyncio.wait_for(
-            DendriteManager.configure_session(self),
-            timeout=2.0
-        )
-        bt.logging.debug(f"Session configured ({time.time() - session_start:.4f}s)")
-    except asyncio.TimeoutError:
-        bt.logging.error(f"Session configuration timeout after 2s - abandoning old session and creating new")
-        connector = aiohttp.TCPConnector(
-            ssl=False,
-            limit=0,
-            limit_per_host=0,
-            ttl_dns_cache=300,
-            enable_cleanup_closed=True,
-            force_close=True,
-        )
-        timeout = aiohttp.ClientTimeout(
-            total=self.config.neuron.timeout,
-            connect=1.0,
-            sock_read=1.0,
-            sock_connect=1.0,
-        )
-        self.dendrite._session = aiohttp.ClientSession(
-            connector=connector,
-            timeout=timeout,
-            skip_auto_headers={'User-Agent'},
-        )
-        bt.logging.info(f"Emergency session created ({time.time() - session_start:.4f}s)")
+    self.querying = True
+
+    session_start = time.time()    
+    DendriteManager.configure_session(self)
+    bt.logging.debug(f"Session configured ({time.time() - session_start:.4f}s)")
 
     synapse_start = time.time()
     compress_start = time.time()
@@ -262,6 +246,8 @@ async def forward(self: Validator, synapse: MarketSimulationStateUpdate) -> List
 
     query_start = time.time()
     synapse_responses = {}
+    self._query_done_event.clear()
+    await asyncio.sleep(0)
 
     async def query_uid(uid):
         try:
@@ -289,7 +275,6 @@ async def forward(self: Validator, synapse: MarketSimulationStateUpdate) -> List
             )
             axon_synapses[uid].dendrite.status_code = 500
             return uid, axon_synapses[uid]
-
     # Create query tasks
     query_tasks = []
     for uid in range(len(self.metagraph.axons)):
@@ -306,7 +291,7 @@ async def forward(self: Validator, synapse: MarketSimulationStateUpdate) -> List
             pending_count = len(query_tasks) - done_count
             now = time.monotonic()
             if pending_count == 0:
-                bt.logging.info(f"Wait completed ({time.time() - query_start:.4f}s | {done_count} done | {pending_count} pending)")
+                bt.logging.debug(f"Wait completed ({time.time() - query_start:.4f}s | {done_count} done | {pending_count} pending)")
                 break
             if now >= global_deadline:
                 bt.logging.warning(f"Global timeout hit at {self.config.neuron.global_query_timeout}s; cancelling {pending_count} pending tasks")
@@ -333,7 +318,6 @@ async def forward(self: Validator, synapse: MarketSimulationStateUpdate) -> List
                 collected += 1
             except Exception as e:
                 bt.logging.debug(f"Task failed during collection: {e}")
-
     bt.logging.debug(f"Collected {collected} results ({time.time() - query_start:.4f}s)")
     cancelled_count = 0
     for task in query_tasks:
@@ -350,6 +334,7 @@ async def forward(self: Validator, synapse: MarketSimulationStateUpdate) -> List
     response_start = time.time()
     missing_count = 0
     for uid in range(len(self.metagraph.axons)):
+        await asyncio.sleep(0)
         if uid not in self.deregistered_uids and uid not in synapse_responses:
             axon_synapses[uid] = self.dendrite.preprocess_synapse_for_request(
                 self.metagraph.axons[uid],
@@ -364,19 +349,24 @@ async def forward(self: Validator, synapse: MarketSimulationStateUpdate) -> List
     bt.logging.info(f"Dendrite call completed ({query_time:.4f}s | "
                     f"Timeout {self.config.neuron.timeout}s / {self.config.neuron.global_query_timeout}s).")
     self.dendrite.synapse_history = self.dendrite.synapse_history[-10:]
+    
+    self.querying = False
+    self._query_done_event.set()
+    await asyncio.sleep(0)
 
     start = time.time()
     total_responses, total_instructions, success, timeouts, failures = validate_responses(self, synapse_responses)
     bt.logging.info(f"Validated Responses ({time.time()-start:.4f}s).")
-
+    await asyncio.sleep(0)
     start = time.time()
     update_stats(self, synapse_responses)
-    bt.logging.debug(f"Updated Stats ({time.time()-start:.4f}s).")
-
+    bt.logging.info(f"Updated Stats ({time.time()-start:.4f}s).")
+    await asyncio.sleep(0)
     start = time.time()
     responses.extend(set_delays(self, synapse_responses))
-    bt.logging.debug(f"Set Delays ({time.time()-start:.4f}s).")
+    bt.logging.info(f"Set Delays ({time.time()-start:.4f}s).")
     bt.logging.trace(f"Responses: {responses}")
+    await asyncio.sleep(0)
     bt.logging.info(f"Received {total_responses} valid responses containing {total_instructions} instructions "
                     f"({success} SUCCESS | {timeouts} TIMEOUTS | {failures} FAILURES).")
     return responses

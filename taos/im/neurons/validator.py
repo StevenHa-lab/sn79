@@ -27,7 +27,6 @@ if __name__ != "__mp_main__":
     import torch
     import traceback
     import xml.etree.ElementTree as ET
-    import pandas as pd
     import msgspec
     import math
     import shutil
@@ -43,14 +42,12 @@ if __name__ != "__mp_main__":
     import bittensor as bt
 
     import uvicorn
-    from typing import Tuple
+    from typing import Tuple, Dict
     from fastapi import FastAPI, APIRouter
     from fastapi import Request
-    from threading import Thread
+    from threading import Thread, Lock
     from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
-    from multiprocessing import Manager
 
-    import subprocess
     import psutil
     from git import Repo
     from pathlib import Path
@@ -59,6 +56,7 @@ if __name__ != "__mp_main__":
     from taos.common.neurons.validator import BaseValidatorNeuron
     from taos.im.utils import duration_from_timestamp
     from taos.im.utils.save import save_state_worker
+    from taos.im.utils.reward import get_inventory_value
 
     from taos.im.config import add_im_validator_args
     from taos.im.protocol.simulator import SimulatorResponseBatch
@@ -101,7 +99,7 @@ if __name__ != "__mp_main__":
             Maintains the metagraph and sets weights.
             This method is run in a separate thread to speed up processing.
             """
-            if not self.maintaining:
+            if not self.maintaining and self.last_state and self.last_state.timestamp % self.config.scoring.interval == 2_000_000_000:
                 Thread(target=self._maintain, args=(), daemon=True, name=f'maintain_{self.step}').start()
 
         def monitor(self) -> None:
@@ -221,19 +219,20 @@ if __name__ != "__mp_main__":
         async def _save_state(self) -> bool:
             """
             Asynchronously saves validator and simulation state to disk in a separate process.
-            
+
             Returns:
                 bool: True if save was successful, False otherwise
             """
-            if self.shared_state.saving:
+            if self.shared_state_saving:
                 bt.logging.warning(f"Skipping save at step {self.step} — previous save still running.")
                 return False
-            
-            self.shared_state.saving = True
-            
+
+            self.shared_state_saving = True
+            await asyncio.sleep(0)
+
             try:
                 bt.logging.debug("Preparing state for saving...")
-                
+
                 simulation_state_data = {
                     "start_time": self.start_time,
                     "start_timestamp": self.start_timestamp,
@@ -253,7 +252,8 @@ if __name__ != "__mp_main__":
                     "pending_notices": self.pending_notices,
                     "simulation.logDir": self.simulation.logDir,
                 }
-                
+                await asyncio.sleep(0)
+
                 validator_state_data = {
                     "step": self.step,
                     "simulation_timestamp": self.simulation_timestamp,
@@ -265,10 +265,14 @@ if __name__ != "__mp_main__":
                     "unnormalized_scores": self.unnormalized_scores,
                     "trade_volumes": self.trade_volumes,
                     "deregistered_uids": self.deregistered_uids,
+                    "volume_sums": self.volume_sums,
+                    "maker_volume_sums": self.maker_volume_sums,
+                    "taker_volume_sums": self.taker_volume_sums,
+                    "self_volume_sums": self.self_volume_sums,
                 }
-                
+                await asyncio.sleep(0)
                 bt.logging.info("Saving state...")
-                
+
                 result = await asyncio.get_running_loop().run_in_executor(
                     self.save_state_executor,
                     save_state_worker,
@@ -277,7 +281,7 @@ if __name__ != "__mp_main__":
                     self.simulation_state_file,
                     self.validator_state_file
                 )
-                
+
                 if result['success']:
                     bt.logging.success(
                         f"Simulation state saved to {self.simulation_state_file} "
@@ -294,28 +298,30 @@ if __name__ != "__mp_main__":
                     if result.get('traceback'):
                         bt.logging.debug(result['traceback'])
                     self.pagerduty_alert(
-                        f"Failed to save state: {result['error']}", 
+                        f"Failed to save state: {result['error']}",
                         details={"trace": result.get('traceback')}
                     )
                     return False
-                    
+
             except Exception as ex:
                 bt.logging.error(f"Error preparing state for save: {ex}")
                 bt.logging.debug(traceback.format_exc())
                 self.pagerduty_alert(
-                    f"Failed to prepare state for save: {ex}", 
+                    f"Failed to prepare state for save: {ex}",
                     details={"trace": traceback.format_exc()}
                 )
                 return False
             finally:
-                self.shared_state.saving = False
+                self.shared_state_saving = False
 
         def save_state(self) -> None:
             """
             Synchronous wrapper for save_state that schedules it on the event loop.
             """
-            if self.shared_state.saving:
+            if self.shared_state_saving:
                 bt.logging.warning(f"Skipping save at step {self.step} — previous save still running.")
+                return
+            if not self.last_state or self.last_state.timestamp % self.config.scoring.interval != 4_000_000_000:
                 return
             try:
                 loop = asyncio.get_event_loop()
@@ -325,6 +331,66 @@ if __name__ != "__mp_main__":
                     loop.run_until_complete(self._save_state())
             except RuntimeError:
                 asyncio.run(self._save_state())
+
+        def _save_state_sync(self):
+            """
+            Direct synchronous save without using executor.
+            Used as fallback when executors are shut down.
+            """
+            try:
+                bt.logging.info("Saving state (sync)...")
+
+                # Prepare state data
+                simulation_state_data = {
+                    "start_time": self.start_time,
+                    "start_timestamp": self.start_timestamp,
+                    "step_rates": self.step_rates,
+                    "initial_balances": self.initial_balances,
+                    "recent_trades": {
+                        book_id: [t.model_dump(mode="json") for t in trades]
+                        for book_id, trades in self.recent_trades.items()
+                    },
+                    "recent_miner_trades": {
+                        uid: {
+                            book_id: [[t.model_dump(mode="json"), r] for t, r in trades]
+                            for book_id, trades in uid_trades.items()
+                        }
+                        for uid, uid_trades in self.recent_miner_trades.items()
+                    },
+                    "pending_notices": self.pending_notices,
+                    "simulation.logDir": self.simulation.logDir,
+                }
+
+                validator_state_data = {
+                    "step": self.step,
+                    "simulation_timestamp": self.simulation_timestamp,
+                    "hotkeys": self.hotkeys,
+                    "scores": [score.item() for score in self.scores],
+                    "activity_factors": self.activity_factors,
+                    "inventory_history": self.inventory_history,
+                    "sharpe_values": self.sharpe_values,
+                    "unnormalized_scores": self.unnormalized_scores,
+                    "trade_volumes": self.trade_volumes,
+                    "deregistered_uids": self.deregistered_uids,
+                }
+
+                # Call worker function directly (synchronously in main process)
+                result = save_state_worker(
+                    simulation_state_data,
+                    validator_state_data,
+                    self.simulation_state_file,
+                    self.validator_state_file
+                )
+
+                if result['success']:
+                    bt.logging.success(
+                        f"State saved directly: simulation ({result['simulation_save_time']:.4f}s), "
+                        f"validator ({result['validator_save_time']:.4f}s)"
+                    )
+                else:
+                    bt.logging.error(f"Direct save failed: {result['error']}")
+            except Exception as ex:
+                bt.logging.error(f"Error in direct save: {ex}]\n{traceback.format_exc()}")
 
         def load_state(self) -> None:
             """Loads the state of the validator from a file."""
@@ -447,6 +513,10 @@ if __name__ != "__mp_main__":
                             self.activity_factors[uid][bookId] = 0.0
                     if len(self.activity_factors[uid]) > self.simulation.book_count:
                         self.activity_factors[uid] = {k : v for k, v in self.activity_factors[uid].items() if k < self.simulation.book_count}
+                self.volume_sums = validator_state.get('volume_sums', {})
+                self.maker_volume_sums = validator_state.get('maker_volume_sums', {})
+                self.taker_volume_sums = validator_state.get('taker_volume_sums', {})
+                self.self_volume_sums = validator_state.get('self_volume_sums', {})
                 if reorg:
                     self._save_state()
                 bt.logging.success(f"Loaded validator state.")
@@ -505,7 +575,6 @@ if __name__ != "__mp_main__":
         def cleanup_executors(self):
             """Clean up all executors and manager on shutdown"""
             executors = {
-                'executor': getattr(self, 'executor', None),
                 'reward_executor': getattr(self, 'reward_executor', None),
                 'report_executor': getattr(self, 'report_executor', None),
                 'save_state_executor': getattr(self, 'save_state_executor', None),
@@ -535,6 +604,7 @@ if __name__ != "__mp_main__":
             self._cleanup_done = True
             try:
                 self.cleanup_executors()
+                self._save_state_sync()
             except Exception as ex:
                 traceback.print_exc()
                 bt.logging.error(f"Error during cleanup: {ex}")
@@ -570,12 +640,13 @@ if __name__ != "__mp_main__":
 
             self.maintaining = False
             self.compressing = False
-            self.manager = Manager()
-            self.shared_state = self.manager.Namespace()
-            self.shared_state.rewarding = False
-            self.shared_state.reporting = False
-            self.shared_state.saving = False
-            self.executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="background")
+            self.querying = False
+            self._rewarding = False
+            self._saving = False
+            self._reporting = False
+            self._rewarding_lock = Lock()
+            self._saving_lock = Lock()
+            self._reporting_lock = Lock()
             self.reward_executor = ProcessPoolExecutor(max_workers=1)
             self.report_executor = ProcessPoolExecutor(max_workers=1)
             self.save_state_executor = ProcessPoolExecutor(max_workers=1)
@@ -584,6 +655,10 @@ if __name__ != "__mp_main__":
             atexit.register(self.cleanup)
 
             self.initial_balances_published = {uid : False for uid in range(self.subnet_info.max_uids)}
+            self.volume_sums = {}
+            self.maker_volume_sums = {}
+            self.taker_volume_sums = {}
+            self.self_volume_sums = {}
 
             self.load_simulation_config()
 
@@ -599,6 +674,36 @@ if __name__ != "__mp_main__":
             self.miner_stats = {uid : {'requests' : 0, 'timeouts' : 0, 'failures' : 0, 'rejections' : 0, 'call_time' : []} for uid in range(self.subnet_info.max_uids)}
             init_metrics(self)
             publish_info(self)
+
+        @property
+        def shared_state_rewarding(self):
+            with self._rewarding_lock:
+                return self._rewarding
+
+        @shared_state_rewarding.setter
+        def shared_state_rewarding(self, value):
+            with self._rewarding_lock:
+                self._rewarding = value
+
+        @property
+        def shared_state_saving(self):
+            with self._saving_lock:
+                return self._saving
+
+        @shared_state_saving.setter
+        def shared_state_saving(self, value):
+            with self._saving_lock:
+                self._saving = value
+
+        @property
+        def shared_state_reporting(self):
+            with self._reporting_lock:
+                return self._reporting
+
+        @shared_state_reporting.setter
+        def shared_state_reporting(self, value):
+            with self._reporting_lock:
+                self._reporting = value
 
         def load_fundamental(self):
             if self.simulation.logDir:
@@ -711,6 +816,11 @@ if __name__ != "__mp_main__":
                                 self.activity_factors[reset['a']] = {bookId : 0.0 for bookId in range(self.simulation.book_count)}
                                 self.inventory_history[reset['a']] = {}
                                 self.trade_volumes[reset['a']] = {bookId : {'total' : {}, 'maker' : {}, 'taker' : {}, 'self' : {}} for bookId in range(self.simulation.book_count)}
+                                for book_id in range(self.simulation.book_count):
+                                    self.volume_sums[(reset['a'], book_id)] = 0.0
+                                    self.maker_volume_sums[(reset['a'], book_id)] = 0.0
+                                    self.taker_volume_sums[(reset['a'], book_id)] = 0.0
+                                    self.self_volume_sums[(reset['a'], book_id)] = 0.0
                                 self.initial_balances[reset['a']] = {bookId : {'BASE' : None, 'QUOTE' : None, 'WEALTH' : None} for bookId in range(self.simulation.book_count)}
                                 self.initial_balances_published[reset['a']] = False
                                 self.deregistered_uids.remove(reset['a'])
@@ -719,22 +829,54 @@ if __name__ != "__mp_main__":
                         else:
                             self.pagerduty_alert(f"Failed to Reset Agent {reset['a']} : {reset['m']}")
 
+        async def wait_for(self, check_fn: callable, message: str, interval: float = 0.01):
+            """
+            Wait for a condition to become False.
+
+            Args:
+                check_fn: Callable that returns the condition to check
+                message: Log message to display while waiting
+                interval: Check interval in seconds
+            """
+            import time
+
+            if not check_fn():
+                return
+
+            start_time = time.time()
+            last_log_time = start_time
+
+            bt.logging.info(message)
+
+            while check_fn():
+                await asyncio.sleep(interval)
+
+                current_time = time.time()
+                elapsed = current_time - start_time
+
+                if current_time - last_log_time >= 1.0:
+                    bt.logging.info(f"{message} (waited {elapsed:.1f}s)")
+                    last_log_time = current_time
+
+            total_wait = time.time() - start_time
+            bt.logging.debug(f"Wait completed after {total_wait:.1f}s")
+
         def report(self) -> None:
             """
             Publish simulation metrics.
             """
-            if self.config.reporting.disabled:
+            if self.config.reporting.disabled or not self.last_state or self.last_state.timestamp % self.config.scoring.interval != 0:
                 return
-            if getattr(self, "reporting", False):
+            if getattr(self, "reporting", False) :
                 bt.logging.warning(f"Skipping reporting at step {self.step} — previous report still running.")
                 return
 
             async def run_report():
                 try:
-                    self.shared_state.reporting = True
+                    self.shared_state_reporting = True
                     await report(self)
                 finally:
-                    self.shared_state.reporting = False
+                    self.shared_state_reporting = False
 
             def thread_target():
                 loop = asyncio.new_event_loop()
@@ -747,114 +889,393 @@ if __name__ != "__mp_main__":
                 self.report_thread_executor = ThreadPoolExecutor(max_workers=1)
             self.report_thread_executor.submit(thread_target)
 
-        async def _reward(self, state):
+        async def _compute_compact_volumes(self) -> Dict:
+            """
+            Compute compact volume data for scoring.
+
+            Returns:
+                Dict: Compact volume data with lookback_volume and latest_volume per UID/book
+            """
+            lookback_threshold = self.simulation_timestamp - (
+                self.config.scoring.sharpe.lookback *
+                self.simulation.publish_interval
+            )
+
+            compact_volumes = {}
+            for uid in self.metagraph.uids:
+                uid_item = uid.item()
+                compact_volumes[uid_item] = {}
+
+                if uid_item in self.trade_volumes:
+                    for book_id, book_volume in self.trade_volumes[uid_item].items():
+                        total_trades = book_volume['total']
+                        if not total_trades:
+                            compact_volumes[uid_item][book_id] = {
+                                'lookback_volume': 0.0,
+                                'latest_volume': 0.0
+                            }
+                            continue
+                        timestamps = total_trades.keys()
+                        latest_time = max(timestamps)
+                        latest_volume = total_trades[latest_time]
+                        lookback_volume = sum(
+                            vol for t, vol in total_trades.items()
+                            if t >= lookback_threshold
+                        )
+                        compact_volumes[uid_item][book_id] = {
+                            'lookback_volume': lookback_volume,
+                            'latest_volume': latest_volume
+                        }
+                else:
+                    for book_id in range(self.simulation.book_count):
+                        compact_volumes[uid_item][book_id] = {
+                            'lookback_volume': 0.0,
+                            'latest_volume': 0.0
+                        }
+            return compact_volumes
+
+        async def _update_trade_volumes(self, state: MarketSimulationStateUpdate):
+            """
+            Update trade volumes with proper volume_sums maintenance for all roles.
+            """
+            total_start = time.time()
+
+            books = state.books
+            timestamp = state.timestamp
+            accounts = state.accounts
+            notices = state.notices
+
+            sampled_timestamp = math.ceil(
+                timestamp / self.config.scoring.activity.trade_volume_sampling_interval
+            ) * self.config.scoring.activity.trade_volume_sampling_interval
+
+            prune_threshold = timestamp - self.config.scoring.activity.trade_volume_assessment_period
+            volume_decimals = self.simulation.volumeDecimals
+            for bookId, book in books.items():
+                trades = [event for event in book['e'] if event['y'] == 't']
+                if trades:
+                    recent_trades_book = self.recent_trades[bookId]
+                    recent_trades_book.extend([TradeInfo.model_construct(**t) for t in trades])
+                    del recent_trades_book[:-25]
+            for uid in self.metagraph.uids:
+                uid_item = uid.item()
+                try:
+                    if uid_item not in self.trade_volumes:
+                        self.trade_volumes[uid_item] = {
+                            book_id: {'total': {}, 'maker': {}, 'taker': {}, 'self': {}}
+                            for book_id in range(self.simulation.book_count)
+                        }
+                    trade_volumes_uid = self.trade_volumes[uid_item]
+                    for book_id, role_trades in trade_volumes_uid.items():
+                        key = (uid_item, book_id)
+                        for role, trades in role_trades.items():
+                            if trades:
+                                pruned_volume = sum(
+                                    v for t, v in trades.items() if t < prune_threshold
+                                )
+                                if pruned_volume > 0:
+                                    if role == 'total':
+                                        current_sum = self.volume_sums.get(key, 0.0)
+                                        self.volume_sums[key] = round(
+                                            max(0.0, current_sum - pruned_volume),
+                                            volume_decimals
+                                        )
+                                    elif role == 'maker':
+                                        current_sum = self.maker_volume_sums.get(key, 0.0)
+                                        self.maker_volume_sums[key] = round(
+                                            max(0.0, current_sum - pruned_volume),
+                                            volume_decimals
+                                        )
+                                    elif role == 'taker':
+                                        current_sum = self.taker_volume_sums.get(key, 0.0)
+                                        self.taker_volume_sums[key] = round(
+                                            max(0.0, current_sum - pruned_volume),
+                                            volume_decimals
+                                        )
+                                    elif role == 'self':
+                                        current_sum = self.self_volume_sums.get(key, 0.0)
+                                        self.self_volume_sums[key] = round(
+                                            max(0.0, current_sum - pruned_volume),
+                                            volume_decimals
+                                        )
+                                trade_volumes_uid[book_id][role] = {
+                                    t: v for t, v in trades.items() if t >= prune_threshold
+                                }
+                    for book_id in range(self.simulation.book_count):
+                        if book_id not in trade_volumes_uid:
+                            trade_volumes_uid[book_id] = {
+                                'total': {}, 'maker': {}, 'taker': {}, 'self': {}
+                            }
+                        book_trade_volumes = trade_volumes_uid[book_id]
+                        if sampled_timestamp not in book_trade_volumes['total']:
+                            book_trade_volumes['total'][sampled_timestamp] = 0.0
+                            book_trade_volumes['maker'][sampled_timestamp] = 0.0
+                            book_trade_volumes['taker'][sampled_timestamp] = 0.0
+                            book_trade_volumes['self'][sampled_timestamp] = 0.0
+                    if uid_item in notices:
+                        trades = [notice for notice in notices[uid_item] if notice['y'] in ['EVENT_TRADE', "ET"]]
+                        if trades:
+                            recent_miner_trades_uid = self.recent_miner_trades[uid_item]
+                            volume_deltas = {
+                                'total': {},
+                                'maker': {},
+                                'taker': {},
+                                'self': {}
+                            }                            
+                            for trade in trades:
+                                is_maker = trade['Ma'] == uid_item
+                                is_taker = trade['Ta'] == uid_item
+                                book_id = trade['b']
+
+                                if is_maker:
+                                    recent_miner_trades_uid[book_id].append([TradeEvent.model_construct(**trade), "maker"])
+                                if is_taker:
+                                    recent_miner_trades_uid[book_id].append([TradeEvent.model_construct(**trade), "taker"])
+                                recent_miner_trades_uid[book_id] = recent_miner_trades_uid[book_id][-5:]
+
+                                book_volumes = trade_volumes_uid[book_id]
+                                trade_value = round(trade['q'] * trade['p'], volume_decimals)
+
+                                book_volumes['total'][sampled_timestamp] = round(
+                                    book_volumes['total'][sampled_timestamp] + trade_value,
+                                    volume_decimals
+                                )
+                                
+                                if book_id not in volume_deltas['total']:
+                                    volume_deltas['total'][book_id] = 0.0
+                                volume_deltas['total'][book_id] += trade_value
+
+                                if trade['Ma'] == trade['Ta']:
+                                    book_volumes['self'][sampled_timestamp] = round(
+                                        book_volumes['self'][sampled_timestamp] + trade_value,
+                                        volume_decimals
+                                    )
+                                    if book_id not in volume_deltas['self']:
+                                        volume_deltas['self'][book_id] = 0.0
+                                    volume_deltas['self'][book_id] += trade_value
+                                    
+                                elif is_maker:
+                                    book_volumes['maker'][sampled_timestamp] = round(
+                                        book_volumes['maker'][sampled_timestamp] + trade_value,
+                                        volume_decimals
+                                    )
+                                    if book_id not in volume_deltas['maker']:
+                                        volume_deltas['maker'][book_id] = 0.0
+                                    volume_deltas['maker'][book_id] += trade_value
+                                    
+                                elif is_taker:
+                                    book_volumes['taker'][sampled_timestamp] = round(
+                                        book_volumes['taker'][sampled_timestamp] + trade_value,
+                                        volume_decimals
+                                    )
+                                    if book_id not in volume_deltas['taker']:
+                                        volume_deltas['taker'][book_id] = 0.0
+                                    volume_deltas['taker'][book_id] += trade_value
+
+                            for book_id, delta in volume_deltas['total'].items():
+                                key = (uid_item, book_id)
+                                current_sum = self.volume_sums.get(key, 0.0)
+                                self.volume_sums[key] = round(
+                                    current_sum + delta,
+                                    volume_decimals
+                                )
+                            
+                            for book_id, delta in volume_deltas['maker'].items():
+                                key = (uid_item, book_id)
+                                current_sum = self.maker_volume_sums.get(key, 0.0)
+                                self.maker_volume_sums[key] = round(
+                                    current_sum + delta,
+                                    volume_decimals
+                                )
+                            
+                            for book_id, delta in volume_deltas['taker'].items():
+                                key = (uid_item, book_id)
+                                current_sum = self.taker_volume_sums.get(key, 0.0)
+                                self.taker_volume_sums[key] = round(
+                                    current_sum + delta,
+                                    volume_decimals
+                                )
+                            
+                            for book_id, delta in volume_deltas['self'].items():
+                                key = (uid_item, book_id)
+                                current_sum = self.self_volume_sums.get(key, 0.0)
+                                self.self_volume_sums[key] = round(
+                                    current_sum + delta,
+                                    volume_decimals
+                                )
+
+                    if uid_item in accounts:
+                        initial_balances_uid = self.initial_balances[uid_item]
+                        accounts_uid = accounts[uid_item]
+
+                        for bookId, account in accounts_uid.items():
+                            initial_balance_book = initial_balances_uid[bookId]
+                            if initial_balance_book['BASE'] is None:
+                                initial_balance_book['BASE'] = account['bb']['t']
+                            if initial_balance_book['QUOTE'] is None:
+                                initial_balance_book['QUOTE'] = account['qb']['t']
+                            if initial_balance_book['WEALTH'] is None:
+                                initial_balance_book['WEALTH'] = get_inventory_value(account, books[bookId])
+
+                        self.inventory_history[uid_item][timestamp] = {
+                            book_id: get_inventory_value(accounts_uid[book_id], book) - initial_balances_uid[book_id]['WEALTH']
+                            for book_id, book in books.items()
+                        }
+                    else:
+                        self.inventory_history[uid_item][timestamp] = {book_id: 0.0 for book_id in books}
+
+                    inventory_hist = self.inventory_history[uid_item]
+                    if len(inventory_hist) > self.config.scoring.sharpe.lookback:
+                        timestamps_to_keep = sorted(inventory_hist.keys())[-self.config.scoring.sharpe.lookback:]
+                        self.inventory_history[uid_item] = {
+                            ts: inventory_hist[ts] for ts in timestamps_to_keep
+                        }
+                except Exception as ex:
+                    bt.logging.error(f"Failed to update trade data for UID {uid_item}: {ex}")
+
+            total_time = time.time() - total_start
+            bt.logging.debug(f"[UPDATE_VOLUMES] Total: {total_time:.4f}s")
+            await asyncio.sleep(0)
+
+        async def _reward(self, state : MarketSimulationStateUpdate):
             """
             Calculate and apply rewards for the given simulation state.
             """
-            timestamp = state.timestamp
-            duration = duration_from_timestamp(timestamp)
-            self.shared_state.rewarding = True
-            try:
-                bt.logging.info(
-                    f"Updating Agent Scores at Step {self.step} "
-                    f"(Workers={self.config.scoring.sharpe.parallel_workers})..."
-                )
+            if not hasattr(self, "_reward_lock"):
+                self._reward_lock = asyncio.Lock()
+
+            start_wait = time.time()
+            async with self._reward_lock:
+                waited = time.time() - start_wait
+                if waited > 0:
+                    bt.logging.debug(f"Acquired reward lock after waiting {waited:.3f}s")
+                await asyncio.sleep(0)
+                bt.logging.debug("Waiting for query to complete before rewarding...")
+                start_query = time.time()
+                await self._query_done_event.wait()
+                bt.logging.debug(f"Querying complete after {time.time() - start_query}s, rewarding...")
+
+                self.shared_state_rewarding = True
+                await asyncio.sleep(0)
+
+                timestamp = state.timestamp
+                duration = duration_from_timestamp(timestamp)
+                bt.logging.info(f"Starting reward calculation for step {self.step}...")
                 start = time.time()
                 await asyncio.sleep(0)
-                validator_data = {
-                    'sharpe_values': self.sharpe_values,
-                    'activity_factors': self.activity_factors,
-                    'trade_volumes': self.trade_volumes,
-                    'config': {
-                        'scoring': {
-                            'sharpe': {
-                                'normalization_min': self.config.scoring.sharpe.normalization_min,
-                                'normalization_max': self.config.scoring.sharpe.normalization_max,
-                                'lookback': self.config.scoring.sharpe.lookback,
-                                'min_lookback': self.config.scoring.sharpe.min_lookback,
-                                'parallel_workers': self.config.scoring.sharpe.parallel_workers,
+
+                try:
+                    bt.logging.debug("[REWARD] Updating trade volumes...")
+                    update_start = time.time()
+                    await self._update_trade_volumes(state)
+                    bt.logging.debug(f"[REWARD] Trade volumes updated in {time.time()-update_start:.4f}s")
+                    if timestamp % self.config.scoring.interval != 0:
+                        bt.logging.info(f"Agent Scores Data Updated for {duration} ({time.time()-start:.4f}s)")
+                        return
+                    bt.logging.debug("[REWARD] Converting inventory history...")
+                    convert_start = time.time()
+                    inventory_compact = {}
+                    
+                    total_timestamps = 0
+                    for uid in self.metagraph.uids:
+                        uid_item = uid.item()
+                        if uid_item in self.inventory_history and len(self.inventory_history[uid_item]) > 0:
+                            hist = self.inventory_history[uid_item]
+                            lookback = min(self.config.scoring.sharpe.lookback, len(hist))
+                            sorted_timestamps = sorted(hist.keys())[-lookback:]
+                            inventory_compact[uid_item] = {ts: hist[ts] for ts in sorted_timestamps}
+                            total_timestamps += len(sorted_timestamps)
+                        else:
+                            inventory_compact[uid_item] = {}
+                    
+                    bt.logging.debug(f"[REWARD] Converted inventory history in {time.time()-convert_start:.4f}s")
+                    compact_start = time.time()
+                    compact_volumes = await self._compute_compact_volumes()
+                    bt.logging.debug(f"[REWARD] Computed compact volumes in {time.time()-compact_start:.4f}s")
+
+                    prep_start = time.time()
+                    validator_data = {
+                        'sharpe_values': self.sharpe_values,
+                        'activity_factors': self.activity_factors,
+                        'compact_volumes': compact_volumes,
+                        'inventory_history': inventory_compact,
+                        'config': {
+                            'scoring': {
+                                'sharpe': {
+                                    'normalization_min': self.config.scoring.sharpe.normalization_min,
+                                    'normalization_max': self.config.scoring.sharpe.normalization_max,
+                                    'lookback': self.config.scoring.sharpe.lookback,
+                                    'min_lookback': self.config.scoring.sharpe.min_lookback,
+                                    'parallel_workers': self.config.scoring.sharpe.parallel_workers,
+                                },
+                                'activity': {
+                                    'capital_turnover_cap': self.config.scoring.activity.capital_turnover_cap,
+                                    'trade_volume_sampling_interval': self.config.scoring.activity.trade_volume_sampling_interval,
+                                    'trade_volume_assessment_period': self.config.scoring.activity.trade_volume_assessment_period,
+                                },
+                                'interval': self.config.scoring.interval,
                             },
-                            'activity': {
-                                'capital_turnover_cap': self.config.scoring.activity.capital_turnover_cap,
-                                'trade_volume_sampling_interval': self.config.scoring.activity.trade_volume_sampling_interval,
-                                'trade_volume_assessment_period': self.config.scoring.activity.trade_volume_assessment_period,
+                            'rewarding': {
+                                'seed': self.config.rewarding.seed,
+                                'pareto': {
+                                    'shape': self.config.rewarding.pareto.shape,
+                                    'scale': self.config.rewarding.pareto.scale,
+                                }
                             },
-                            'interval': self.config.scoring.interval,
-                            'min_delay': self.config.scoring.min_delay,
-                            'max_delay': self.config.scoring.max_delay,
-                            'min_instruction_delay': self.config.scoring.min_instruction_delay,
-                            'max_instruction_delay': self.config.scoring.max_instruction_delay,
                         },
-                        'rewarding': {
-                            'seed': self.config.rewarding.seed,
-                            'pareto': {
-                                'shape': self.config.rewarding.pareto.shape,
-                                'scale': self.config.rewarding.pareto.scale,
-                            }
+                        'simulation_config': {
+                            'miner_wealth': self.simulation.miner_wealth,
+                            'publish_interval': self.simulation.publish_interval,
+                            'volumeDecimals': self.simulation.volumeDecimals,
+                            'grace_period': self.simulation.grace_period,
                         },
-                        'neuron': {
-                            'timeout': self.config.neuron.timeout,
-                        }
-                    },
-                    'simulation_config': {
-                        'miner_wealth': self.simulation.miner_wealth,
-                        'publish_interval': self.simulation.publish_interval,
-                        'volumeDecimals': self.simulation.volumeDecimals,
-                        'grace_period': self.simulation.grace_period,
-                        'time_unit': self.simulation.time_unit,
-                    },
-                    'reward_weights': self.reward_weights,
-                    'simulation_timestamp': self.simulation_timestamp,
-                    'uids': [uid.item() for uid in self.metagraph.uids],
-                    'deregistered_uids': self.deregistered_uids,
-                    'recent_trades': self.recent_trades,
-                    'inventory_history': self.inventory_history,
-                    'recent_miner_trades': self.recent_miner_trades,
-                    'initial_balances': self.initial_balances,
-                    'step': self.step,
-                    'device': self.device,
-                }
+                        'reward_weights': self.reward_weights,
+                        'simulation_timestamp': self.simulation_timestamp,
+                        'uids': [uid.item() for uid in self.metagraph.uids],
+                        'deregistered_uids': self.deregistered_uids,
+                        'device': self.device,
+                    }
+                    prep_time = time.time() - prep_start
+                    bt.logging.debug(f"[REWARD] Prepared validator_data in {prep_time:.4f}s")
+                    
+                    await asyncio.sleep(0)
+                    
+                    # Measure executor submission time (includes pickling)
+                    bt.logging.debug("[REWARD] Submitting to executor...")
+                    submit_start = time.time()
+                    
+                    loop = asyncio.get_running_loop()
+                    future = loop.run_in_executor(self.reward_executor, get_rewards, validator_data)
+                    
+                    submit_time = time.time() - submit_start
+                    bt.logging.debug(f"[REWARD] Submitted to executor in {submit_time:.4f}s")
 
-                synapse_data = {
-                    'books': state.books,
-                    'timestamp': state.timestamp,
-                    'accounts': state.accounts,
-                    'notices': state.notices,
-                }
+                    wait_start = time.time()
+                    while not future.done():
+                        await asyncio.sleep(0.1)
+                    wait_time = time.time() - wait_start
+                    bt.logging.debug(f"[REWARD] Executor finished after {wait_time:.4f}s")
+                    result_start = time.time()
+                    rewards, updated_data = future.result()
+                    bt.logging.debug(f"[REWARD] Retrieved result in {time.time() - result_start:.4f}s")
 
-                rewards, updated, updated_data = await asyncio.get_running_loop().run_in_executor(
-                    self.executor, get_rewards, validator_data, synapse_data
-                )
+                    self.sharpe_values = updated_data.get('sharpe_values', self.sharpe_values)
+                    self.activity_factors = updated_data.get('activity_factors', self.activity_factors)
+                    self.simulation_timestamp = updated_data.get('simulation_timestamp', self.simulation_timestamp)
 
-                self.recent_trades = updated_data['recent_trades']
-                self.inventory_history = updated_data['inventory_history']
-                self.trade_volumes = updated_data['trade_volumes']
-                self.recent_miner_trades = updated_data['recent_miner_trades']
-                self.initial_balances = updated_data['initial_balances']
-
-                if updated:
-                    self.sharpe_values = updated_data['sharpe_values']
-                    self.activity_factors = updated_data['activity_factors']
-                    self.simulation_timestamp = updated_data['simulation_timestamp']
-
-                await asyncio.sleep(0)
-
-                if updated:
-                    bt.logging.debug(
-                        f"Agent Rewards Recalculated for {duration} ({time.time()-start:.4f}s):\n{rewards}"
-                    )
+                    bt.logging.debug(f"Agent Rewards Recalculated for {duration} ({time.time()-start:.4f}s):\n{rewards}")
                     self.update_scores(rewards, self.metagraph.uids)
                     bt.logging.info(f"Agent Scores Updated for {duration} ({time.time()-start:.4f}s)")
-                else:
-                    bt.logging.info(f"Agent Scores Data Updated for {duration} ({time.time()-start:.4f}s)")
-            except Exception as ex:
-                bt.logging.error(f"Rewarding failed: {ex}")
-                bt.logging.debug(traceback.format_exc())
-            finally:
-                self.shared_state.rewarding = False
-                bt.logging.info(f"Completed rewarding for timestamp {timestamp}.")
 
-        def reward(self, state) -> None:
+                except Exception as ex:
+                    bt.logging.error(f"Rewarding failed: {ex}\n{traceback.format_exc()}")
+                finally:
+                    self.shared_state_rewarding = False
+                    await asyncio.sleep(0)
+                    bt.logging.debug(f"Completed rewarding (TOTAL {time.time()-start_wait:.4f}s).")            
+            await asyncio.sleep(0)
+
+        def reward(self, state : MarketSimulationStateUpdate) -> None:
             """
             Update agent rewards and recalculate scores.
             """
@@ -869,7 +1290,7 @@ if __name__ != "__mp_main__":
             start = time.time()
             for uid, accounts in state.accounts.items():
                 for book_id in accounts:
-                    state.accounts[uid][book_id]['v'] = round(sum([volume for volume in self.trade_volumes[uid][book_id]['total'].values()]), self.simulation.volumeDecimals)
+                    state.accounts[uid][book_id]['v'] = self.volume_sums.get((uid, book_id), 0.0)
             bt.logging.info(f"Volumes added to state ({time.time()-start:.4f}s).")
 
             # Update variables
@@ -906,15 +1327,6 @@ if __name__ != "__mp_main__":
 
             # Process deregistration notices
             self.process_resets(state)
-
-            # Await metagraph maintenance to complete before proceeding with next step
-            while self.maintaining:
-                bt.logging.info(f"Waiting for maintaining to complete before querying...")
-                time.sleep(0.5)
-
-            # Calculate latest rewards and update miner scores
-            self.maintain()
-            self.reward(state)
             # Forward state synapse to miners, populate response data to simulator object and serialize for returning to simulator.
             response = SimulatorResponseBatch(await forward(self, state)).serialize()
 
@@ -924,14 +1336,21 @@ if __name__ != "__mp_main__":
             bt.logging.info(f"RATE : {(self.step_rates[-1] if self.step_rates != [] else 0) / 1e9:.2f} STEPS/s | AVG : {(sum(self.step_rates) / len(self.step_rates) / 1e9 if self.step_rates != [] else 0):.2f}  STEPS/s")
             self.step_rates = self.step_rates[-10000:]
             self.last_state_time = time.time()
+
+            # Calculate latest rewards, update miner scores, save state and publish metrics
+            self.maintain()
+            self.reward(state)
+            await asyncio.sleep(0)
             self.save_state()
+            await asyncio.sleep(0)
             self.report()
+            await asyncio.sleep(0)
             bt.logging.info(f"State update handled ({time.time()-receive_start}s)")
 
             return response
 
         async def _listen(self):
-            def receive(mq_req) -> dict:
+            def receive(mq_req : posix_ipc.MessageQueue) -> dict:
                 msg, priority = mq_req.receive()
                 receive_start = time.time()
                 bt.logging.info(f"Received state update from simulator (msgpack)")
@@ -974,7 +1393,7 @@ if __name__ != "__mp_main__":
                             raise ex
                 return result, receive_start
 
-            def respond(response) -> dict:
+            def respond(response : dict) -> dict:
                 import random
                 self.last_response = response
                 packed_res = msgpack.packb(response, use_bin_type=True)
@@ -991,7 +1410,6 @@ if __name__ != "__mp_main__":
                 response = {"responses" : []}
                 try:
                     mq_req = posix_ipc.MessageQueue("/taosim-req", flags=posix_ipc.O_CREAT, max_messages=1, max_message_size=8)
-                    # This blocks until the queue can provide a message
                     message, receive_start = receive(mq_req)
                     state = MarketSimulationStateUpdate.parse_dict(message)
                     response = await self.handle_state(message, state, receive_start)

@@ -27,75 +27,57 @@ def sharpe(uid, inventory_values, lookback, norm_min, norm_max, min_lookback, gr
         num_values = len(inventory_values)
         if uid in deregistered_uids or num_values < min(min_lookback, lookback):
             return None
-        
-        # Pre-allocate result dictionary
-        sharpe_values = {'books': {}}
-        
-        # Extract inventory values and timestamps once
-        inv_items = list(inventory_values.items())
-        timestamps = [t for t, _ in inv_items]
-        book_ids = sorted(next(iter(inventory_values.values())).keys())
-        values_list = [[v[book_id] for book_id in book_ids] for _, v in inv_items]
-        
-        # Convert to numpy array (transposed for per-book access)
-        np_inventory_values = np.array(values_list).T
-        
-        # Calculate changeover indices once
+        timestamps = list(inventory_values.keys())
+        book_ids = list(next(iter(inventory_values.values())).keys())
+
+        np_inventory_values = np.array([
+            [inventory_values[ts][book_id] for book_id in book_ids]
+            for ts in timestamps
+        ], dtype=np.float64).T
         changeover_mask = None
         if grace_period > 0:
-            # Find indices where there's a grace period gap
-            changeover = []
-            for i in range(len(timestamps) - 1):
-                if timestamps[i + 1] >= timestamps[i] + grace_period:
-                    changeover.append(i)
+            ts_array = np.array(timestamps, dtype=np.int64)
+            time_diffs = np.diff(ts_array)
+            changeover_indices = np.where(time_diffs >= grace_period)[0]
             
-            if changeover:
-                # Create a boolean mask for efficient deletion
+            if len(changeover_indices) > 0:
                 changeover_mask = np.ones(len(timestamps) - 1, dtype=bool)
-                changeover_mask[changeover] = False
+                changeover_mask[changeover_indices] = False
+        returns = np.diff(np_inventory_values, axis=1)  # Shape: (num_books, num_timestamps-1)
         
-        # Calculate per-book Sharpe ratios
-        book_sharpes = []
-        for bookId, book_inventory_values in enumerate(np_inventory_values):
-            # Calculate returns
-            returns = np.diff(book_inventory_values)
-            
-            # Apply changeover mask if needed
-            if changeover_mask is not None:
-                returns = returns[changeover_mask]
-            
-            # Calculate Sharpe ratio
-            std = returns.std()
-            sharpe_val = np.sqrt(len(returns)) * (returns.mean() / std) if std != 0.0 else 0.0
-            
-            sharpe_values['books'][bookId] = sharpe_val
-            book_sharpes.append(sharpe_val)
-        
-        # Convert to numpy array for vectorized operations
-        all_sharpes = np.array(book_sharpes)
-        sharpe_values['average'] = all_sharpes.mean()
-        sharpe_values['median'] = np.median(all_sharpes)
-        
-        # Calculate total Sharpe ratio (sum across books)
-        # Use pre-computed values_list instead of reprocessing inventory_values
-        total_inventory_values = np.sum(np_inventory_values, axis=0)
-        returns = np.diff(total_inventory_values)
-        
-        # Apply changeover mask if needed
         if changeover_mask is not None:
-            returns = returns[changeover_mask]
+            returns = returns[:, changeover_mask]
+        means = returns.mean(axis=1)
+        stds = returns.std(axis=1)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            sharpe_ratios = np.where(
+                stds != 0.0,
+                np.sqrt(returns.shape[1]) * (means / stds),
+                0.0
+            )
+        sharpe_values = {
+            'books': {book_id: float(sharpe_ratios[i]) for i, book_id in enumerate(book_ids)}
+        }
+        sharpe_values['average'] = float(sharpe_ratios.mean())
+        sharpe_values['median'] = float(np.median(sharpe_ratios))
+        total_inventory = np_inventory_values.sum(axis=0)
+        total_returns = np.diff(total_inventory)
         
-        std = returns.std()
-        sharpe_values['total'] = np.sqrt(len(returns)) * (returns.mean() / std) if std != 0.0 else 0.0
+        if changeover_mask is not None:
+            total_returns = total_returns[changeover_mask]
         
-        # Normalize values
+        total_std = total_returns.std()
+        sharpe_values['total'] = float(
+            np.sqrt(len(total_returns)) * (total_returns.mean() / total_std)
+            if total_std != 0.0 else 0.0
+        )
+
         sharpe_values['normalized_average'] = normalize(norm_min, norm_max, sharpe_values['average'])
         sharpe_values['normalized_median'] = normalize(norm_min, norm_max, sharpe_values['median'])
-        sharpe_values['normalized_total'] = normalize(norm_min, norm_max, sharpe_values['total'])
-        
-        return sharpe_values
+        sharpe_values['normalized_total'] = normalize(norm_min, norm_max, sharpe_values['total'])        
+        return sharpe_values        
     except Exception as ex:
-        print(f"Failed to calculate Sharpe for UID {uid} : {traceback.format_exc()}")
+        print(f"Failed to calculate Sharpe for UID {uid}: {traceback.format_exc()}")
         return None
 
 
