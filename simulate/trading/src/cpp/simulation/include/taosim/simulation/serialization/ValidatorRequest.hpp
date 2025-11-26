@@ -422,6 +422,8 @@ struct pack<taosim::simulation::serialization::ValidatorRequest>
                 o.pack_map(4);
             } else if (msg->type == "EVENT_SIMULATION_END") {
                 o.pack_map(3);
+            } else {
+                o.pack_map(3);
             }
 
             auto abbreviate = [](const std::string& str) {

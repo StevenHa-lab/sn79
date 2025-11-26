@@ -84,6 +84,16 @@ private:
     bool m_disallowPublish{};
     bool m_useMessagePack{};
     std::unique_ptr<replay::ReplayManager> m_replayManager;
+    bool m_measureStepWallClockTime{};
+    struct {
+        using Measurement = decltype(std::chrono::high_resolution_clock::now());
+        std::optional<Measurement> t0parse;
+        std::optional<Measurement> t1parse;
+        std::optional<Measurement> t0proc;
+        std::optional<Measurement> t1proc;
+        std::optional<Measurement> t0state;
+        std::optional<Measurement> t1state;
+    } m_measurements;
 
     void setupLogDir(pugi::xml_node node);
 

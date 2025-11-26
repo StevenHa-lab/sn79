@@ -478,7 +478,8 @@ async def report(self: 'Validator') -> None:
                         self.wallet.hotkey.ss58_address, self.config.netuid, bookId, 0, "dynamic_taker_rate")
                 _set_if_changed(self.prometheus_book_gauges, DISMTR,
                         self.wallet.hotkey.ss58_address, self.config.netuid, bookId, 0, "maker_taker_ratio")
-
+        
+        await self.wait_for_event(self._query_done_event, "query", "publishing trade metrics")
         await self.wait_for(lambda: self.shared_state_rewarding, "Waiting for reward calculation to complete before computing metrics...")
         # --- Trades metrics ---
         if has_new_trades:

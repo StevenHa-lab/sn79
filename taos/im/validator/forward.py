@@ -62,7 +62,7 @@ class DendriteManager:
         else:
             bt.logging.debug("Reusing existing aiohttp session")
 
-def validate_responses(self: Validator, synapses: dict[int, MarketSimulationStateUpdate]) -> None:
+def validate_responses(self: Validator, synapses: dict[int, MarketSimulationStateUpdate]) -> tuple:
     """
     Checks responses from miners for any attempts at invalid actions, and enforces limits on instruction counts
 
@@ -70,16 +70,24 @@ def validate_responses(self: Validator, synapses: dict[int, MarketSimulationStat
         self (taos.im.neurons.validator.Validator): The intelligent markets simulation validator.
         synapses (dict[int, MarketSimulationStateUpdate]): The synapses with attached agent responses to be validated.
     Returns:
-        None
+        tuple: (total_responses, total_instructions, success, timeouts, failures)
     """
     total_responses = 0
     total_instructions = 0
     success = 0
     timeouts = 0
     failures = 0
-    volume_cap = round(self.config.scoring.activity.capital_turnover_cap * self.simulation.miner_wealth, self.simulation.volumeDecimals)
+    
+    # Pre-compute volume cap once
+    volume_cap = round(
+        self.config.scoring.activity.capital_turnover_cap * self.simulation.miner_wealth, 
+        self.simulation.volumeDecimals
+    )
+
+    book_count = self.simulation.book_count
+    max_instructions_per_book = self.config.scoring.max_instructions_per_book
+    
     for uid, synapse in synapses.items():
-        valid_instructions = []
         if synapse.is_timeout:
             timeouts += 1
             continue
@@ -88,68 +96,71 @@ def validate_responses(self: Validator, synapses: dict[int, MarketSimulationStat
             continue
         elif not synapse.is_success:
             failures += 1
-            bt.logging.warning(f"UID {uid} invalid state (not success/timeout/failure): {synapse.dendrite.status_message}")
+            bt.logging.warning(f"UID {uid} invalid state: {synapse.dendrite.status_message}")
             continue
         success += 1
-        if synapse.is_success:
+        if synapse.compressed:
             synapse.decompress()
-        if synapse.response:
             if synapse.compressed:
                 bt.logging.warning(f"Failed to decompress response for {uid}!")
                 synapse.response = None
                 continue
-            # If agents attempt to submit instructions for agent IDs other than their own, ignore these responses
-            if synapse.response.agent_id != uid:
-                bt.logging.warning(f"Invalid response submitted by agent {uid} (Mismatched Agent Ids) : {synapse.response}")
-                synapse.response = None
-                continue
-            miner_volumes = {}
-            for book_id in range(self.simulation.book_count):
-                cache_key = (uid, book_id)
-                miner_volumes[book_id] = self.volume_sums.get(cache_key, 0.0)            
-            for instruction in synapse.response.instructions:
-                try:
-                    if instruction.agentId != uid or instruction.type == 'RESET_AGENT':
-                        bt.logging.warning(f"Invalid instruction submitted by agent {uid} (Mismatched Agent Ids) : {instruction}")
-                        valid_instructions = []
-                        break
-                    if instruction.bookId >= self.simulation.book_count:
-                        bt.logging.warning(f"Invalid instruction submitted by agent {uid} (Invalid Book Id {instruction.bookId}) : {instruction}")
-                        continue
+        if not synapse.response:
+            bt.logging.debug(f"UID {uid} failed to respond: {synapse.dendrite.status_message}")
+            continue
+        # If agents attempt to submit instructions for agent IDs other than their own, ignore these responses
+        if synapse.response.agent_id != uid:
+            bt.logging.warning(f"Invalid response submitted by agent {uid} (Mismatched Agent Ids)")
+            synapse.response = None
+            continue
+        miner_volumes = {
+            book_id: self.volume_sums.get((uid, book_id), 0.0)
+            for book_id in range(book_count)
+        }
+        valid_instructions = []
+        instructions_per_book = {}
+        invalid_agent_id = False
+        for instruction in synapse.response.instructions:
+            try:
+                if instruction.agentId != uid or instruction.type == 'RESET_AGENT':
+                    bt.logging.warning(f"Invalid instruction submitted by agent {uid} (Mismatched Agent Ids)")
+                    invalid_agent_id = True
+                    break
+                if instruction.bookId >= book_count:
+                    bt.logging.warning(f"Invalid instruction submitted by agent {uid} (Invalid Book Id {instruction.bookId})")
+                    continue
                     # If a miner exceeds `capital_turnover_cap` times their initial wealth in trading volume over a single `trade_volume_assessment_period`, they are restricted from placing additional orders.
                     # Only cancellations may be submitted and processed by the miner until their volume on the specified book in the previous period is below the cap.
-                    if miner_volumes[instruction.bookId] >= volume_cap and instruction.type != "CANCEL_ORDERS":
-                        bt.logging.debug(f"Agent {uid} has reached their volume cap on book {instruction.bookId} : Traded {miner_volumes[instruction.bookId]} / {volume_cap}.")
-                        continue
-                    if instruction.type in ['PLACE_ORDER_MARKET', 'PLACE_ORDER_LIMIT'] and instruction.stp == STP.NO_STP:
-                        instruction.stp = STP.CANCEL_OLDEST
-                    valid_instructions.append(instruction)
-                except Exception as ex:
-                    bt.logging.warning(f"Error processing instruction submitted by agent {uid} : {ex}\n{instruction}")
-            final_instructions = []
-            # Enforce the configured limit on maximum submitted instructions (to prevent overloading simulator)
-            instructions_per_book = {}
-            for instruction in valid_instructions:
-                if hasattr(instruction, 'bookId') and instruction.bookId not in instructions_per_book:
+                if miner_volumes[instruction.bookId] >= volume_cap and instruction.type != "CANCEL_ORDERS":
+                    bt.logging.debug(f"Agent {uid} volume cap reached on book {instruction.bookId}: {miner_volumes[instruction.bookId]} / {volume_cap}")
+                    continue
+                if instruction.type in ['PLACE_ORDER_MARKET', 'PLACE_ORDER_LIMIT'] and instruction.stp == STP.NO_STP:
+                    instruction.stp = STP.CANCEL_OLDEST
+                if instruction.bookId not in instructions_per_book:
                     instructions_per_book[instruction.bookId] = 0
+                # Enforce the configured limit on maximum submitted instructions (to prevent overloading simulator)
                 instructions_per_book[instruction.bookId] += 1
-                if instructions_per_book[instruction.bookId] <= self.config.scoring.max_instructions_per_book:
-                    final_instructions.append(instruction)
-            if len(final_instructions) < len(valid_instructions):
-                bt.logging.warning(
-                    f"Agent {uid} sent {len(valid_instructions)} instructions "
-                    f"(Avg. {len(valid_instructions) / len(instructions_per_book):.2f} / book), "
-                    f"with more than {self.config.scoring.max_instructions_per_book} instructions on some books - "
-                    f"excess instructions were dropped. Final instruction count {len(final_instructions)}."
-                )
-                for book_id, count in instructions_per_book.items():
-                    bt.logging.trace(f"Agent {uid} Book {book_id} : {count} Instructions")
-            # Update the synapse response with only the validated instructions
-            synapse.response.instructions = final_instructions
+                if instructions_per_book[instruction.bookId] <= max_instructions_per_book:
+                    valid_instructions.append(instruction)
+            except Exception as ex:
+                bt.logging.warning(f"Error processing instruction by agent {uid}: {ex}\n{instruction}")
+        if invalid_agent_id:
+            valid_instructions = []
+        total_submitted = sum(instructions_per_book.values())
+        if len(valid_instructions) < total_submitted:
+            bt.logging.warning(
+                f"Agent {uid} sent {total_submitted} instructions "
+                f"(Avg. {total_submitted / len(instructions_per_book):.2f} / book), "
+                f"with more than {max_instructions_per_book} instructions on some books - "
+                f"excess instructions dropped. Final count: {len(valid_instructions)}"
+            )
+            for book_id, count in instructions_per_book.items():
+                bt.logging.trace(f"Agent {uid} Book {book_id}: {count} Instructions")
+        # Update the synapse response with only the validated instructions
+        synapse.response.instructions = valid_instructions
+        if valid_instructions:
             total_responses += 1
-            total_instructions += len(synapse.response.instructions)
-        else:
-            bt.logging.debug(f"UID {uid} failed to respond : {synapse.dendrite.status_message}")
+            total_instructions += len(valid_instructions)
     return total_responses, total_instructions, success, timeouts, failures
 
 def update_stats(self : Validator, synapses : dict[int, MarketSimulationStateUpdate]) -> None:
@@ -228,7 +239,6 @@ async def forward(self: Validator, synapse: MarketSimulationStateUpdate) -> List
                 engine=self.config.compression.engine,
                 compressed_books=compressed_books
             )
-
         axon_synapses = {uid: compress_axon_synapse(axon_synapses[uid]) for uid in range(len(self.metagraph.axons))}
     else:
         num_processes = self.config.compression.parallel_workers if self.config.compression.parallel_workers > 0 else multiprocessing.cpu_count() // 2
@@ -274,63 +284,50 @@ async def forward(self: Validator, synapse: MarketSimulationStateUpdate) -> List
             )
             axon_synapses[uid].dendrite.status_code = 500
             return uid, axon_synapses[uid]
+
     # Create query tasks
     query_tasks = []
     for uid in range(len(self.metagraph.axons)):
         if uid not in self.deregistered_uids:
             query_tasks.append(asyncio.create_task(query_uid(uid)))
 
-    bt.logging.debug(f"Created {len(query_tasks)} query tasks")
-    bt.logging.debug(f"Starting query collection")
-    global_deadline = time.monotonic() + self.config.neuron.global_query_timeout
-    poll_sleep = 0.002
-    try:
-        while True:
-            done_count = sum(1 for t in query_tasks if t.done())
-            pending_count = len(query_tasks) - done_count
-            now = time.monotonic()
-            if pending_count == 0:
-                bt.logging.debug(f"Wait completed ({time.time() - query_start:.4f}s | {done_count} done | {pending_count} pending)")
-                break
-            if now >= global_deadline:
-                bt.logging.warning(f"Global timeout hit at {self.config.neuron.global_query_timeout}s; cancelling {pending_count} pending tasks")
-                for t in query_tasks:
-                    if not t.done():
-                        try:
-                            t.cancel()
-                        except Exception:
-                            pass
-                break
-            await asyncio.sleep(poll_sleep)
-    except Exception as e:
-        bt.logging.error(f"Wait error at t={time.time() - query_start:.4f}s: {e}")
-    collect_deadline = time.time() + 0.05
-    collected = 0
-    for task in list(query_tasks):
-        if time.time() > collect_deadline:
-            bt.logging.warning(f"Collection deadline hit, stopping early")
-            break
-        if task.done():
-            try:
-                uid, response = task.result()
-                synapse_responses[uid] = response
-                collected += 1
-            except Exception as e:
-                bt.logging.debug(f"Task failed during collection: {e}")
-    bt.logging.debug(f"Collected {collected} results ({time.time() - query_start:.4f}s)")
-    cancelled_count = 0
-    for task in query_tasks:
-        if not task.done():
-            try:
-                task.cancel()
-                cancelled_count += 1
-            except Exception:
-                pass
+    bt.logging.info(f"Created {len(query_tasks)} query tasks, starting wait with {self.config.neuron.global_query_timeout}s timeout")
 
-    bt.logging.debug(f"Cancelling {cancelled_count} pending tasks")
-    bt.logging.debug(f"Starting cleanup phase at t={time.time() - query_start:.4f}s")
+    # Use asyncio.wait instead of wait_for + gather
+    done, pending = await asyncio.wait(
+        query_tasks,
+        timeout=self.config.neuron.global_query_timeout,
+        return_when=asyncio.ALL_COMPLETED
+    )
 
-    response_start = time.time()
+    bt.logging.info(f"Wait completed: {len(done)} done, {len(pending)} pending in {time.time()-query_start:.4f}s")
+
+    # Collect results from completed tasks
+    completed_count = 0
+    for task in done:
+        try:
+            uid, response = task.result()
+            synapse_responses[uid] = response
+            completed_count += 1
+        except Exception as e:
+            bt.logging.debug(f"Task failed: {e}")
+
+    bt.logging.info(f"Collected {completed_count} responses from done tasks")
+
+    # Cancel any pending tasks
+    if pending:
+        bt.logging.warning(f"Global timeout hit at {self.config.neuron.global_query_timeout}s; cancelling {len(pending)} pending tasks")
+        for task in pending:
+            task.cancel()
+
+    query_time = time.time() - query_start
+    bt.logging.info(f"Dendrite call completed ({query_time:.4f}s | "
+                    f"Timeout {self.config.neuron.timeout}s / {self.config.neuron.global_query_timeout}s). "
+                    f"Total responses collected: {len(synapse_responses)}")
+    
+    self.dendrite.synapse_history = self.dendrite.synapse_history[-10:]
+
+    # Fill in missing responses as timeouts
     missing_count = 0
     for uid in range(len(self.metagraph.axons)):
         if uid not in self.deregistered_uids and uid not in synapse_responses:
@@ -342,14 +339,9 @@ async def forward(self: Validator, synapse: MarketSimulationStateUpdate) -> List
             axon_synapses[uid].dendrite.status_code = 408
             synapse_responses[uid] = axon_synapses[uid]
             missing_count += 1
-    bt.logging.debug(f"Created {missing_count} timeout responses in {time.time() - response_start:.4f}s at t={time.time() - query_start:.4f}s")
-    query_time = time.time() - query_start
-    bt.logging.info(f"Dendrite call completed ({query_time:.4f}s | "
-                    f"Timeout {self.config.neuron.timeout}s / {self.config.neuron.global_query_timeout}s).")
-    self.dendrite.synapse_history = self.dendrite.synapse_history[-10:]
     
-    self.querying = False
-    self._query_done_event.set()
+    if missing_count > 0:
+        bt.logging.info(f"Filled in {missing_count} missing responses as timeouts")
 
     start = time.time()
     total_responses, total_instructions, success, timeouts, failures = validate_responses(self, synapse_responses)
@@ -363,6 +355,8 @@ async def forward(self: Validator, synapse: MarketSimulationStateUpdate) -> List
     bt.logging.trace(f"Responses: {responses}")
     bt.logging.info(f"Received {total_responses} valid responses containing {total_instructions} instructions "
                     f"({success} SUCCESS | {timeouts} TIMEOUTS | {failures} FAILURES).")
+    self.querying = False
+    self._query_done_event.set()
     return responses
 
 async def notify(self : Validator, notices : List[FinanceEventNotification]) -> None:

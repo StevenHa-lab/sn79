@@ -16,6 +16,7 @@
 #include <boost/uuid/uuid_io.hpp>
 #include <date/date.h>
 #include <date/tz.h>
+#include <fmt/chrono.h>
 #include <fmt/format.h>
 #include <msgpack.hpp>
 
@@ -337,6 +338,16 @@ void SimulationManager::publishStateMessagePack()
 
     if (now < m_gracePeriod || !online()) return;
 
+    auto getTime = [] {
+        return std::make_optional(std::chrono::high_resolution_clock::now());
+    };
+
+    if (m_measureStepWallClockTime && m_measurements.t0parse) {
+        const auto t = getTime();
+        m_measurements.t1proc = t;
+        m_measurements.t0state = t;
+    }
+
     taosim::serialization::HumanReadableStream stream{1uz << 27};
     const serialization::ValidatorRequest req{.mngr = this};
     msgpack::pack(stream, req);
@@ -349,6 +360,30 @@ void SimulationManager::publishStateMessagePack()
     shmReq.truncate(stream.size());
     bipc::mapped_region reqRegion{shmReq, bipc::read_write};
     std::memcpy(reqRegion.get_address(), stream.data(), stream.size());
+
+    if (m_measureStepWallClockTime && m_measurements.t0parse) {
+        const auto simuTimeDetails = representativeSimulation->time();
+        using namespace std::chrono;
+        const std::pair stepTimeSpan{
+            duration<Timestamp, std::nano>{simuTimeDetails.current - simuTimeDetails.step},
+            duration<Timestamp, std::nano>{simuTimeDetails.current}
+        };
+        const auto t = getTime();
+        m_measurements.t1state = t;
+        const auto total = duration<double>(
+            *m_measurements.t1state - *m_measurements.t0parse);
+        const auto parse = duration<double>(
+            *m_measurements.t1parse - *m_measurements.t0parse);
+        const auto proc = duration<double>(
+            *m_measurements.t1proc - *m_measurements.t0proc);
+        const auto state = duration<double>(
+            *m_measurements.t1state - *m_measurements.t0state);
+        fmt::println(
+            "PROCESSED {:%T} - {:%T} ({:.4f}s | PARSE {:.4f}s | PROC {:.4f}s | STATE {:.4f}s)",
+            duration_cast<seconds>(stepTimeSpan.first),
+            duration_cast<seconds>(stepTimeSpan.second),
+            total.count(), parse.count(), proc.count(), state.count());
+    }
 
     retryMessagePack:
 
@@ -367,6 +402,11 @@ void SimulationManager::publishStateMessagePack()
     if (!mqRecvSuccess) {
         fmt::println("Receive from /{} timed out, flushing and retrying...", s_validatorResMessageQueueName);
         goto retryMessagePack;
+    }
+
+    if (m_measureStepWallClockTime) {
+        const auto t = getTime();
+        m_measurements.t0parse = t;
     }
 
     bipc::shared_memory_object shmRes{
@@ -434,33 +474,50 @@ void SimulationManager::publishStateMessagePack()
         return msg;
     };
 
-    if (obj.type != msgpack::type::MAP || obj.via.map.size != 1) {
+    if (obj.type != msgpack::type::MAP) {
+        fmt::println("MAP type check failed for responses");
+        const auto t = getTime();
+        m_measurements.t1parse = t;
+        m_measurements.t0proc = t;
+        return;
+    }
+    if (obj.via.map.size != 1) {
+        fmt::println("MAP size == 1 check failed for responses");
+        const auto t = getTime();
+        m_measurements.t1parse = t;
+        m_measurements.t0proc = t;
         return;
     }
     const auto& val = obj.via.map.ptr[0].val;
-    if (val.type != msgpack::type::ARRAY || val.via.array.size == 0) {
+    if (val.type != msgpack::type::ARRAY) {
+        fmt::println("ARRAY type check failed for responses");
+        const auto t = getTime();
+        m_measurements.t1parse = t;
+        m_measurements.t0proc = t;
+        return;
+    }
+    if (val.via.array.size == 0) {
+        const auto t = getTime();
+        m_measurements.t1parse = t;
+        m_measurements.t0proc = t;
         return;
     }
     std::vector<Message::Ptr> unpackedResponses;
     size_t responseIdx{};
-    size_t errorCounter{};
     std::map<size_t, std::string> responseIdxToError;
     for (const auto& response : val.via.array) {
-        auto handleError = [&](auto&& e) {
-            responseIdxToError[responseIdx] = e.what();
-            ++errorCounter;
-        };
         try {
             unpackedResponses.push_back(unpackResponse(response));
         } catch (const std::exception& e) {
-            handleError(e);
+            responseIdxToError[responseIdx] = e.what();
         }
         ++responseIdx;
     }
-    if (errorCounter > 0) {
+    if (responseIdxToError.size() > 0) {
         rapidjson::Document json{rapidjson::kObjectType};
         auto& allocator = json.GetAllocator();
-        const auto errorRatio = static_cast<float>(errorCounter) / val.via.array.size;
+        const auto errorRatio =
+            static_cast<float>(responseIdxToError.size()) / val.via.array.size;
         json.AddMember(
             "messages",
             [&] {
@@ -499,6 +556,13 @@ void SimulationManager::publishStateMessagePack()
                 ))};
         }
     }
+
+    if (m_measureStepWallClockTime) {
+        const auto t = getTime();
+        m_measurements.t1parse = t;
+        m_measurements.t0proc = t;
+    }
+
     for (const auto& response : unpackedResponses) {
         const auto [msg, blockIdx] = decanonize(response, m_blockInfo.dimension);
         if (!blockIdx) {
@@ -810,6 +874,8 @@ std::unique_ptr<SimulationManager> SimulationManager::fromConfig(const fs::path&
         ipc::PosixMessageQueueDesc{.name = s_validatorResMessageQueueName.data()});
 
     mngr->m_useMessagePack = node.attribute("useMessagePack").as_bool();
+
+    mngr->m_measureStepWallClockTime = node.attribute("measureStepWallClockTime").as_bool();
 
     return mngr;
 }

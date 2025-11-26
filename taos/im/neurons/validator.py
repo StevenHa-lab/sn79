@@ -83,19 +83,21 @@ if __name__ != "__mp_main__":
             add_im_validator_args(cls, parser)
 
         async def wait_for_event(self, event: asyncio.Event, wait_process: str, run_process: str):
+            """Wait for event to complete."""
             if not event.is_set():
-                bt.logging.info(f"Waiting for {wait_process} to complete before {run_process}...")
+                bt.logging.debug(f"Waiting for {wait_process} to complete before {run_process}...")
                 start_wait = time.time()
                 while not event.is_set():
                     try:
-                        await asyncio.wait_for(event.wait(), timeout=1.0)
+                        await asyncio.wait_for(event.wait(), timeout=0.1)
                         break
                     except asyncio.TimeoutError:
+                        await asyncio.sleep(0)
                         elapsed = time.time() - start_wait
-                        bt.logging.info(f"Waiting for {wait_process} to complete before {run_process}... ({elapsed:.1f}s)")
-
+                        if int(elapsed) % 1 == 0:  # Every second
+                            bt.logging.debug(f"Still waiting for {wait_process}... ({elapsed:.1f}s)")                
                 total_wait = time.time() - start_wait
-                bt.logging.info(f"Completed {wait_process} after {total_wait:.1f}s, {run_process}...")
+                bt.logging.debug(f"Waited {total_wait:.1f}s for {wait_process}")
 
         async def _maintain(self) -> None:
             """
@@ -264,6 +266,7 @@ if __name__ != "__mp_main__":
             await self.wait_for_event(self._query_done_event, "query", "preparing state data")
 
             try:
+                bt.logging.info(f"Starting state saving for step {self.step}...")
                 start = time.time()
                 prep_start = time.time()
                 bt.logging.debug("Preparing state for saving...")
@@ -304,9 +307,9 @@ if __name__ != "__mp_main__":
                     "taker_volume_sums": self.taker_volume_sums,
                     "self_volume_sums": self.self_volume_sums,
                 }
-                bt.logging.info(f"Prepared save data ({time.time() - prep_start}s)")
+                bt.logging.debug(f"Prepared save data ({time.time() - prep_start}s)")
                 await self.wait_for_event(self._query_done_event, "query", "saving state")
-                bt.logging.info("Saving state...")
+                bt.logging.debug("Saving state...")
                 future_start = time.time()
 
                 future = asyncio.get_running_loop().run_in_executor(
@@ -320,7 +323,7 @@ if __name__ != "__mp_main__":
                 while not future.done():
                     await asyncio.sleep(0.1)
                 result = future.result()
-                bt.logging.info(f"Saved state ({time.time() - future_start}s)")
+                bt.logging.debug(f"Saved state ({time.time() - future_start}s)")
 
                 if result['success']:
                     bt.logging.success(
@@ -1379,7 +1382,6 @@ if __name__ != "__mp_main__":
             self.reward(state)
             self.save_state()
             self.report()
-            await asyncio.sleep(0)
             bt.logging.info(f"State update handled ({time.time()-receive_start}s)")
 
             return response
@@ -1406,7 +1408,7 @@ if __name__ != "__mp_main__":
                         else:
                             bt.logging.error(f"mmap read failed on all 5 attempts: {ex}")
                             self.pagerduty_alert(f"Failed to mmap read after 5 attempts : {ex}", details={"trace": traceback.format_exc()})
-                            raise ex
+                            return result, receive_start
                     finally:
                         if packed_data is not None or attempt >= 5:
                             shm_req.close_fd()
@@ -1425,7 +1427,7 @@ if __name__ != "__mp_main__":
                         else:
                             bt.logging.error(f"Msgpack unpack failed on all 5 attempts: {ex}")
                             self.pagerduty_alert(f"Failed to unpack simulator state after 5 attempts : {ex}", details={"trace": traceback.format_exc()})
-                            raise ex
+                            return result, receive_start
                 return result, receive_start
 
             def respond(response: dict) -> dict:
@@ -1449,14 +1451,15 @@ if __name__ != "__mp_main__":
                         t1 = time.time()
                         bt.logging.debug(f"[LISTEN] Starting receive at {t1:.3f}")
                         message, receive_start = await loop.run_in_executor(None, receive, mq_req)
-                        t2 = time.time()
-                        bt.logging.debug(f"[LISTEN] Received message in {t2-t1:.4f}s")
-                        state = MarketSimulationStateUpdate.parse_dict(message)
-                        t3 = time.time()
-                        bt.logging.debug(f"[LISTEN] Parsed state in {t3-t2:.4f}s")
-                        response = await self.handle_state(message, state, receive_start)
-                        t4 = time.time()
-                        bt.logging.debug(f"[LISTEN] handle_state completed in {t4-t3:.4f}s")
+                        if message:
+                            t2 = time.time()
+                            bt.logging.debug(f"[LISTEN] Received message in {t2-t1:.4f}s")
+                            state = MarketSimulationStateUpdate.parse_dict(message)
+                            t3 = time.time()
+                            bt.logging.debug(f"[LISTEN] Parsed state in {t3-t2:.4f}s")
+                            response = await self.handle_state(message, state, receive_start)
+                            t4 = time.time()
+                            bt.logging.debug(f"[LISTEN] handle_state completed in {t4-t3:.4f}s")
                     except Exception as ex:
                         traceback.print_exc()
                         self.pagerduty_alert(f"Exception in posix listener loop : {ex}", details={"trace": traceback.format_exc()})
