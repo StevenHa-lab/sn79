@@ -56,7 +56,9 @@ struct BookStat
 class ALGOTraderVolumeStats
 {
 public:
-    explicit ALGOTraderVolumeStats(Timestamp period, double alpha, double beta, double omega, double gamma, double initPrice);
+    explicit ALGOTraderVolumeStats(Timestamp period, 
+        double alpha, double beta, double omega, double gamma, 
+        double initPrice, size_t depth);
 
     void push(const Trade& trade);
     void push(TimestampedVolume timestampedVolume);
@@ -65,17 +67,17 @@ public:
     [[nodiscard]] decimal_t rollingSum() const noexcept { return m_rollingSum; }
     [[nodiscard]] double variance() const noexcept { return m_variance; }
     [[nodiscard]] double estimatedVolatility() const noexcept { return std::pow(m_estimatedVol, 0.5)* std::pow(86'400'000'000'000/m_period ,0.5); }
-    // [[nodiscard]] double bidSlope() noexcept { return lastOLS().bid; }
-    // [[nodiscard]] double askSlope() noexcept { return lastOLS().ask; }
+    [[nodiscard]] double bidSlope() noexcept { return lastSlopes().bid; }
+    [[nodiscard]] double askSlope() noexcept { return lastSlopes().ask; }
     [[nodiscard]] double bidVolume() noexcept { return lastVolume().bid; }
     [[nodiscard]] double askVolume() noexcept { return lastVolume().ask; }
 
-    [[nodiscard]] static ALGOTraderVolumeStats fromXML(pugi::xml_node node, double initPrice);
+    [[nodiscard]] static ALGOTraderVolumeStats fromXML(pugi::xml_node node, double initPrice, size_t depth);
 
 private:
     double slopeOLS(std::vector<BookLevel>& side);
-    double volumeSum(std::vector<BookLevel>& side);
-    // BookStat lastOLS() {return m_OLS[m_lastSeq]; }
+    double volumeSum(std::vector<BookLevel>& side, size_t depth = 5);
+    BookStat lastSlopes() {return m_bookSlopes[m_lastSeq]; }
     BookStat lastVolume() {return m_bookVolumes[m_lastSeq]; }
 
     
@@ -85,19 +87,20 @@ private:
     double m_omega;
     double m_gamma;
     double m_initPrice;
+    size_t m_depth;
+
     std::priority_queue<
         TimestampedVolume,
         std::vector<TimestampedVolume>,
         std::greater<TimestampedVolume>> m_queue;
     decimal_t m_rollingSum{};
-    std::map<Timestamp,double> m_cond_variance; 
     std::map<Timestamp,double> m_priceHistory; // Timestamped price history, close price (VWAP per exact timestamp)
     std::map<Timestamp,double> m_logRets; 
     double m_priceLast;
     double m_variance;
     double m_estimatedVol;
     Timestamp m_lastSeq;
-    // std::map<Timestamp, BookStat> m_OLS;
+    std::map<Timestamp, BookStat> m_bookSlopes; 
     std::map<Timestamp, BookStat> m_bookVolumes;
     
 };
@@ -109,6 +112,8 @@ struct ALGOTraderState
     ALGOTraderVolumeStats volumeStats;
     decimal_t volumeToBeExecuted;
     OrderDirection direction;
+    Timestamp statusChangeTime;
+    Timestamp statusChangeEndTime;
 };
 
 //-------------------------------------------------------------------------
@@ -147,8 +152,9 @@ private:
     decimal_t drawNewVolume(uint32_t baseDecimals);
     double getProcessValue(BookId bookId, const std::string& name);
     uint64_t getProcessCount(BookId bookId, const std::string& name);
-    double wakeupProb(ALGOTraderState& state);
+    double wakeupProb(ALGOTraderState& state, double fundDist);
     Timestamp orderPlacementLatency();
+    Timestamp marketFeedLatency();
 
     std::mt19937* m_rng;
     std::string m_exchange;
@@ -164,9 +170,8 @@ private:
     std::vector<decimal_t> m_lastPrice;
     std::vector<TopLevel> m_topLevel;
     std::normal_distribution<double> m_departureThreshold;
-    float m_wakeupProb;
-    double m_volumeProb;
     VolatilityBounds m_volatilityBounds;
+    double m_durationProbCoef, m_deviationProbCoef;
     Timestamp m_period;
     size_t m_depth;
     std::normal_distribution<double> m_delay;

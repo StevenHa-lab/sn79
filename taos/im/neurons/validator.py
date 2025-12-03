@@ -37,13 +37,15 @@ if __name__ != "__mp_main__":
     import msgpack
     import atexit
     import multiprocessing
+    import subprocess
+    import struct
     from datetime import datetime, timedelta
     from ypyjson import YpyObject
 
     import bittensor as bt
 
     import uvicorn
-    from typing import Tuple, Dict
+    from typing import Tuple, Dict, List
     from fastapi import FastAPI, APIRouter
     from fastapi import Request
     import threading
@@ -62,13 +64,13 @@ if __name__ != "__mp_main__":
 
     from taos.im.config import add_im_validator_args
     from taos.im.protocol.simulator import SimulatorResponseBatch
-    from taos.im.protocol import MarketSimulationStateUpdate, FinanceEventNotification
+    from taos.im.protocol import MarketSimulationStateUpdate, FinanceEventNotification, FinanceAgentResponse
     from taos.im.protocol.models import MarketSimulationConfig, TradeInfo
     from taos.im.protocol.events import SimulationStartEvent, TradeEvent
 
     class Validator(BaseValidatorNeuron):
         """
-        intelligent market simulation validator implementation.
+        Intelligent market simulation validator implementation.
 
         The validator is run as a FastAPI client in order to receive messages from the simulator engine for processing and forwarding to miners.
         Metagraph maintenance, weight setting, state persistence and other general bittensor routines are executed in a separate thread.
@@ -78,66 +80,120 @@ if __name__ != "__mp_main__":
         @classmethod
         def add_args(cls, parser: argparse.ArgumentParser) -> None:
             """
-            Add intelligent-markets-specific validator configuration arguments.
+            Registers Intelligent-Markets-specific CLI configuration parameters.
+
+            Args:
+                parser (argparse.ArgumentParser): The main argument parser to extend.
+
+            Returns:
+                None
             """
             add_im_validator_args(cls, parser)
 
-        async def wait_for_event(self, event: asyncio.Event, wait_process: str, run_process: str):
-            """Wait for event to complete."""
-            if not event.is_set():
-                bt.logging.debug(f"Waiting for {wait_process} to complete before {run_process}...")
-                start_wait = time.time()
-                while not event.is_set():
-                    try:
-                        await asyncio.wait_for(event.wait(), timeout=0.1)
-                        break
-                    except asyncio.TimeoutError:
-                        await asyncio.sleep(0)
-                        elapsed = time.time() - start_wait
-                        if int(elapsed) % 1 == 0:  # Every second
-                            bt.logging.debug(f"Still waiting for {wait_process}... ({elapsed:.1f}s)")                
-                total_wait = time.time() - start_wait
-                bt.logging.debug(f"Waited {total_wait:.1f}s for {wait_process}")
+        def _setup_signal_handlers(self):
+            """
+            Registers OS signal handlers for graceful shutdown.
 
-        async def _maintain(self) -> None:
-            """
-            Async wrapper for maintenance that runs sync operations in executor.
-            """
-            try:
-                self.maintaining = True
-                await self.wait_for_event(self._query_done_event, "query", "synchronizing")
-                bt.logging.info(f"Synchronizing at Step {self.step}...")
-                start = time.time()
-                loop = asyncio.get_event_loop()
-                await loop.run_in_executor(
-                    self.maintenance_executor,
-                    self._sync_and_check
-                )
-                bt.logging.info(f"Synchronized ({time.time()-start:.4f}s)")
+            Behavior:
+                - Captures SIGINT, SIGTERM, and SIGHUP (if available).
+                - Logs the received signal.
+                - Triggers full validator cleanup.
+                - Exits the process cleanly.
 
-            except Exception as ex:
-                self.pagerduty_alert(f"Failed to sync: {ex}", details={"trace": traceback.format_exc()})
-            finally:
-                self.maintaining = False
+            Returns:
+                None
+            """
+            def signal_handler(signum, frame):
+                signal_name = signal.Signals(signum).name
+                bt.logging.info(f"Received {signal_name}, initiating graceful shutdown...")
+                self.cleanup()
+                sys.exit(0)
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                signal.signal(sig, signal_handler)
+            if hasattr(signal, 'SIGHUP'):
+                signal.signal(signal.SIGHUP, signal_handler)
 
-        def _sync_and_check(self):
+        def _start_query_service(self):
             """
-            Helper function that runs sync operations.
-            """
-            self.sync(save_state=False)
-            if not check_simulator(self):
-                restart_simulator(self)
+            Launches the validator's query service and initializes POSIX IPC resources.
 
-        def maintain(self) -> None:
+            Responsibilities:
+                - Spawns the query subprocess with correct wallet and network parameters.
+                - Waits for creation of shared memory blocks and message queues.
+                - Initializes memory maps for request/response communication.
+                - Verifies that the query service is alive during startup.
+                - Raises a RuntimeError if IPC initialization fails or service dies.
+
+            Returns:
+                None
+
+            Raises:
+                RuntimeError: If IPC endpoints are not ready within timeout
+                            or if the subprocess exits unexpectedly.
             """
-            Maintains the metagraph and sets weights.
-            """
-            if not self.maintaining and self.last_state and self.last_state.timestamp % self.config.scoring.interval == 2_000_000_000:
-                bt.logging.debug(f"[MAINT] Scheduling from thread: {threading.current_thread().name}")
-                bt.logging.debug(f"[MAINT] Main loop ID: {id(self.main_loop)}, Current loop ID: {id(asyncio.get_event_loop())}")
-                self.main_loop.call_soon_threadsafe(lambda: self.main_loop.create_task(self._maintain()))
+
+            bt.logging.info(f"Starting query service from: ../validator/query.py")
+
+            cmd = [
+                sys.executable,
+                '-u',
+                '../validator/query.py',
+                '--wallet.path', self.config.wallet.path,
+                '--wallet.name', self.config.wallet.name,
+                '--wallet.hotkey', self.config.wallet.hotkey,
+                '--subtensor.network', self.config.subtensor.network,
+                '--netuid', str(self.config.netuid),
+                '--neuron.timeout', str(self.config.neuron.timeout),
+                '--neuron.global_query_timeout', str(self.config.neuron.global_query_timeout),
+                '--compression.level', str(self.config.compression.level),
+                '--compression.engine', self.config.compression.engine,
+                '--compression.parallel_workers', str(self.config.compression.parallel_workers),
+            ]
+
+            self.query_process = subprocess.Popen(cmd, stderr=sys.stderr)
+            bt.logging.info(f"Query service PID: {self.query_process.pid}")
+
+            # Wait for IPC resources to be created with retry
+            queue_name = f"/validator_query_{self.config.wallet.hotkey}"
+
+            bt.logging.info("Waiting for query service IPC resources...")
+            max_retries = 30  # 30 seconds max
+            for attempt in range(max_retries):
+                try:
+                    self.request_queue = posix_ipc.MessageQueue(f"{queue_name}_req")
+                    self.response_queue = posix_ipc.MessageQueue(f"{queue_name}_res")
+                    self.request_shm = posix_ipc.SharedMemory(f"{queue_name}_req_shm")
+                    self.response_shm = posix_ipc.SharedMemory(f"{queue_name}_res_shm")
+
+                    self.request_mem = mmap.mmap(self.request_shm.fd, self.request_shm.size)
+                    self.response_mem = mmap.mmap(self.response_shm.fd, self.response_shm.size)
+
+                    bt.logging.info(f"Query service ready (request_shm: {self.request_shm.size / 1024 / 1024:.0f}MB, response_shm: {self.response_shm.size / 1024 / 1024:.0f}MB)")
+                    return
+
+                except posix_ipc.ExistentialError:
+                    if attempt == 0:
+                        bt.logging.debug("IPC resources not ready yet, waiting...")
+                    time.sleep(1)
+
+                    # Check if process died
+                    if self.query_process.poll() is not None:
+                        raise RuntimeError(f"Query service died with exit code {self.query_process.returncode}")
+
+            raise RuntimeError("Timeout waiting for query service IPC resources")
 
         def monitor(self) -> None:
+            """
+            Periodically checks simulator health and restarts if needed.
+
+            Runs in a blocking loop:
+                - Sleeps 5 minutes between checks.
+                - Logs simulator availability.
+                - Handles and logs unexpected exceptions.
+
+            Returns:
+                None
+            """
             while True:
                 try:
                     time.sleep(300)
@@ -150,15 +206,31 @@ if __name__ != "__mp_main__":
                     bt.logging.error(f"Failure in simulator monitor : {traceback.format_exc()}")
 
         def seed(self) -> None:
+            """
+            Generates simulator seed data.
+
+            Returns:
+                None
+            """
             from taos.im.validator.seed import seed
             seed(self)
 
         def update_repo(self, end=False) -> bool:
             """
-            Checks for and pulls latest changes from the taos repo.
-            If source has changed, the simulator is rebuilt and restarted.
-            If config has changed, restart the simulator to activate the new parameterizations.
-            If validator source is updated, restart validator process.
+            Checks for source or config changes in the repository and reloads components.
+
+            Behavior:
+                - Pulls latest remote changes.
+                - Rebuilds simulator when C++ or Python sources change.
+                - Restarts simulator on configuration changes.
+                - Updates validator process when its own Python source changes.
+                - Handles special behavior on simulation end.
+
+            Args:
+                end (bool): Whether the update is performed during simulation shutdown.
+
+            Returns:
+                bool: True if update steps completed successfully, False on error.
             """
             try:
                 validator_py_files_changed, simulator_config_changed, simulator_py_files_changed, simulator_cpp_files_changed = check_repo(self)
@@ -188,6 +260,23 @@ if __name__ != "__mp_main__":
                 return False
 
         def _compress_outputs(self,  start=False):
+            """
+            Compresses old simulator log outputs and performs disk cleanup.
+
+            Responsibilities:
+                - Groups historical .log files into ZIP archives.
+                - Removes original log files once archived.
+                - Enforces storage retention when disk usage exceeds 85%.
+                - Deletes dated archives and directories as needed.
+                - Handles exceptions gracefully with PagerDuty reporting.
+
+            Args:
+                start (bool): If True, performs cleanup of prior simulation logs
+                    even if timestamps overlap with the new run.
+
+            Returns:
+                None
+            """
             self.compressing = True
             try:
                 if self.simulation.logDir:
@@ -248,67 +337,425 @@ if __name__ != "__mp_main__":
                 self.compressing = False
 
         def compress_outputs(self, start=False):
+            """
+            Launches asynchronous log compression in a background thread.
+
+            Behavior:
+                - Ensures only one compression job runs at a time.
+                - Spawns a daemon thread to execute `_compress_outputs()`.
+
+            Args:
+                start (bool): If True, forces compression of pre-run logs.
+
+            Returns:
+                None
+            """
             if not self.compressing:
                 Thread(target=self._compress_outputs, args=(start,), daemon=True, name=f'compress_{self.step}').start()
 
-        async def _save_state(self) -> bool:
+        def load_simulation_config(self) -> None:
             """
-            Asynchronously saves validator and simulation state to disk in a separate process.
+            Loads the market-simulation configuration from its XML definition.
+
+            Responsibilities:
+                - Parses the XML file into a MarketSimulationConfig object.
+                - Initializes paths for validator and simulation state files.
+                - Loads the previous saved state (if any).
 
             Returns:
-                bool: True if save was successful, False otherwise
+                None
+            """
+            self.xml_config = ET.parse(self.config.simulation.xml_config).getroot()
+            self.simulation = MarketSimulationConfig.from_xml(self.xml_config)
+            self.validator_state_file = self.config.neuron.full_path + f"/validator.mp"
+            self.simulation_state_file = self.config.neuron.full_path + f"/{self.simulation.label()}.mp"
+            self.load_state()
+
+        def __init__(self, config=None) -> None:
+            """
+            Initializes the Intelligent Markets validator node.
+
+            Responsibilities:
+                - Loads simulation configuration from XML.
+                - Initializes metagraph and subnet info.
+                - Sets up executors, event loops, state locks, and signal handlers.
+                - Loads prior simulation/validator state if available.
+                - Initializes metrics, reporting, and query service.
+                - Starts IPC-backed query subprocess.
+
+            Args:
+                config: Validator configuration object.
+
+            Raises:
+                Exception: If the simulation config XML file is missing.
+            """
+            super(Validator, self).__init__(config=config)
+            # Load the simulator config XML file data in order to make context and parameters accessible for reporting and output location.
+
+            if not os.path.exists(self.config.simulation.xml_config):
+                raise Exception(f"Simulator config does not exist at {self.config.simulation.xml_config}!")
+            self.simulator_config_file = os.path.realpath(Path(self.config.simulation.xml_config))
+            # Initialize subnet info and other basic validator/simulation properties
+            self.subnet_info = self.subtensor.get_metagraph_info(self.config.netuid)
+            self.last_state = None
+            self.last_response = None
+            self.msgpack_error_counter = 0
+            self.simulation_timestamp = 0
+            self.reward_weights = {"sharpe" : 1.0}
+            self.start_time = None
+            self.start_timestamp = None
+            self.last_state_time = None
+            self.step_rates = []
+
+            self.main_loop = asyncio.new_event_loop()
+            self._main_loop_ready = Event()
+
+            self.maintaining = False
+            self.compressing = False
+            self.querying = False
+            self._rewarding = False
+            self._saving = False
+            self._reporting = False
+            self._rewarding_lock = Lock()
+            self._saving_lock = Lock()
+            self._reporting_lock = Lock()
+            self.reward_executor = ProcessPoolExecutor(max_workers=2,initializer=lambda: os.sched_setaffinity(0, {2, 3}))
+            self.report_executor = ProcessPoolExecutor(max_workers=2,initializer=lambda: os.sched_setaffinity(0, {4, 5}))
+            self.save_state_executor = ThreadPoolExecutor(max_workers=1)
+            self.maintenance_executor = ThreadPoolExecutor(max_workers=1)
+            self._setup_signal_handlers()
+            self._cleanup_done = False
+            atexit.register(self.cleanup)
+
+            self.initial_balances_published = {uid : False for uid in range(self.subnet_info.max_uids)}
+            self.volume_sums = {}
+            self.maker_volume_sums = {}
+            self.taker_volume_sums = {}
+            self.self_volume_sums = {}
+
+            self.load_simulation_config()
+
+            # Add routes for methods receiving input from simulator
+            self.router = APIRouter()
+            self.router.add_api_route("/orderbook", self.orderbook, methods=["GET"])
+            self.router.add_api_route("/account", self.account, methods=["GET"])
+
+            self.repo_path = Path(os.path.dirname(os.path.realpath(__file__))).parent.parent.parent
+            self.repo = Repo(self.repo_path)
+            self.update_repo()
+
+            self.miner_stats = {uid : {'requests' : 0, 'timeouts' : 0, 'failures' : 0, 'rejections' : 0, 'call_time' : []} for uid in range(self.subnet_info.max_uids)}
+            init_metrics(self)
+            publish_info(self)
+            self.query_process = None
+            self._start_query_service()
+
+        def __enter__(self):
+            """
+            Enables use of Validator as a context manager.
+
+            Returns:
+                Validator: The active validator instance.
+            """
+            return self
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            """
+            Ensures cleanup is triggered when exiting a context manager block.
+
+            Args:
+                exc_type: Exception type, if any.
+                exc_val: Exception instance, if any.
+                exc_tb: Traceback, if any.
+
+            Returns:
+                bool: False to propagate exceptions.
+            """
+            self.cleanup()
+            return False
+
+        @property
+        def shared_state_rewarding(self):
+            with self._rewarding_lock:
+                return self._rewarding
+
+        @shared_state_rewarding.setter
+        def shared_state_rewarding(self, value):
+            with self._rewarding_lock:
+                self._rewarding = value
+
+        @property
+        def shared_state_saving(self):
+            with self._saving_lock:
+                return self._saving
+
+        @shared_state_saving.setter
+        def shared_state_saving(self, value):
+            with self._saving_lock:
+                self._saving = value
+
+        @property
+        def shared_state_reporting(self):
+            with self._reporting_lock:
+                return self._reporting
+
+        @shared_state_reporting.setter
+        def shared_state_reporting(self, value):
+            with self._reporting_lock:
+                self._reporting = value
+
+        async def wait_for(self, check_fn: callable, message: str, interval: float = 0.01):
+            """
+            Asynchronously waits for a condition to become False.
+
+            Behavior:
+                - Logs a message once per second while waiting.
+                - Returns immediately if condition is already False.
+                - Provides debug timing on completion.
+
+            Args:
+                check_fn (callable): Function returning a boolean condition.
+                message (str): Log message describing the wait condition.
+                interval (float): Interval between checks in seconds.
+
+            Returns:
+                None
+            """
+            import time
+
+            if not check_fn():
+                return
+
+            start_time = time.time()
+            last_log_time = start_time
+
+            bt.logging.info(message)
+
+            while check_fn():
+                await asyncio.sleep(interval)
+
+                current_time = time.time()
+                elapsed = current_time - start_time
+
+                if current_time - last_log_time >= 1.0:
+                    bt.logging.info(f"{message} (waited {elapsed:.1f}s)")
+                    last_log_time = current_time
+
+            total_wait = time.time() - start_time
+            bt.logging.debug(f"Wait completed after {total_wait:.1f}s")
+
+        async def wait_for_event(self, event: asyncio.Event, wait_process: str, run_process: str):
+            """
+            Waits for an asyncio.Event to be set before continuing execution.
+
+            Provides periodic logging while waiting, and measures the total wait
+            duration for operational visibility.
+
+            Args:
+                event (asyncio.Event): The event that must be completed.
+                wait_process (str): Name of the process being waited on.
+                run_process (str): Name of the process to run afterward.
+
+            Returns:
+                None
+            """
+            if not event.is_set():
+                bt.logging.debug(f"Waiting for {wait_process} to complete before {run_process}...")
+                start_wait = time.time()
+                while not event.is_set():
+                    try:
+                        await asyncio.wait_for(event.wait(), timeout=1.0)
+                        break
+                    except asyncio.TimeoutError:
+                        await asyncio.sleep(0)
+                        elapsed = time.time() - start_wait
+                        if int(elapsed) % 5 == 0 and elapsed > 0:
+                            bt.logging.debug(f"Still waiting for {wait_process}... ({elapsed:.1f}s)")
+                total_wait = time.time() - start_wait
+                bt.logging.debug(f"Waited {total_wait:.1f}s for {wait_process}")
+
+        def load_fundamental(self):
+            """
+            Loads fundamental price data from simulation output files.
+
+            Behavior:
+                - Reads per-block fundamental CSV files from the simulation log directory.
+                - Extracts the latest fundamental price for each book ID.
+                - Falls back to None for each book if no directory exists.
+                - Stores results in `self.fundamental_price`.
+
+            Returns:
+                None
+            """
+            if self.simulation.logDir:
+                prices = {}
+                for block in range(self.simulation.block_count):
+                    block_file = os.path.join(self.simulation.logDir, f'fundamental.{block * self.simulation.books_per_block}-{self.simulation.books_per_block * (block + 1) - 1}.csv')
+                    fp_line = None
+                    book_ids = None
+                    for line in open(block_file, 'r').readlines():
+                        if not book_ids:
+                            book_ids = [int(col) for col in line.split(',') if col != "Timestamp\n"]
+                        if line.strip() != '':
+                            fp_line = line
+                    prices = prices | {book_ids[i] : float(price) for i, price in enumerate(fp_line.strip().split(',')[:-1])}
+            else:
+                prices = {bookId : None for bookId in range(self.simulation.book_count)}
+            self.fundamental_price = prices
+
+        def onStart(self, timestamp, event : SimulationStartEvent) -> None:
+            """
+            Handles the simulator start event.
+
+            Responsibilities:
+                - Reloads simulation configuration.
+                - Resets trade volume and inventory histories relative to new timestamp.
+                - Records simulation start time and timestamp.
+                - Initializes output directory and launches log compression.
+                - Loads fundamental prices for all books.
+                - Resets initial balances and recent trade structures.
+                - Saves initial state and publishes validator info.
+
+            Args:
+                timestamp (int): Simulation start timestamp.
+                event (SimulationStartEvent): Contains simulation log directory and metadata.
+
+            Returns:
+                None
+            """
+            self.load_simulation_config()
+            self.trade_volumes = {
+                uid : {
+                    bookId : {
+                        role : {
+                            prev_time - self.simulation_timestamp : volume for prev_time, volume in self.trade_volumes[uid][bookId][role].items() if prev_time - self.simulation_timestamp < self.simulation_timestamp
+                        } for role in self.trade_volumes[uid][bookId]
+                    } for bookId in range(self.simulation.book_count)
+                } for uid in range(self.subnet_info.max_uids)
+            }
+            self.inventory_history = {
+                uid : {
+                    prev_time - self.simulation_timestamp : values for prev_time, values in self.inventory_history[uid].items() if prev_time - self.simulation_timestamp < self.simulation_timestamp
+                } for uid in range(self.subnet_info.max_uids)
+            }
+            self.start_time = time.time()
+            self.simulation_timestamp = timestamp
+            self.start_timestamp = self.simulation_timestamp
+            self.last_state_time = None
+            self.step_rates = []
+            self.simulation.logDir = event.logDir
+            self.compress_outputs(start=True)
+            bt.logging.info("-"*40)
+            bt.logging.info("SIMULATION STARTED")
+            bt.logging.info("-"*40)
+            bt.logging.info(f"START TIME: {self.start_time}")
+            bt.logging.info(f"TIMESTAMP : {self.start_timestamp}")
+            bt.logging.info(f"OUT DIR   : {self.simulation.logDir}")
+            bt.logging.info("-"*40)
+            self.load_fundamental()
+            self.initial_balances = {uid : {bookId : {'BASE' : None, 'QUOTE' : None, 'WEALTH' : self.simulation.miner_wealth} for bookId in range(self.simulation.book_count)} for uid in range(self.subnet_info.max_uids)}
+            self.recent_trades = {bookId : [] for bookId in range(self.simulation.book_count)}
+            self.recent_miner_trades = {uid : {bookId : [] for bookId in range(self.simulation.book_count)} for uid in range(self.subnet_info.max_uids)}
+            self.save_state()
+            publish_info(self)
+
+        def onEnd(self) -> None:
+            """
+            Handles the simulator end event.
+
+            Responsibilities:
+                - Logs simulation end.
+                - Clears active log directory and resets fundamental price data.
+                - Clears pending notices for all UIDs.
+                - Saves state one final time.
+                - Pulls repo updates and rebuilds simulator if needed.
+
+            Returns:
+                None
+            """
+            bt.logging.info("SIMULATION ENDED")
+            self.simulation.logDir = None
+            self.fundamental_price = {bookId : None for bookId in range(self.simulation.book_count)}
+            self.pending_notices = {uid : [] for uid in range(self.subnet_info.max_uids)}
+            self.save_state()
+            self.update_repo(end=True)
+
+        def _construct_save_data(self):
+            """
+            Builds the simulation-state and validator-state dictionaries
+            required for serialization.
+
+            Includes:
+                - Simulation timing, balances, trade histories, notices, and log paths.
+                - Validator scoring, volumes, activity factors, and metadata.
+
+            Returns:
+                tuple(dict, dict): (simulation_state_data, validator_state_data)
+            """
+            start = time.time()
+            bt.logging.debug("Preparing state for saving...")
+            simulation_state_data = {
+                "start_time": self.start_time,
+                "start_timestamp": self.start_timestamp,
+                "step_rates": self.step_rates,
+                "initial_balances": self.initial_balances,
+                "recent_trades": {
+                    book_id: [t.model_dump(mode="json") for t in trades]
+                    for book_id, trades in self.recent_trades.items()
+                },
+                "recent_miner_trades": {
+                    uid: {
+                        book_id: [[t.model_dump(mode="json"), r] for t, r in trades]
+                        for book_id, trades in uid_trades.items()
+                    }
+                    for uid, uid_trades in self.recent_miner_trades.items()
+                },
+                "pending_notices": self.pending_notices,
+                "simulation.logDir": self.simulation.logDir,
+            }
+
+            validator_state_data = {
+                "step": self.step,
+                "simulation_timestamp": self.simulation_timestamp,
+                "hotkeys": self.hotkeys,
+                "scores": [score.item() for score in self.scores],
+                "activity_factors": self.activity_factors,
+                "inventory_history": self.inventory_history,
+                "sharpe_values": self.sharpe_values,
+                "unnormalized_scores": self.unnormalized_scores,
+                "trade_volumes": self.trade_volumes,
+                "deregistered_uids": self.deregistered_uids,
+                "volume_sums": self.volume_sums,
+                "maker_volume_sums": self.maker_volume_sums,
+                "taker_volume_sums": self.taker_volume_sums,
+                "self_volume_sums": self.self_volume_sums,
+            }
+            bt.logging.debug(f"Prepared save data ({time.time() - start}s)")
+            return simulation_state_data, validator_state_data
+
+        async def _save_state(self) -> bool:
+            """
+            Saves simulation and validator state asynchronously via executor workers.
+
+            Behavior:
+                - Prevents concurrent saves via shared-state lock.
+                - Offloads write operations to a separate process.
+                - Logs performance metrics and error details.
+                - Raises PagerDuty alerts on failure.
+
+            Returns:
+                bool: True if state saved successfully, False otherwise.
             """
             if self.shared_state_saving:
                 bt.logging.warning(f"Skipping save at step {self.step} — previous save still running.")
                 return False
 
             self.shared_state_saving = True
-            await self.wait_for_event(self._query_done_event, "query", "preparing state data")
 
             try:
                 bt.logging.info(f"Starting state saving for step {self.step}...")
                 start = time.time()
-                prep_start = time.time()
-                bt.logging.debug("Preparing state for saving...")
-
-                simulation_state_data = {
-                    "start_time": self.start_time,
-                    "start_timestamp": self.start_timestamp,
-                    "step_rates": self.step_rates,
-                    "initial_balances": self.initial_balances,
-                    "recent_trades": {
-                        book_id: [t.model_dump(mode="json") for t in trades]
-                        for book_id, trades in self.recent_trades.items()
-                    },
-                    "recent_miner_trades": {
-                        uid: {
-                            book_id: [[t.model_dump(mode="json"), r] for t, r in trades]
-                            for book_id, trades in uid_trades.items()
-                        }
-                        for uid, uid_trades in self.recent_miner_trades.items()
-                    },
-                    "pending_notices": self.pending_notices,
-                    "simulation.logDir": self.simulation.logDir,
-                }
-
-                validator_state_data = {
-                    "step": self.step,
-                    "simulation_timestamp": self.simulation_timestamp,
-                    "hotkeys": self.hotkeys,
-                    "scores": [score.item() for score in self.scores],
-                    "activity_factors": self.activity_factors,
-                    "inventory_history": self.inventory_history,
-                    "sharpe_values": self.sharpe_values,
-                    "unnormalized_scores": self.unnormalized_scores,
-                    "trade_volumes": self.trade_volumes,
-                    "deregistered_uids": self.deregistered_uids,
-                    "volume_sums": self.volume_sums,
-                    "maker_volume_sums": self.maker_volume_sums,
-                    "taker_volume_sums": self.taker_volume_sums,
-                    "self_volume_sums": self.self_volume_sums,
-                }
-                bt.logging.debug(f"Prepared save data ({time.time() - prep_start}s)")
-                await self.wait_for_event(self._query_done_event, "query", "saving state")
+                simulation_state_data, validator_state_data = self._construct_save_data()
                 bt.logging.debug("Saving state...")
                 future_start = time.time()
 
@@ -359,7 +806,15 @@ if __name__ != "__mp_main__":
 
         def save_state(self) -> None:
             """
-            Synchronous wrapper for save_state that schedules it on the event loop.
+            Schedules the asynchronous state-saving coroutine on the main event loop.
+
+            Behavior:
+                - Executes only at specific scoring intervals.
+                - Ensures no previous save task is still running.
+                - Dispatches `_save_state()` thread-safely from the maintenance thread.
+
+            Returns:
+                None
             """
             if not self.last_state or self.last_state.timestamp % self.config.scoring.interval != 4_000_000_000:
                 return
@@ -372,45 +827,19 @@ if __name__ != "__mp_main__":
 
         def _save_state_sync(self):
             """
-            Direct synchronous save without using executor.
-            Used as fallback when executors are shut down.
+            Performs a fully synchronous state save without using executors.
+
+            Used when:
+                - The event loop or executor pools have already shut down.
+                - A fallback save must occur during shutdown or reorg.
+
+            Returns:
+                None
             """
             try:
                 bt.logging.info("Saving state (sync)...")
 
-                # Prepare state data
-                simulation_state_data = {
-                    "start_time": self.start_time,
-                    "start_timestamp": self.start_timestamp,
-                    "step_rates": self.step_rates,
-                    "initial_balances": self.initial_balances,
-                    "recent_trades": {
-                        book_id: [t.model_dump(mode="json") for t in trades]
-                        for book_id, trades in self.recent_trades.items()
-                    },
-                    "recent_miner_trades": {
-                        uid: {
-                            book_id: [[t.model_dump(mode="json"), r] for t, r in trades]
-                            for book_id, trades in uid_trades.items()
-                        }
-                        for uid, uid_trades in self.recent_miner_trades.items()
-                    },
-                    "pending_notices": self.pending_notices,
-                    "simulation.logDir": self.simulation.logDir,
-                }
-
-                validator_state_data = {
-                    "step": self.step,
-                    "simulation_timestamp": self.simulation_timestamp,
-                    "hotkeys": self.hotkeys,
-                    "scores": [score.item() for score in self.scores],
-                    "activity_factors": self.activity_factors,
-                    "inventory_history": self.inventory_history,
-                    "sharpe_values": self.sharpe_values,
-                    "unnormalized_scores": self.unnormalized_scores,
-                    "trade_volumes": self.trade_volumes,
-                    "deregistered_uids": self.deregistered_uids,
-                }
+                simulation_state_data, validator_state_data = self._construct_save_data()
 
                 # Call worker function directly (synchronously in main process)
                 result = save_state_worker(
@@ -431,7 +860,19 @@ if __name__ != "__mp_main__":
                 bt.logging.error(f"Error in direct save: {ex}]\n{traceback.format_exc()}")
 
         def load_state(self) -> None:
-            """Loads the state of the validator from a file."""
+            """
+            Loads validator and simulation state from msgpack or legacy PyTorch files.
+
+            Behavior:
+                - Converts `.pt` state files to msgpack if detected.
+                - Loads simulation variables (balances, trades, notices, timestamps).
+                - Loads validator data (scores, activity, Sharpe values, volumes).
+                - Reconstructs missing fields or reshapes data when schema versions differ.
+                - Reinitializes state when `neuron.reset=True` or files are absent.
+
+            Returns:
+                None
+            """
             if os.path.exists(self.simulation_state_file.replace('.mp', '.pt')):
                 bt.logging.info("Pytorch simulation state file exists - converting to msgpack...")
                 pt_simulation_state = torch.load(self.simulation_state_file.replace('.mp', '.pt'), weights_only=False)
@@ -588,239 +1029,20 @@ if __name__ != "__mp_main__":
                 self.unnormalized_scores = {uid : 0.0 for uid in range(self.subnet_info.max_uids)}
                 self.trade_volumes = {uid : {bookId : {'total' : {}, 'maker' : {}, 'taker' : {}, 'self' : {}} for bookId in range(self.simulation.book_count)} for uid in range(self.subnet_info.max_uids)}
 
-        def load_simulation_config(self) -> None:
-            """
-            Reads elements from the config XML to populate the simulation config class object.
-            """
-            self.xml_config = ET.parse(self.config.simulation.xml_config).getroot()
-            self.simulation = MarketSimulationConfig.from_xml(self.xml_config)
-            self.validator_state_file = self.config.neuron.full_path + f"/validator.mp"
-            self.simulation_state_file = self.config.neuron.full_path + f"/{self.simulation.label()}.mp"
-            self.load_state()
-
-        def _setup_signal_handlers(self):
-            """Setup handlers for graceful shutdown"""
-            def signal_handler(signum, frame):
-                signal_name = signal.Signals(signum).name
-                bt.logging.info(f"Received {signal_name}, initiating graceful shutdown...")
-                self.cleanup()
-                sys.exit(0)
-            for sig in (signal.SIGINT, signal.SIGTERM):
-                signal.signal(sig, signal_handler)
-            if hasattr(signal, 'SIGHUP'):
-                signal.signal(signal.SIGHUP, signal_handler)
-
-        def cleanup_executors(self):
-            """Clean up all executors and manager on shutdown"""
-            executors = {
-                'reward_executor': getattr(self, 'reward_executor', None),
-                'report_executor': getattr(self, 'report_executor', None),
-                'save_state_executor': getattr(self, 'save_state_executor', None),
-                'maintenance_executor': getattr(self, 'maintenance_executor', None),
-            }
-
-            for name, executor in executors.items():
-                if executor is not None:
-                    try:
-                        bt.logging.info(f"Shutting down {name}...")
-                        executor.shutdown(wait=True, cancel_futures=False)
-                        bt.logging.info(f"{name} shut down successfully")
-                    except Exception as ex:
-                        bt.logging.error(f"Error shutting down {name}: {ex}")
-
-            if hasattr(self, 'manager'):
-                try:
-                    bt.logging.info("Shutting down multiprocessing manager...")
-                    self.manager.shutdown()
-                    bt.logging.info("Manager shut down successfully")
-                except Exception as ex:
-                    bt.logging.error(f"Error shutting down manager: {ex}")
-
-        def cleanup(self):
-            """Clean up all resources on shutdown"""
-            bt.logging.info("Starting validator cleanup...")
-            self._cleanup_done = True
-            try:
-                self.cleanup_executors()
-                self._save_state_sync()
-            except Exception as ex:
-                traceback.print_exc()
-                bt.logging.error(f"Error during cleanup: {ex}")
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc_val, exc_tb):
-            self.cleanup()
-            return False
-
-        def __init__(self, config=None) -> None:
-            """
-            Initialize the intelligent markets simulation validator.
-            """
-            super(Validator, self).__init__(config=config)
-            # Load the simulator config XML file data in order to make context and parameters accessible for reporting and output location.
-
-            if not os.path.exists(self.config.simulation.xml_config):
-                raise Exception(f"Simulator config does not exist at {self.config.simulation.xml_config}!")
-            self.simulator_config_file = os.path.realpath(Path(self.config.simulation.xml_config))
-            # Initialize subnet info and other basic validator/simulation properties
-            self.subnet_info = self.subtensor.get_metagraph_info(self.config.netuid)
-            self.last_state = None
-            self.last_response = None
-            self.msgpack_error_counter = 0
-            self.simulation_timestamp = 0
-            self.reward_weights = {"sharpe" : 1.0}
-            self.start_time = None
-            self.start_timestamp = None
-            self.last_state_time = None
-            self.step_rates = []
-
-            self.main_loop = asyncio.new_event_loop()
-            self._main_loop_ready = Event()
-
-            self.maintaining = False
-            self.compressing = False
-            self.querying = False
-            self._rewarding = False
-            self._saving = False
-            self._reporting = False
-            self._rewarding_lock = Lock()
-            self._saving_lock = Lock()
-            self._reporting_lock = Lock()
-            self.reward_executor = ProcessPoolExecutor(max_workers=1)
-            self.report_executor = ProcessPoolExecutor(max_workers=1)
-            self.save_state_executor = ThreadPoolExecutor(max_workers=1)
-            self.maintenance_executor = ThreadPoolExecutor(max_workers=1)
-            self._setup_signal_handlers()
-            self._cleanup_done = False
-            atexit.register(self.cleanup)
-
-            self.initial_balances_published = {uid : False for uid in range(self.subnet_info.max_uids)}
-            self.volume_sums = {}
-            self.maker_volume_sums = {}
-            self.taker_volume_sums = {}
-            self.self_volume_sums = {}
-
-            self.load_simulation_config()
-
-            # Add routes for methods receiving input from simulator
-            self.router = APIRouter()
-            self.router.add_api_route("/orderbook", self.orderbook, methods=["GET"])
-            self.router.add_api_route("/account", self.account, methods=["GET"])
-
-            self.repo_path = Path(os.path.dirname(os.path.realpath(__file__))).parent.parent.parent
-            self.repo = Repo(self.repo_path)
-            self.update_repo()
-
-            self.miner_stats = {uid : {'requests' : 0, 'timeouts' : 0, 'failures' : 0, 'rejections' : 0, 'call_time' : []} for uid in range(self.subnet_info.max_uids)}
-            init_metrics(self)
-            publish_info(self)
-
-        @property
-        def shared_state_rewarding(self):
-            with self._rewarding_lock:
-                return self._rewarding
-
-        @shared_state_rewarding.setter
-        def shared_state_rewarding(self, value):
-            with self._rewarding_lock:
-                self._rewarding = value
-
-        @property
-        def shared_state_saving(self):
-            with self._saving_lock:
-                return self._saving
-
-        @shared_state_saving.setter
-        def shared_state_saving(self, value):
-            with self._saving_lock:
-                self._saving = value
-
-        @property
-        def shared_state_reporting(self):
-            with self._reporting_lock:
-                return self._reporting
-
-        @shared_state_reporting.setter
-        def shared_state_reporting(self, value):
-            with self._reporting_lock:
-                self._reporting = value
-
-        def load_fundamental(self):
-            if self.simulation.logDir:
-                prices = {}
-                for block in range(self.simulation.block_count):
-                    block_file = os.path.join(self.simulation.logDir, f'fundamental.{block * self.simulation.books_per_block}-{self.simulation.books_per_block * (block + 1) - 1}.csv')
-                    fp_line = None
-                    book_ids = None
-                    for line in open(block_file, 'r').readlines():
-                        if not book_ids:
-                            book_ids = [int(col) for col in line.split(',') if col != "Timestamp\n"]
-                        if line.strip() != '':
-                            fp_line = line
-                    prices = prices | {book_ids[i] : float(price) for i, price in enumerate(fp_line.strip().split(',')[:-1])}
-            else:
-                prices = {bookId : None for bookId in range(self.simulation.book_count)}
-            self.fundamental_price = prices
-
-        def onStart(self, timestamp, event : SimulationStartEvent) -> None:
-            """
-            Triggered when start of simulation event is published by simulator.
-            Sets the simulation output directory and retrieves any fundamental price values already written.
-            """
-            self.load_simulation_config()
-            self.trade_volumes = {
-                uid : {
-                    bookId : {
-                        role : {
-                            prev_time - self.simulation_timestamp : volume for prev_time, volume in self.trade_volumes[uid][bookId][role].items() if prev_time - self.simulation_timestamp < self.simulation_timestamp
-                        } for role in self.trade_volumes[uid][bookId]
-                    } for bookId in range(self.simulation.book_count)
-                } for uid in range(self.subnet_info.max_uids)
-            }
-            self.inventory_history = {
-                uid : {
-                    prev_time - self.simulation_timestamp : values for prev_time, values in self.inventory_history[uid].items() if prev_time - self.simulation_timestamp < self.simulation_timestamp
-                } for uid in range(self.subnet_info.max_uids)
-            }
-            self.start_time = time.time()
-            self.simulation_timestamp = timestamp
-            self.start_timestamp = self.simulation_timestamp
-            self.last_state_time = None
-            self.step_rates = []
-            self.simulation.logDir = event.logDir
-            self.compress_outputs(start=True)
-            bt.logging.info("-"*40)
-            bt.logging.info("SIMULATION STARTED")
-            bt.logging.info("-"*40)
-            bt.logging.info(f"START TIME: {self.start_time}")
-            bt.logging.info(f"TIMESTAMP : {self.start_timestamp}")
-            bt.logging.info(f"OUT DIR   : {self.simulation.logDir}")
-            bt.logging.info("-"*40)
-            self.load_fundamental()
-            self.initial_balances = {uid : {bookId : {'BASE' : None, 'QUOTE' : None, 'WEALTH' : self.simulation.miner_wealth} for bookId in range(self.simulation.book_count)} for uid in range(self.subnet_info.max_uids)}
-            self.recent_trades = {bookId : [] for bookId in range(self.simulation.book_count)}
-            self.recent_miner_trades = {uid : {bookId : [] for bookId in range(self.simulation.book_count)} for uid in range(self.subnet_info.max_uids)}
-            self.save_state()
-            publish_info(self)
-
-        def onEnd(self) -> None:
-            """
-            Triggered when end of simulation event is published by simulator.
-            Resets quantities as necessary, updates, rebuilds and launches simulator with the latest configuration.
-            """
-            bt.logging.info("SIMULATION ENDED")
-            self.simulation.logDir = None
-            self.fundamental_price = {bookId : None for bookId in range(self.simulation.book_count)}
-            self.pending_notices = {uid : [] for uid in range(self.subnet_info.max_uids)}
-            self.save_state()
-            self.update_repo(end=True)
-
         def handle_deregistration(self, uid) -> None:
             """
-            Triggered on deregistration of a UID.
-            Flags the UID as marked for balance reset.
+            Handles deregistration of a validator or miner UID.
+
+            Behavior:
+                - Flags the UID for balance/state reset.
+                - Zeros current score.
+                - Logs deregistration action.
+
+            Args:
+                uid (int): UID being deregistered.
+
+            Returns:
+                None
             """
             self.deregistered_uids.append(uid)
             self.scores[uid] = 0.0
@@ -828,8 +1050,21 @@ if __name__ != "__mp_main__":
 
         def process_resets(self, state : MarketSimulationStateUpdate) -> None:
             """
-            Checks for and handles agent reset notices (due to deregistration).
-            Zeroes scores and clears relevant internal variables.
+            Processes reset notices delivered by the simulator.
+
+            Behavior:
+                - Detects successful agent reset events (RDRA / ERDRA).
+                - Resets Sharpe values, activity factors, volume histories, inventory,
+                and all accumulated metrics for each affected UID.
+                - Removes UID from deregistration list after reset.
+                - Restores the UID to a clean initial state.
+                - Issues a PagerDuty alert if reset fails.
+
+            Args:
+                state (MarketSimulationStateUpdate): Contains notices and reset messages.
+
+            Returns:
+                None
             """
             for notice in state.notices[self.uid]:
                 if notice['y'] in ["RESPONSE_DISTRIBUTED_RESET_AGENT", "RDRA"] or notice['y'] in ["ERROR_RESPONSE_DISTRIBUTED_RESET_AGENT", "ERDRA"]:
@@ -871,48 +1106,104 @@ if __name__ != "__mp_main__":
                         else:
                             self.pagerduty_alert(f"Failed to Reset Agent {reset['a']} : {reset['m']}")
 
-        async def wait_for(self, check_fn: callable, message: str, interval: float = 0.01):
+        async def _maintain(self) -> None:
             """
-            Wait for a condition to become False.
+            Executes metagraph sync and maintenance operations asynchronously.
 
-            Args:
-                check_fn: Callable that returns the condition to check
-                message: Log message to display while waiting
-                interval: Check interval in seconds
+            Actions:
+                - Marks the validator as in maintenance mode.
+                - Runs synchronous maintenance work in an executor thread.
+                - Logs timing and reports issues via PagerDuty.
+
+            Returns:
+                None
             """
-            import time
+            try:
+                self.maintaining = True
+                bt.logging.info(f"Synchronizing at Step {self.step}...")
+                start = time.time()
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(
+                    self.maintenance_executor,
+                    self._sync_and_check
+                )
+                bt.logging.info(f"Synchronized ({time.time()-start:.4f}s)")
 
-            if not check_fn():
-                return
+            except Exception as ex:
+                self.pagerduty_alert(f"Failed to sync: {ex}", details={"trace": traceback.format_exc()})
+            finally:
+                self.maintaining = False
 
-            start_time = time.time()
-            last_log_time = start_time
+        def _sync_and_check(self):
+            """
+            Performs synchronous metagraph maintenance and simulator health checks.
 
-            bt.logging.info(message)
+            Steps:
+                - Runs Bittensor sync (without saving state).
+                - Verifies simulator health.
+                - Restarts simulator if unhealthy.
 
-            while check_fn():
-                await asyncio.sleep(interval)
+            Returns:
+                None
+            """
+            self.sync(save_state=False)
+            if not check_simulator(self):
+                restart_simulator(self)
 
-                current_time = time.time()
-                elapsed = current_time - start_time
+        def maintain(self) -> None:
+            """
+            Schedules asynchronous maintenance work from the maintenance thread.
 
-                if current_time - last_log_time >= 1.0:
-                    bt.logging.info(f"{message} (waited {elapsed:.1f}s)")
-                    last_log_time = current_time
+            Behavior:
+                - Ensures maintenance is not already running.
+                - Triggers only at specific simulation timestamps.
+                - Sends a coroutine to the main event loop thread-safely.
 
-            total_wait = time.time() - start_time
-            bt.logging.debug(f"Wait completed after {total_wait:.1f}s")
+            Returns:
+                None
+            """
+            if not self.maintaining and self.last_state and self.last_state.timestamp % self.config.scoring.interval == 2_000_000_000:
+                bt.logging.debug(f"[MAINT] Scheduling from thread: {threading.current_thread().name}")
+                bt.logging.debug(f"[MAINT] Main loop ID: {id(self.main_loop)}, Current loop ID: {id(asyncio.get_event_loop())}")
+                self.main_loop.call_soon_threadsafe(lambda: self.main_loop.create_task(self._maintain()))
 
         async def _report(self):
+            """
+            Internal asynchronous wrapper for executing the reporting routine.
+
+            Behavior:
+                - Sets shared reporting state to prevent duplicate reports.
+                - Adjusts process niceness during reporting.
+                - Executes the report coroutine.
+                - Restores shared state afterward.
+
+            Returns:
+                None
+            """
             try:
                 self.shared_state_reporting = True
+                os.nice(10)
                 await report(self)
+                os.nice(-10)
             finally:
                 self.shared_state_reporting = False
 
         def report(self) -> None:
             """
-            Publish simulation metrics.
+            Schedules the reporting routine if reporting conditions are met.
+
+            Conditions:
+                - Reporting is enabled.
+                - A previous simulator state exists.
+                - Current step aligns with scoring interval.
+                - No report is already in progress.
+
+            Behavior:
+                - Logs scheduling information.
+                - Dispatches `_report()` coroutine on the main event loop.
+
+            Returns:
+                None
             """
             if self.config.reporting.disabled or not self.last_state or self.last_state.timestamp % self.config.scoring.interval != 0:
                 return
@@ -925,10 +1216,27 @@ if __name__ != "__mp_main__":
 
         async def _compute_compact_volumes(self) -> Dict:
             """
-            Compute compact volume data for scoring.
+            Compute compact volume metrics used for activity-weighted scoring.
+
+            This method aggregates each UID’s total trade volumes across all books
+            into two compressed metrics:
+
+            • **lookback_volume** — Total traded value within the scoring lookback window
+            • **latest_volume** — Most recent sampled trade volume entry
+
+            These values are consumed later during reward computation for activity scoring.
 
             Returns:
-                Dict: Compact volume data with lookback_volume and latest_volume per UID/book
+                Dict[int, Dict[int, Dict[str, float]]]:
+                    Nested structure:
+                    {
+                        uid: {
+                            book_id: {
+                                "lookback_volume": float,
+                                "latest_volume": float
+                            }
+                        }
+                    }
             """
             lookback_threshold = self.simulation_timestamp - (
                 self.config.scoring.sharpe.lookback *
@@ -970,7 +1278,32 @@ if __name__ != "__mp_main__":
 
         async def _update_trade_volumes(self, state: MarketSimulationStateUpdate):
             """
-            Update trade volumes with proper volume_sums maintenance for all roles.
+            Update and maintain all trade volume tracking structures.
+
+            This function ingests raw trade events from the simulator state and updates
+            the following per-UID per-book series:
+
+            • **total** — total traded notional value
+            • **maker** — maker-side volume
+            • **taker** — taker-side volume
+            • **self** — trades where maker == taker
+            • **recent_trades** and **recent_miner_trades** (rolling buffers)
+            • **volume_sums** / **maker_volume_sums** / **taker_volume_sums** / **self_volume_sums**
+
+            It also:
+            • Prunes old volume entries outside the activity assessment window
+            • Samples volume at aligned timestamps
+            • Tracks inventory changes
+            • Initializes missing volume structures dynamically
+            • Maintains per-UID initial balances for Sharpe calculations
+            • Ensures inventory history is kept within lookback bounds
+
+            Args:
+                state (MarketSimulationStateUpdate):
+                    Full simulation tick state containing books, accounts, and notices.
+
+            Raises:
+                Logs errors when UID-level processing fails but continues processing remaining UIDs.
             """
             total_start = time.time()
 
@@ -1173,7 +1506,33 @@ if __name__ != "__mp_main__":
 
         async def _reward(self, state : MarketSimulationStateUpdate):
             """
-            Calculate and apply rewards for the given simulation state.
+            Asynchronously perform the full reward computation pipeline.
+
+            This function is executed within an async lock to ensure that reward
+            calculation never overlaps across threads or scheduler ticks.
+
+            Steps Performed:
+                1. Acquire async lock to prevent concurrent reward computation.
+                2. Update trade volumes via `_update_trade_volumes()`.
+                3. If the timestamp does not align with the scoring interval, exit early.
+                4. Convert inventory history into compact, lookback-bounded form.
+                5. Compute compact volume metrics.
+                6. Construct the complete `validator_data` payload for the scoring engine.
+                7. Call the reward function (`get_rewards`) to compute:
+                    • Sharpe values
+                    • Activity factors
+                    • Updated simulation timestamp
+                    • Final per-UID reward values
+                8. Apply computed rewards and update internal score tables.
+
+            Args:
+                state (MarketSimulationStateUpdate):
+                    Full simulation tick state used as the basis for scoring.
+
+            Logs:
+                • Execution times for major phases
+                • Reward calculation progress
+                • Detailed traceback in case of failure
             """
             if not hasattr(self, "_reward_lock"):
                 self._reward_lock = asyncio.Lock()
@@ -1184,7 +1543,6 @@ if __name__ != "__mp_main__":
                 if waited > 0:
                     bt.logging.debug(f"Acquired reward lock after waiting {waited:.3f}s")
                 await asyncio.sleep(0)
-                await self.wait_for_event(self._query_done_event, "query", "rewarding")
 
                 self.shared_state_rewarding = True
                 await asyncio.sleep(0)
@@ -1204,7 +1562,6 @@ if __name__ != "__mp_main__":
                         bt.logging.info(f"Agent Scores Data Updated for {duration} ({time.time()-start:.4f}s)")
                         return
                     bt.logging.debug("[REWARD] Converting inventory history...")
-                    await self.wait_for_event(self._query_done_event, "query", "converting inventory history")
                     convert_start = time.time()
                     inventory_compact = {}
 
@@ -1221,7 +1578,6 @@ if __name__ != "__mp_main__":
                             inventory_compact[uid_item] = {}
 
                     bt.logging.debug(f"[REWARD] Converted inventory history in {time.time()-convert_start:.4f}s")
-                    await self.wait_for_event(self._query_done_event, "query", "computing compact volumes")
                     compact_start = time.time()
                     compact_volumes = await self._compute_compact_volumes()
                     bt.logging.debug(f"[REWARD] Computed compact volumes in {time.time()-compact_start:.4f}s")
@@ -1272,32 +1628,14 @@ if __name__ != "__mp_main__":
                     bt.logging.debug(f"[REWARD] Prepared validator_data in {prep_time:.4f}s")
 
                     await asyncio.sleep(0)
-                    await self.wait_for_event(self._query_done_event, "query", "submitting reward task to executor")
 
-                    bt.logging.debug("[REWARD] Submitting to executor...")
-                    submit_start = time.time()
-
-                    loop = asyncio.get_running_loop()
-                    future = loop.run_in_executor(self.reward_executor, get_rewards, validator_data)
-
-                    submit_time = time.time() - submit_start
-                    bt.logging.debug(f"[REWARD] Submitted to executor in {submit_time:.4f}s")
-
-                    wait_start = time.time()
-                    while not future.done():
-                        await asyncio.sleep(0.1)
-                    wait_time = time.time() - wait_start
-                    bt.logging.debug(f"[REWARD] Executor finished after {wait_time:.4f}s")
-                    result_start = time.time()
-                    rewards, updated_data = future.result()
-                    bt.logging.debug(f"[REWARD] Retrieved result in {time.time() - result_start:.4f}s")
+                    rewards, updated_data = get_rewards(validator_data)
 
                     self.sharpe_values = updated_data.get('sharpe_values', self.sharpe_values)
                     self.activity_factors = updated_data.get('activity_factors', self.activity_factors)
                     self.simulation_timestamp = updated_data.get('simulation_timestamp', self.simulation_timestamp)
 
                     bt.logging.debug(f"Agent Rewards Recalculated for {duration} ({time.time()-start:.4f}s):\n{rewards}")
-                    await self.wait_for_event(self._query_done_event, "query", "updating scores")
                     self.update_scores(rewards, self.metagraph.uids)
                     bt.logging.info(f"Agent Scores Updated for {duration} ({time.time()-start:.4f}s)")
 
@@ -1311,13 +1649,44 @@ if __name__ != "__mp_main__":
 
         def reward(self, state : MarketSimulationStateUpdate) -> None:
             """
-            Update agent rewards and recalculate scores.
+            Schedule asynchronous reward calculation on the validator's main event loop.
+            Offloads work to `_reward()` to ensure that:
+
+            • Reward computation always occurs in the correct asyncio event loop
+            • CPU-intensive work does not block the calling thread
+            • Reward logic executes with proper async locking
+
+            Args:
+                state (MarketSimulationStateUpdate):
+                    Simulation state for the current tick, forwarded to `_reward`.
             """
             bt.logging.debug(f"[REWARD] Scheduling from thread: {threading.current_thread().name}")
             bt.logging.debug(f"[REWARD] Main loop ID: {id(self.main_loop)}, Current loop ID: {id(asyncio.get_event_loop())}")
             self.main_loop.call_soon_threadsafe(lambda: self.main_loop.create_task(self._reward(state)))
 
         async def handle_state(self, message : dict, state : MarketSimulationStateUpdate, receive_start : int) -> dict:
+            """
+            Handle a full simulator state update, enrich it with validator data, compute responses,
+            update internal validator state, and return instructions back to the simulator.
+
+
+            This method is the central processing loop for each simulation step. It performs:
+            - Periodic validator configuration reloads.
+            - Per‑account volume injection.
+            - Simulation metadata updates and logging.
+            - State forwarding to miners and response aggregation.
+            - Reward calculation, scoring, persistence, and metric publication.
+
+
+            Args:
+            message (dict): The raw simulator state message as received (typically msgpack‑decoded).
+            state (MarketSimulationStateUpdate): Parsed simulation state model containing orderbooks, accounts, timestamps, etc.
+            receive_start (int): Timestamp marking when the simulator delivered the message, used for latency metrics.
+
+
+            Returns:
+            dict: Serialized response batch to be returned to the simulator.
+            """
             # Every 1H of simulation time, check if there are any changes to the validator - if updates exist, pull them and restart.
             if self.simulation_timestamp % 3600_000_000_000 == 0 and self.simulation_timestamp != 0:
                 bt.logging.info("Checking for validator updates...")
@@ -1387,6 +1756,20 @@ if __name__ != "__mp_main__":
             return response
 
         async def _listen(self):
+            """
+            Continuously listen for simulator state updates via POSIX IPC, unpack them,
+            parse them into state objects, and process them with `handle_state`.
+
+            This listener runs the full validator event loop when operating in IPC mode.
+            It performs:
+            - Receiving shared‑memory pointers via message queues.
+            - mmap reads with retry logic.
+            - msgpack unpacking with retry logic.
+            - Parsing the state dict into a typed model.
+            - Handling all state updates and forwarding miner responses.
+
+            The method uses run‑in‑executor offloading for blocking IPC operations.
+            """
             def receive(mq_req: posix_ipc.MessageQueue) -> dict:
                 msg, priority = mq_req.receive()
                 receive_start = time.time()
@@ -1399,7 +1782,6 @@ if __name__ != "__mp_main__":
                     try:
                         with mmap.mmap(shm_req.fd, byte_size_req, mmap.MAP_SHARED, mmap.PROT_READ) as mm:
                             packed_data = mm.read(byte_size_req)
-                        bt.logging.info(f"Read state update ({time.time() - start:.4f}s)")
                         break
                     except Exception as ex:
                         if attempt < 5:
@@ -1456,7 +1838,7 @@ if __name__ != "__mp_main__":
                             bt.logging.debug(f"[LISTEN] Received message in {t2-t1:.4f}s")
                             state = MarketSimulationStateUpdate.parse_dict(message)
                             t3 = time.time()
-                            bt.logging.debug(f"[LISTEN] Parsed state in {t3-t2:.4f}s")
+                            bt.logging.info(f"Parsed state dict ({t3-t2:.4f}s)")
                             response = await self.handle_state(message, state, receive_start)
                             t4 = time.time()
                             bt.logging.debug(f"[LISTEN] handle_state completed in {t4-t3:.4f}s")
@@ -1474,7 +1856,9 @@ if __name__ != "__mp_main__":
                 mq_req.close()
 
         def listen(self):
-            """Synchronous wrapper for the asynchronous _listen method."""
+            """
+            Synchronous wrapper for the asynchronous `_listen` method.
+            """
             try:
                 asyncio.run(self._listen())
             except KeyboardInterrupt:
@@ -1482,7 +1866,25 @@ if __name__ != "__mp_main__":
 
         async def orderbook(self, request : Request) -> dict:
             """
-            The route method which receives and processes simulation state updates received from the simulator.
+            HTTP route endpoint that receives a complete simulator state update over HTTP,
+            parses it, and forwards it to `handle_state`.
+
+
+            This is the HTTP equivalent of the IPC listener used when running a
+            distributed or containerized simulator. It performs:
+            - Streaming request‑body read.
+            - Basic JSON‑structure validation.
+            - Construction of a Ypy‑backed state object.
+            - Conversion into a typed MarketSimulationStateUpdate model.
+            - Delegation to the main validator processing pipeline.
+
+
+            Args:
+            request (Request): Incoming HTTP request containing a JSON‑encoded simulation state update.
+
+
+            Returns:
+            dict: Serialized simulation response batch.
             """
             bt.logging.info("Received state update from simulator.")
             global_start = time.time()
@@ -1506,9 +1908,23 @@ if __name__ != "__mp_main__":
 
         async def account(self, request : Request) -> None:
             """
-            The route method which receives event notification messages from the simulator.
-            This method is currently used only to enable the simulation start message to be immediately propagated to the validator.
-            Other events are instead recorded to the simulation state object.
+            HTTP route endpoint for receiving event‑level notifications from the simulator
+            (e.g., simulation start, simulation end, error reports, market notices).
+
+
+            Responsibilities:
+            - Immediately forward simulation‑start events to miners.
+            - Handle simulation‑end markers.
+            - Record and persist error‑report batches.
+            - Forward all other event notifications to miners.
+            - Trigger alerting for msgpack or simulation integrity errors.
+
+            Args:
+            request (Request): HTTP request containing a batch of simulator event messages.
+
+            Returns:
+            None | dict: `{"continue": True/False}` when error‑report limits are reached.
+            Otherwise returns `None`.
             """
             body = bytearray()
             async for chunk in request.stream():
@@ -1545,6 +1961,165 @@ if __name__ != "__mp_main__":
             await notify(self, notices) # This method forwards the event notifications to the related miners.
             if ended:
                 self.onEnd()
+
+        def cleanup_ipc(self):
+            """
+            Shuts down the query service and releases all POSIX IPC resources.
+
+            Behavior:
+                - Attempts to send a shutdown message to the query service.
+                - Waits for graceful termination, falling back to terminate/kill.
+                - Closes memory maps and shared memory file descriptors.
+                - Closes message queues.
+                - Logs detailed warnings for any partial cleanup failures.
+
+            Returns:
+                None
+            """
+            try:
+                bt.logging.info("Cleaning up query service...")
+
+                # Send shutdown command to query service
+                if hasattr(self, 'request_queue'):
+                    try:
+                        self.request_queue.send(b'shutdown', timeout=1.0)
+                        bt.logging.info("Sent shutdown command to query service")
+                    except Exception as e:
+                        bt.logging.warning(f"Failed to send shutdown command: {e}")
+
+                # Wait for query process to terminate gracefully
+                if hasattr(self, 'query_process') and self.query_process:
+                    try:
+                        self.query_process.wait(timeout=5.0)
+                        bt.logging.info(f"Query service exited with code {self.query_process.returncode}")
+                    except subprocess.TimeoutExpired:
+                        bt.logging.warning("Query service did not exit gracefully, terminating...")
+                        self.query_process.terminate()
+                        try:
+                            self.query_process.wait(timeout=2.0)
+                        except subprocess.TimeoutExpired:
+                            bt.logging.error("Query service did not terminate, killing...")
+                            self.query_process.kill()
+
+                # Close memory maps
+                if hasattr(self, 'request_mem'):
+                    try:
+                        self.request_mem.close()
+                        bt.logging.debug("Closed request memory map")
+                    except Exception as e:
+                        bt.logging.warning(f"Error closing request memory map: {e}")
+
+                if hasattr(self, 'response_mem'):
+                    try:
+                        self.response_mem.close()
+                        bt.logging.debug("Closed response memory map")
+                    except Exception as e:
+                        bt.logging.warning(f"Error closing response memory map: {e}")
+
+                # Close shared memory file descriptors
+                if hasattr(self, 'request_shm'):
+                    try:
+                        self.request_shm.close_fd()
+                        bt.logging.debug("Closed request shared memory fd")
+                    except Exception as e:
+                        bt.logging.warning(f"Error closing request shared memory fd: {e}")
+
+                if hasattr(self, 'response_shm'):
+                    try:
+                        self.response_shm.close_fd()
+                        bt.logging.debug("Closed response shared memory fd")
+                    except Exception as e:
+                        bt.logging.warning(f"Error closing response shared memory fd: {e}")
+
+                # Close message queues
+                if hasattr(self, 'request_queue'):
+                    try:
+                        self.request_queue.close()
+                        bt.logging.debug("Closed request queue")
+                    except Exception as e:
+                        bt.logging.warning(f"Error closing request queue: {e}")
+
+                if hasattr(self, 'response_queue'):
+                    try:
+                        self.response_queue.close()
+                        bt.logging.debug("Closed response queue")
+                    except Exception as e:
+                        bt.logging.warning(f"Error closing response queue: {e}")
+
+                bt.logging.info("Query service cleanup complete")
+
+            except Exception as e:
+                bt.logging.error(f"Error during query service cleanup: {e}")
+                import traceback
+                bt.logging.error(traceback.format_exc())
+
+        def cleanup_executors(self):
+            """
+            Shuts down thread and process executors used by the validator.
+
+            Executors cleaned:
+                - reward_executor
+                - report_executor
+                - save_state_executor
+                - maintenance_executor
+                - multiprocessing manager (if present)
+
+            Behavior:
+                - Each executor is shut down gracefully with `wait=True`.
+                - Logs success or failure for each executor.
+
+            Returns:
+                None
+            """
+            executors = {
+                'reward_executor': getattr(self, 'reward_executor', None),
+                'report_executor': getattr(self, 'report_executor', None),
+                'save_state_executor': getattr(self, 'save_state_executor', None),
+                'maintenance_executor': getattr(self, 'maintenance_executor', None),
+            }
+
+            for name, executor in executors.items():
+                if executor is not None:
+                    try:
+                        bt.logging.info(f"Shutting down {name}...")
+                        executor.shutdown(wait=True, cancel_futures=False)
+                        bt.logging.info(f"{name} shut down successfully")
+                    except Exception as ex:
+                        bt.logging.error(f"Error shutting down {name}: {ex}")
+
+            if hasattr(self, 'manager'):
+                try:
+                    bt.logging.info("Shutting down multiprocessing manager...")
+                    self.manager.shutdown()
+                    bt.logging.info("Manager shut down successfully")
+                except Exception as ex:
+                    bt.logging.error(f"Error shutting down manager: {ex}")
+
+        def cleanup(self):
+            """
+            Performs full resource cleanup for the validator during shutdown.
+
+            Cleanup includes:
+                - Executor shutdown
+                - POSIX IPC teardown
+                - Final synchronization and state save (if enabled)
+
+            Behavior:
+                - Ensures cleanup only runs once via `_cleanup_done`.
+                - Logs failures with full traceback.
+
+            Returns:
+                None
+            """
+            bt.logging.info("Starting validator cleanup...")
+            self._cleanup_done = True
+            try:
+                self.cleanup_executors()
+                self.cleanup_ipc()
+                # self._save_state_sync()
+            except Exception as ex:
+                traceback.print_exc()
+                bt.logging.error(f"Error during cleanup: {ex}")
 
 # The main method which runs the validator
 if __name__ == "__main__":
@@ -1587,7 +2162,7 @@ if __name__ == "__main__":
             async def keep_alive():
                 bt.logging.info(f"Main event loop started for background tasks")
                 bt.logging.debug(f"[MAINLOOP] Thread: {threading.current_thread().name}")
-                bt.logging.debug(f"[MAINLOOP] Loop: {validator.main_loop}")
+                bt.logging.debug(f"[MAINLOOP] Loop: {id(validator.main_loop)}")
                 try:
                     while True:
                         await asyncio.sleep(1)
@@ -1596,7 +2171,7 @@ if __name__ == "__main__":
             loop = validator.main_loop
             asyncio.set_event_loop(loop)
             validator._main_loop_ready.set()
-            bt.logging.debug(f"[MAINLOOP] Running loop: {loop}")
+            bt.logging.debug(f"[MAINLOOP] Running loop: {id(loop)}")
             try:
                 loop.run_until_complete(keep_alive())
             finally:

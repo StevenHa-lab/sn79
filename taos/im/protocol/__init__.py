@@ -271,7 +271,6 @@ class MarketSimulationStateUpdate(SimulationStateUpdate):
         
     @classmethod
     def parse_dict(cls, data, normalize=False):
-        start = time.time()
         ret = MarketSimulationStateUpdate(timestamp=data['timestamp'])
         if normalize:
             def normalize_int_keys(d):
@@ -298,9 +297,7 @@ class MarketSimulationStateUpdate(SimulationStateUpdate):
             object.__setattr__(ret, "books", data.get("books", {}))
             object.__setattr__(ret, "accounts", data.get("accounts", {}))
             object.__setattr__(ret, "accounts", data.get("accounts", {}))
-            object.__setattr__(ret, "notices", data.get("notices", {}))        
-
-        bt.logging.info(f"Parsed state dict ({time.time() - start:.4f}s)")
+            object.__setattr__(ret, "notices", data.get("notices", {}))
         return ret
 
     def decompress(self, lazy=False):

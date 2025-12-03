@@ -365,7 +365,6 @@ async def report(self: 'Validator') -> None:
 
         if self.simulation.logDir:
             await asyncio.sleep(0)
-            await self.wait_for_event(self._query_done_event, "query", "retrieving FP")
             bt.logging.debug(f"Retrieving fundamental prices...")
             start = time.time()
             self.load_fundamental()
@@ -374,7 +373,6 @@ async def report(self: 'Validator') -> None:
         bt.logging.debug(f"Publishing book metrics...")
         for bookId, book in self.last_state.books.items():
             await asyncio.sleep(0)
-            await self.wait_for_event(self._query_done_event, "query", "publishing book metrics")
             # --- Book bids ---
             if book['b']:
                 start = time.time()
@@ -478,8 +476,7 @@ async def report(self: 'Validator') -> None:
                         self.wallet.hotkey.ss58_address, self.config.netuid, bookId, 0, "dynamic_taker_rate")
                 _set_if_changed(self.prometheus_book_gauges, DISMTR,
                         self.wallet.hotkey.ss58_address, self.config.netuid, bookId, 0, "maker_taker_ratio")
-        
-        await self.wait_for_event(self._query_done_event, "query", "publishing trade metrics")
+
         await self.wait_for(lambda: self.shared_state_rewarding, "Waiting for reward calculation to complete before computing metrics...")
         # --- Trades metrics ---
         if has_new_trades:
@@ -488,7 +485,6 @@ async def report(self: 'Validator') -> None:
             self.prometheus_trades.clear()
             for bookId, trades in self.recent_trades.items():
                 await asyncio.sleep(0)
-                await self.wait_for_event(self._query_done_event, "query", "publishing trade metrics")
                 for trade in trades:
                     _set_if_changed(self.prometheus_trades, 1.0,
                         self.wallet.hotkey.ss58_address, self.config.netuid, trade.timestamp, duration_from_timestamp(trade.timestamp),
@@ -532,8 +528,6 @@ async def report(self: 'Validator') -> None:
             'books': self.last_state.books,
             'notices': self.last_state.notices,
         }
-        
-        await self.wait_for_event(self._query_done_event, "query", "calculating miner metrics")
         loop = asyncio.get_running_loop()
         future = loop.run_in_executor(self.report_executor, report_worker, validator_data, state_data)
         while not future.done():
@@ -556,7 +550,6 @@ async def report(self: 'Validator') -> None:
 
         for agentId, accounts in self.last_state.accounts.items():
             await asyncio.sleep(0)
-            await self.wait_for_event(self._query_done_event, "query", "publishing accounts metrics")
             initial_balance_publish_status = {bookId: False for bookId in range(self.simulation.book_count)}
             for bookId, account in accounts.items():
                 if self.initial_balances[agentId][bookId]['BASE'] is not None and not self.initial_balances_published[agentId]:
@@ -615,7 +608,6 @@ async def report(self: 'Validator') -> None:
         start = time.time()
         for agentId, notices in self.last_state.notices.items():
             await asyncio.sleep(0)
-            await self.wait_for_event(self._query_done_event, "query", "publishing miner trade metrics")
             if agentId < 0:
                 continue
             for notice in notices:
@@ -629,7 +621,6 @@ async def report(self: 'Validator') -> None:
             self.prometheus_miner_trades.clear()
             for uid, book_miner_trades in self.recent_miner_trades.items():
                 await asyncio.sleep(0)
-                await self.wait_for_event(self._query_done_event, "query", "publishing miner trades")
                 for bookId, miner_trades in book_miner_trades.items():
                     if len(miner_trades) > 0:
                         last_maker_trade = None
@@ -656,7 +647,6 @@ async def report(self: 'Validator') -> None:
 
         for agentId in miner_metrics:
             await asyncio.sleep(0)
-            await self.wait_for_event(self._query_done_event, "query", "publishing miner metrics")
             m = miner_metrics[agentId]
 
             _set_if_changed(self.prometheus_miner_gauges, m['total_base_balance'], self.wallet.hotkey.ss58_address, self.config.netuid, agentId, "total_base_balance")

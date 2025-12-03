@@ -78,9 +78,9 @@ if [ $PRESERVE_SIMULATOR = 0 ]; then
     fi
     cd ..
     if ! g++ -dumpversion | grep -q "14"; then
-        cd build && cmake -DENABLE_TRACES=1 -DCMAKE_BUILD_TYPE=Release -D CMAKE_CXX_COMPILER=g++-14 .. && cmake --build . -j "4"
+        cd build && cmake -DENABLE_TRACES=1 -DCMAKE_BUILD_TYPE=Release -D CMAKE_CXX_COMPILER=g++-14 .. && cmake --build . -j "$(nproc)"
     else
-        cd build && cmake -DENABLE_TRACES=1 -DCMAKE_BUILD_TYPE=Release -D .. && cmake --build . -j "4"
+        cd build && cmake -DENABLE_TRACES=1 -DCMAKE_BUILD_TYPE=Release -D .. && cmake --build . -j "$(nproc)"
     fi
     cd ../../../taos/im/neurons
 else
@@ -117,6 +117,48 @@ if [ $PRESERVE_SIMULATOR = 0 ]; then
         tmux split-window -v -t taos:validator 'pm2 logs simulator'
     fi
 fi
+
+setting_exists() {
+    grep -q "^${1}=" /etc/sysctl.conf
+}
+SETTINGS="net.core.rmem_max=134217728
+net.core.wmem_max=134217728
+net.core.rmem_default=8388608
+net.core.wmem_default=8388608
+net.ipv4.tcp_rmem=4096 87380 67108864
+net.ipv4.tcp_wmem=4096 87380 67108864
+net.ipv4.tcp_tw_reuse=1
+net.ipv4.tcp_fin_timeout=30"
+echo "Checking and applying sysctl settings..."
+echo "$SETTINGS" | while IFS= read -r line; do
+    setting="${line%%=*}"
+    value="${line#*=}"
+    echo "Applying: ${setting}=${value}"
+    sudo sysctl -w "${setting}=${value}"
+done
+needs_update=false
+echo "$SETTINGS" | while IFS= read -r line; do
+    setting="${line%%=*}"
+    if ! setting_exists "$setting"; then
+        echo "needs_update"
+        break
+    fi
+done | grep -q "needs_update" && needs_update=true
+if [ "$needs_update" = true ]; then
+    echo "$SETTINGS" | while IFS= read -r line; do
+        setting="${line%%=*}"
+        value="${line#*=}"
+        if ! setting_exists "$setting"; then
+            echo "Adding: ${setting}=${value}"
+            echo "${setting}=${value}" | sudo tee -a /etc/sysctl.conf > /dev/null
+        else
+            echo "Already present: ${setting}"
+        fi
+    done
+    echo "Settings added to /etc/sysctl.conf."
+fi
+echo "Current settings:"
+sysctl net.core.rmem_max net.core.wmem_max net.core.rmem_default net.core.wmem_default net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.ipv4.tcp_tw_reuse net.ipv4.tcp_fin_timeout
 if [ $USE_TMUX = 1 ]; then
     # Attach to the new tmux session
     tmux attach-session -t taos

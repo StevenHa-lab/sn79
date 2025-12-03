@@ -48,11 +48,11 @@ void HighFrequencyTraderAgent::configure(const pugi::xml_node &node)
     }
     m_bookCount = simulation()->exchange()->books().size();
 
-    if (attr = node.attribute("tau"); attr.empty() || attr.as_double() == 0.0) {
+    if (attr = node.attribute("tau"); attr.empty() || attr.as_double() <= 0.0) {
         throw std::invalid_argument(fmt::format(
             "{}: attribute 'tau' should have a value greater than 0.0", ctx));
     }
-    m_tau = static_cast<Timestamp>(attr.as_ullong());
+    m_tau = attr.as_double();
 
     if (attr = node.attribute("delta"); attr.empty() || attr.as_double() == 0.0) {
         throw std::invalid_argument(fmt::format(
@@ -64,7 +64,9 @@ void HighFrequencyTraderAgent::configure(const pugi::xml_node &node)
         throw std::invalid_argument(fmt::format(
             "{}: attribute 'gHFT' should have a value greater than 0.0", ctx));
     }
-    m_gHFT = attr.as_double();
+    //todo add std to conf
+    std::normal_distribution<double> riskDist(attr.as_double(), 0.075);
+    m_gHFT = riskDist(*m_rng);
 
     if (attr = node.attribute("kappa"); attr.empty() || attr.as_double() == 0.0) {
         throw std::invalid_argument(fmt::format(
@@ -99,7 +101,9 @@ void HighFrequencyTraderAgent::configure(const pugi::xml_node &node)
         throw std::invalid_argument(fmt::format(
             "{}: attribute 'psiHFT_constant' should have a value greater than or equal to 0.0", ctx));
     }
-    m_psi = attr.as_double();
+    // TODO add std
+    std::normal_distribution<double> inventoryControlDist(attr.as_double(), 10.0);
+    m_psi = inventoryControlDist(*m_rng);
     m_topLevel = std::vector<TopLevel>(m_bookCount, TopLevel{});
     m_baseFree = std::vector<double>(m_bookCount, 0.);
     m_quoteFree = std::vector<double>(m_bookCount, 0.);
@@ -147,10 +151,21 @@ void HighFrequencyTraderAgent::configure(const pugi::xml_node &node)
     const double percentile = 1-std::exp(-1/(2*scale*scale));
     m_orderPlacementLatencyDistribution =  std::make_unique<taosim::stats::RayleighDistribution>(scale, percentile); 
 
-    m_orderMean = node.attribute("orderMean").as_double();
+    if (attr = node.attribute("orderMean"); attr.empty()) {
+        throw std::invalid_argument(fmt::format(
+            "{}: attribute 'orderMean' should have a value that make sense for the distribution", ctx));
+    }
+    double orderMean = attr.as_double();
     attr = node.attribute("orderSTD");
     m_orderSTD = (attr.empty() || attr.as_double() < 0.0f)  ? 1 : attr.as_double();
+    std::normal_distribution<double> orderDist(orderMean,m_orderSTD);
     
+    // m_orderMean.resize(m_bookCount);
+    for (BookId bookId = 0; bookId < m_bookCount; ++bookId) {
+        m_orderMean.push_back(std::abs(orderDist(*m_rng)));
+    } 
+
+
     m_noiseRay = node.attribute("noiseRay").as_double();
     m_priceShiftDistribution =  std::make_unique<taosim::stats::RayleighDistribution>(m_noiseRay);
     m_minMFLatency = node.attribute("minMFLatency").as_ullong();
@@ -165,6 +180,13 @@ void HighFrequencyTraderAgent::configure(const pugi::xml_node &node)
     m_volumeIncrement =
         1 / std::pow(10, simulation()->exchange()->config().parameters().volumeIncrementDecimals);
     m_maxLeverage = taosim::util::decimal2double(simulation()->exchange()->getMaxLeverage());
+    m_targetMTR = node.attribute("targetMTR").as_double(0.5);
+    m_margin = node.attribute("rateMargin").as_double(0.00001);
+    m_sigmaMargin = node.attribute("marginNoiseSTD").as_double(0.00001);
+    m_rateSensitivity = node.attribute("sensitivityCoef").as_double(100.0);
+    m_spreadSensitivityExp= node.attribute("spreadSensitivityExp").as_double(2.07);
+    m_spreadSensitivityBase= node.attribute("spreadSensitivityBase").as_double(0.00119);
+    m_marginDist = std::normal_distribution<double> (0.0,m_sigmaMargin);
     m_maxLoan = taosim::util::decimal2double(simulation()->exchange()->getMaxLoan());
 }
 
@@ -221,11 +243,10 @@ void HighFrequencyTraderAgent::handleSimulationStart()
         "SUBSCRIBE_EVENT_TRADE");
     
     m_id = simulation()->exchange()->accounts().idBimap().left.at(name());
-    
     for (BookId bookId = 0; bookId < m_bookCount; ++bookId) {
         simulation()->dispatchMessage(
             simulation()->currentTimestamp(),
-            1,
+            static_cast<Timestamp>(m_deltaHFT[bookId]),
             name(),
             m_exchange,
             "RETRIEVE_L1",
@@ -268,7 +289,9 @@ void HighFrequencyTraderAgent::handleRetrieveL1Response(Message::Ptr msg)
 
     auto& topLevel = m_topLevel.at(bookId);
     topLevel.bid = taosim::util::decimal2double(payload->bestBidPrice);
+    topLevel.bidQty = taosim::util::decimal2double(payload->bestBidVolume);
     topLevel.ask = taosim::util::decimal2double(payload->bestAskPrice);
+    topLevel.askQty = taosim::util::decimal2double(payload->bestAskVolume);
     
     if (topLevel.bid == 0.0)
         topLevel.bid = m_tradePrice.at(payload->bookId).price;
@@ -443,61 +466,50 @@ void HighFrequencyTraderAgent::placeOrder(BookId bookId, TopLevel& topLevel) {
     const double actualSpread = topLevel.ask - topLevel.bid;
     const double midquote = (topLevel.ask + topLevel.bid)/2;
     const double relativeSpread = actualSpread/midquote;
-
+    double skipProb = std::exp(-1.0*std::pow(relativeSpread/m_spreadSensitivityBase, m_spreadSensitivityExp));
+    double makerRate = taosim::util::decimal2double(simulation()->exchange()->clearingManager().feePolicy()->getRates(bookId,m_id).maker);
     // Seed the random number generator
     m_rng->seed(std::random_device{}());
-    // Here we might want to change that order volume is small in case relative spread is small unless need to go aggressive 
-    // That would be similar as just adjusting the sides? split half according to the weight based on inventory
-    std::lognormal_distribution<> lognormalDist(m_orderMean*(1+(relativeSpread - m_spread)), m_orderSTD); // mean=m_orderMean, stddev=1
-    const double orderVolume = lognormalDist(*m_rng);
     const double currentInventory = m_inventory[bookId];
-    const double rayleighShift = m_noiseRay * std::sqrt(-2.0 * std::log(1.0 - m_shiftPercentage));
-    const double optimalSpread = m_sigmaSqr*m_gHFT*(1-(simulation()->currentTimestamp()/ m_delta)/(simulation()->duration()/m_delta)) + 2/m_gHFT * std::log(1 + m_gHFT/m_kappa);
-    const double spread = (relativeSpread < m_spread && relativeSpread > m_spread*0.4)? actualSpread : optimalSpread;
+    const double rayleighShift =  m_noiseRay * std::sqrt(-2.0 * std::log(1.0 - m_shiftPercentage));
+    const double optimalSpread = m_sigmaSqr*m_gHFT*(1-(simulation()->currentTimestamp()/ m_delta)/(simulation()->duration()/m_delta))
+     + 2/m_gHFT * std::log(1 + m_gHFT/m_kappa);
+    const double spread = optimalSpread*(1+makerRate*m_rateSensitivity);
     
 
     // ----- Bid Placement -----
     double wealthBid = topLevel.ask * m_baseFree[bookId] + m_quoteFree[bookId];
-    double orderVolumeBid = lognormalDist(*m_rng);
+    double orderVolume =  m_orderMean.at(bookId)*(1+(relativeSpread - m_spread)); 
     double noiseBid = m_priceShiftDistribution->sample(*m_rng);
     noiseBid -= rayleighShift;
     double priceOrderBid = m_pRes - (spread / 2.0) - noiseBid;
     double limitPriceBid = std::round(priceOrderBid / m_priceIncrement) * m_priceIncrement;
-    const auto bidPayload = makeOrder(bookId, OrderDirection::BUY, orderVolumeBid, limitPriceBid, wealthBid);
+    const auto bidPayload = makeOrder(bookId, OrderDirection::BUY, orderVolume, limitPriceBid, wealthBid);
 
     // ----- Ask Placement -----
     double wealthAsk = topLevel.bid * m_baseFree[bookId] + m_quoteFree[bookId];
-    double orderVolumeAsk = lognormalDist(*m_rng);
     double noiseAsk = m_priceShiftDistribution->sample(*m_rng);
     noiseAsk -= rayleighShift;
     double priceOrderAsk = m_pRes + (spread / 2.0) + noiseAsk;
     double limitPriceAsk = std::round(priceOrderAsk / m_priceIncrement) * m_priceIncrement;
-    const auto askPayload = makeOrder(bookId, OrderDirection::SELL, orderVolumeAsk, limitPriceAsk, wealthAsk);
+    const auto askPayload = makeOrder(bookId, OrderDirection::SELL, orderVolume, limitPriceAsk, wealthAsk);
+    double epsilon = m_marginDist(*m_rng);
 
-    if (m_debug) {
-        simulation()->logDebug("BOOK {} | p_bid_raw={}, limit={}, volume={}\n", simulation()->bookIdCanon(bookId), priceOrderBid, limitPriceBid, orderVolumeBid);
-        simulation()->logDebug("BOOK {} | p_ask_raw={}, limit={}, volume={}\n", simulation()->bookIdCanon(bookId), priceOrderAsk, limitPriceAsk, orderVolumeAsk);
-    }
-
-    if (std::abs(currentInventory) > m_psi){
-        if (currentInventory < 0){
-            sendOrder(bidPayload);
-            if (std::uniform_real_distribution{0.0,1.0}(*m_rng) < 0.75) {
-                cancelClosestToBestPrice(bookId, OrderDirection::SELL, topLevel.ask);
-            }
-            else
-                sendOrder(askPayload);
-        } else {
-            sendOrder(askPayload);
-            if (std::uniform_real_distribution{0.0,1.0}(*m_rng) < 0.75) {
-                cancelClosestToBestPrice(bookId, OrderDirection::BUY, topLevel.bid);
-            } else {
-                sendOrder(bidPayload);
-            }
-        }
+    if ((makerRate > m_sigmaMargin + epsilon || std::bernoulli_distribution{skipProb} (*m_rng)) && std::abs(currentInventory) > 0.1) {
+        OrderDirection direction = currentInventory <= 0 ? OrderDirection::BUY : OrderDirection::SELL;
+        double maxQtyTop = currentInventory <=0 ? topLevel.askQty : topLevel.bidQty;
+        double rebalanceQty = std::uniform_real_distribution<double>{0.1,std::min(std::abs(currentInventory),maxQtyTop)} (*m_rng);
+        simulation()->dispatchMessage(
+                simulation()->currentTimestamp(),
+                orderPlacementLatency(),
+                name(),
+                m_exchange,
+                "PLACE_ORDER_MARKET",
+                MessagePayload::create<PlaceOrderMarketPayload>(
+                direction, taosim::util::double2decimal(rebalanceQty,simulation()->exchange()->config().parameters().volumeIncrementDecimals), bookId));
     } else {
-        sendOrder(bidPayload);
         sendOrder(askPayload);
+        sendOrder(bidPayload);
     }
 }
 

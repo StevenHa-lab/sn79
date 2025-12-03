@@ -37,6 +37,7 @@ private:
     struct TopLevel
     {
         double bid, ask;
+        double bidQty, askQty;
     };
 
     struct DelayBounds
@@ -91,19 +92,25 @@ private:
     double m_kappa;
     double m_spread;
     double m_delta;
-    Timestamp m_tau;
+    double m_tau;
     Timestamp m_minMFLatency;
     double m_psi;
     
     double m_noiseRay;
     double m_shiftPercentage;
-    double m_orderMean;
+    std::vector<double> m_orderMean;
     double m_orderSTD;
 
     double m_pRes;
     double m_sigmaSqr;
     DelayBounds m_opl;
-
+    double m_targetMTR;
+    double m_margin;
+    double m_sigmaMargin;
+    double m_rateSensitivity;
+    double m_spreadSensitivityExp;
+    double m_spreadSensitivityBase;
+    
     uint32_t m_priceDecimals;
     uint32_t m_volumeDecimals;
     double m_priceIncrement;
@@ -128,6 +135,7 @@ private:
     std::vector<TimestampedTradePrice> m_tradePrice;
     std::unique_ptr<taosim::stats::Distribution> m_orderPlacementLatencyDistribution;
     std::unique_ptr<taosim::stats::Distribution> m_priceShiftDistribution;
+    std::normal_distribution<double> m_marginDist;
 };
 
 //-------------------------------------------------------------------------
