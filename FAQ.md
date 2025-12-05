@@ -68,3 +68,53 @@ While we have made changes to attempt to better align the weights assigned to mi
 #### 11. Do you currently burn any miner emissions, or have any plans to implement this mechanism?
 
 No, we do not burn miner emissions and do not currently have any plans to implement this.  Though this seems it may make sense in some other subnets, we do not see that this would be the case for us.  If in future we see need to apply such, this will not be done without careful consideration and consultation with all participants.
+
+#### 12. Why does the current scoring system seem to favor passive market making over active trading?
+
+The present scoring methodology relies on Sharpe ratios calculated from changes in inventory value over time. Due to this, miners who hold small and stable positions with limited activity can end up looking disproportionately strong. Standing limit orders that never get filled do not incur any trading costs such as fees or spreads, so these miners avoid many of the frictions faced by active traders. When inventory fluctuates only slightly, the resulting volatility is also low, which naturally produces a stable Sharpe ratio. Although the system includes volume weighting to promote meaningful activity, the Sharpe calculation itself does not always reflect the true quality of execution.
+
+We are actively working on refinements that better differentiate genuine liquidity provision from passive “standing still” behavior. These improvements focus on execution-centered metrics that factor in trading costs, risk-adjusted performance based on actual fills, and overall operational efficiency.
+
+#### 13. How does the scoring system account for trading costs like fees and spreads?
+
+The Sharpe ratio is based on inventory value changes, and these changes implicitly include the costs or rebates associated with trading. When a miner pays fees or receives rebates, the resulting balance adjustments are captured in the inventory path, which then flows into the performance calculation. In addition, the [Dynamic Incentive Structure](https://simulate.trading/taos-im-dis-paper) (DIS) used in the simulator is specifically designed to amplify the impact of execution costs and to guide agents toward providing or removing liquidity in ways that match the prevailing market environment.  Although trading costs/rebates are incorporated in this way, the effect is diluted for large trades - this will be addressed in the context of including realized profitability to the scoring assessment.
+
+#### 14. Does the scoring system penalize order cancellations or repeated re-posting?
+
+Currently, the scoring framework does not directly penalize order cancellations or the repeated submission of identical orders, even when those actions do not result in meaningful changes. The system focuses more heavily on trading volume and risk-adjusted returns. However, we recognize that excessive cancellations or unchanging re-posts can place unnecessary load on the simulation, may represent score-farming rather than legitimate market-making behavior, and ultimately do not contribute to price discovery or improved liquidity.  Future refinements may apply small penalties or filters to discourage unnecessary churn while ensuring that traders responding appropriately to real market changes are not penalized.
+
+Future versions of the scoring model are likely to introduce operational-efficiency considerations, such as penalties for high cancel-to-fill ratios or for repeatedly submitting identical orders that do not produce new placements or executions. We may also consider simpler guardrails at the agent level—for example, raising minimum order sizes, reducing the number of instructions permitted per round, or further limiting the maximum number of open orders.
+
+#### 15. How does the scoring system encourage participation across all books?
+
+The current system enforces a need to maintain trading activity on all books through the activity factors and associated decays, and further uses an outlier penalty that reduces a miner’s score when performance diverges significantly across books. While this provides some incentive for balanced participation, it does not explicitly reward breadth of coverage compared to specialization. To address this, we are exploring mechanisms that encourage miners to trade actively and intelligently on all books. These could include soft bonuses or penalties based on coverage, diminishing returns for extreme concentration in a small number of books, or the use of concentration metrics to detect overly narrow focus. Coverage incentives will be tied to executed value, not just order placements.
+
+The goal is to support robust strategies that can adapt across diverse markets without artificially forcing traders to participate in books where they have no strategic advantage.
+
+#### 16. Will the scoring system move toward execution-based metrics rather than inventory-based metrics?
+
+We are actively considering a shift toward execution-based scoring which incorporates realized profitability into the calculation. The current inventory-delta Sharpe method has several limitations: it can reward miners for stable inventory positions even when they are not trading meaningfully and it struggles to capture the quality of execution in terms of timing and pricing.
+
+A more execution-focused approach would reward miners more explicitly on the profits realized through "round-tripped" trades, in addition to their total inventory value. It would also emphasize net alpha after accounting for all trading costs, incorporate downside-risk measures such as CVaR instead of relying solely on standard deviation, and potentially incorporate measures like time-to-fill to reward efficient execution.  Operational penalties will be based on recorded cancels and reposts. This allows the system to encourage balanced execution while also discouraging inefficient operational churn.
+
+#### 17. Why are some miners able to maintain high scores with minimal trading activity?
+
+This effect arises when miners maintain extremely stable inventories with little volatility. Even without substantial trading volume, this stability can generate strong Sharpe ratios. The system counterbalances this to some extent through volume weights and by decaying scores during periods of inactivity, but finding the ideal balance is challenging. We do not want to force unnecessary trades, since overtrading can be harmful in real markets, yet we also want to prevent miners from achieving strong scores simply by avoiding risk.
+
+Upcoming refinements aim to ensure that positive scoring requires genuine execution, incorporates all trading costs including spreads and slippage, and discourages strategies that achieve stability through inactivity instead of skillful risk management.
+
+#### 18. Are identical re-posts treated as no-ops in the simulator?
+
+No. Identical re-posts are fully recorded as cancel/placement events. They do not generate new fills unless market conditions change, but they still consume simulator resources and count toward operational activity. Any future scoring penalties aimed at discouraging churn will rely on these recorded events. Excessive cancel/repost cycles often add load without improving liquidity or execution quality - future scoring revisions may apply modest penalties based on recorded operational counts (e.g., cancel-to-fill ratios, repeated identical reposts) to discourage wasteful operational behavior while still allowing legitimate quote updates.
+
+#### 19. How will a cost-aware, execution-focused scoring model treat taker trades?
+
+Taker trades will be evaluated by their realized alpha after accounting for fees and half-spread costs in the same way as for maker trades. Since each taker fill and its costs are recorded, miners can be rewarded when taking liquidity is strategically correct and net-positive, while still internalizing the full cost of doing so.  The DIS already rewards/penalizes taking in conditions where it is less appropriate; this is intended to be further refined and augmented via the incentive mechanism to better encourage liquidity taking and active trading when this would be genuinely beneficial in improving market quality.
+
+#### 20. How will scoring handle time-weighted quoting quality (e.g., being near the top of book)?
+
+Execution metrics can fail to reward traders who continuously post competitive quotes which contribute to market quality, but see low fill rates due to the dynamics of the market. We plan to explore time-weighted measures of quote quality, such as time spent quoting within a certain percentage of the best bid/ask, to complement execution- and inventory-based metrics. These would not replace fill-based scoring but could serve as a soft multiplier ensuring that high-quality liquidity provision is not undervalued in quiet markets.
+
+#### 21. How will the system ensure miners don’t just optimize for scoring rather than real liquidity?
+
+The design goal is to align good scoring outcomes with behaviors that genuinely improve market quality. This alignment will be strengthened through execution-focused metrics, realistic cost accounting, operational-efficiency considerations, and coverage incentives, all of which reduce gaming opportunities and encourage traders to trade in a way that promotes liquidity and healthy market dynamics.
