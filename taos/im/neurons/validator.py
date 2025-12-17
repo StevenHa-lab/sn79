@@ -693,58 +693,189 @@ if __name__ != "__mp_main__":
             self.load_simulation_config()
             volume_decimals = self.simulation.volumeDecimals
 
-            bt.logging.info("Shifting timestamps and recalculating volume sums for simulation restart...")
-
-            self.trade_volumes = {
-                uid : {
-                    bookId : {
-                        role : {
-                            prev_time - self.simulation_timestamp : volume
-                            for prev_time, volume in self.trade_volumes[uid][bookId][role].items()
-                            if prev_time - self.simulation_timestamp < self.simulation_timestamp
-                        } for role in self.trade_volumes[uid][bookId]
-                    } for bookId in range(self.simulation.book_count)
-                } for uid in range(self.subnet_info.max_uids)
-            }
-
-
-            bt.logging.info("Recalculating trade volume sums after timestamp shift...")
-            self.volume_sums = defaultdict(lambda: defaultdict(float))
-            self.maker_volume_sums = defaultdict(lambda: defaultdict(float))
-            self.taker_volume_sums = defaultdict(lambda: defaultdict(float))
-            self.self_volume_sums = defaultdict(lambda: defaultdict(float))
-
+            bt.logging.info("Shifting timestamps for simulation restart...")
+            
+            old_simulation_timestamp = self.simulation_timestamp
+            new_simulation_timestamp = timestamp
+            
+            sharpe_lookback_period = (
+                self.config.scoring.sharpe.lookback * 
+                self.simulation.publish_interval
+            )
+            volume_assessment_period = self.config.scoring.activity.trade_volume_assessment_period
+            
+            sharpe_threshold = old_simulation_timestamp - sharpe_lookback_period
+            volume_threshold = old_simulation_timestamp - volume_assessment_period
+            
+            bt.logging.info(f"Preserving trade volumes for last {volume_assessment_period/1e12:.2f} hours")
+            bt.logging.info(f"Preserving inventory/P&L for last {sharpe_lookback_period/1e12:.2f} hours")
+            
+            pruned_total = defaultdict(lambda: defaultdict(float))
+            pruned_maker = defaultdict(lambda: defaultdict(float))
+            pruned_taker = defaultdict(lambda: defaultdict(float))
+            pruned_self = defaultdict(lambda: defaultdict(float))
+            pruned_roundtrip = defaultdict(lambda: defaultdict(float))
+            
+            bt.logging.info("Shifting trade volume timestamps...")
+            shifted_trade_volumes = {}
             for uid in range(self.subnet_info.max_uids):
-                for bookId in range(self.simulation.book_count):
-                    if uid in self.trade_volumes and bookId in self.trade_volumes[uid]:
-                        book_volumes = self.trade_volumes[uid][bookId]
-
-                        # Recalculate sums
-                        total_volume = sum(book_volumes['total'].values())
-                        if total_volume > 0:
-                            self.volume_sums[uid][bookId] = round(total_volume, volume_decimals)
-
-                        maker_volume = sum(book_volumes['maker'].values())
-                        if maker_volume > 0:
-                            self.maker_volume_sums[uid][bookId] = round(maker_volume, volume_decimals)
-
-                        taker_volume = sum(book_volumes['taker'].values())
-                        if taker_volume > 0:
-                            self.taker_volume_sums[uid][bookId] = round(taker_volume, volume_decimals)
-
-                        self_volume = sum(book_volumes['self'].values())
-                        if self_volume > 0:
-                            self.self_volume_sums[uid][bookId] = round(self_volume, volume_decimals)
-
-            bt.logging.info(f"Recalculated trade volume sums: {len(self.volume_sums)} total entries")
-
-            self.inventory_history = {
-                uid : {
-                    prev_time - self.simulation_timestamp : values
-                    for prev_time, values in self.inventory_history[uid].items()
-                    if prev_time - self.simulation_timestamp < self.simulation_timestamp
-                } for uid in range(self.subnet_info.max_uids)
+                if uid in self.trade_volumes:
+                    shifted_trade_volumes[uid] = {}
+                    for bookId in range(self.simulation.book_count):
+                        if bookId in self.trade_volumes[uid]:
+                            shifted_trade_volumes[uid][bookId] = {}
+                            for role in ['total', 'maker', 'taker', 'self']:
+                                if role in self.trade_volumes[uid][bookId]:
+                                    shifted_times = {}
+                                    for prev_time, volume in self.trade_volumes[uid][bookId][role].items():
+                                        if prev_time >= volume_threshold:  # Use VOLUME threshold
+                                            time_from_old_end = old_simulation_timestamp - prev_time
+                                            new_time = new_simulation_timestamp + time_from_old_end
+                                            shifted_times[new_time] = volume
+                                        else:
+                                            if role == 'total':
+                                                pruned_total[uid][bookId] += volume
+                                            elif role == 'maker':
+                                                pruned_maker[uid][bookId] += volume
+                                            elif role == 'taker':
+                                                pruned_taker[uid][bookId] += volume
+                                            elif role == 'self':
+                                                pruned_self[uid][bookId] += volume
+                                    if shifted_times:
+                                        shifted_trade_volumes[uid][bookId][role] = shifted_times
+            
+            self.trade_volumes = {
+                uid: {
+                    bookId: {
+                        role: shifted_trade_volumes.get(uid, {}).get(bookId, {}).get(role, {})
+                        for role in ['total', 'maker', 'taker', 'self']
+                    }
+                    for bookId in range(self.simulation.book_count)
+                }
+                for uid in range(self.subnet_info.max_uids)
             }
+            
+            bt.logging.info("Adjusting volume sums for pruned data...")
+            for uid in pruned_total:
+                for bookId in pruned_total[uid]:
+                    self.volume_sums[uid][bookId] = max(
+                        0.0,
+                        self.volume_sums[uid][bookId] - pruned_total[uid][bookId]
+                    )
+                    self.volume_sums[uid][bookId] = round(self.volume_sums[uid][bookId], volume_decimals)
+            
+            for uid in pruned_maker:
+                for bookId in pruned_maker[uid]:
+                    self.maker_volume_sums[uid][bookId] = max(
+                        0.0,
+                        self.maker_volume_sums[uid][bookId] - pruned_maker[uid][bookId]
+                    )
+                    self.maker_volume_sums[uid][bookId] = round(self.maker_volume_sums[uid][bookId], volume_decimals)
+            
+            for uid in pruned_taker:
+                for bookId in pruned_taker[uid]:
+                    self.taker_volume_sums[uid][bookId] = max(
+                        0.0,
+                        self.taker_volume_sums[uid][bookId] - pruned_taker[uid][bookId]
+                    )
+                    self.taker_volume_sums[uid][bookId] = round(self.taker_volume_sums[uid][bookId], volume_decimals)
+            
+            for uid in pruned_self:
+                for bookId in pruned_self[uid]:
+                    self.self_volume_sums[uid][bookId] = max(
+                        0.0,
+                        self.self_volume_sums[uid][bookId] - pruned_self[uid][bookId]
+                    )
+                    self.self_volume_sums[uid][bookId] = round(self.self_volume_sums[uid][bookId], volume_decimals)
+
+            bt.logging.info(f"Adjusted volume sums after pruning old data")
+
+            bt.logging.info("Shifting inventory history timestamps...")
+            shifted_inventory = {}
+            for uid in range(self.subnet_info.max_uids):
+                if uid in self.inventory_history and self.inventory_history[uid]:
+                    # Keep only last N observations (same as runtime pruning)
+                    hist = self.inventory_history[uid]
+                    if len(hist) > self.config.scoring.sharpe.lookback:
+                        timestamps_to_keep = sorted(hist.keys())[-self.config.scoring.sharpe.lookback:]
+                        hist = {ts: hist[ts] for ts in timestamps_to_keep}
+                    
+                    shifted_inventory[uid] = {}
+                    for prev_time, values in hist.items():
+                        if prev_time >= sharpe_threshold:  # Use SHARPE threshold
+                            time_from_old_end = old_simulation_timestamp - prev_time
+                            new_time = new_simulation_timestamp + time_from_old_end
+                            shifted_inventory[uid][new_time] = values
+            
+            self.inventory_history = {
+                uid: shifted_inventory.get(uid, {})
+                for uid in range(self.subnet_info.max_uids)
+            }
+            
+            bt.logging.info("Shifting realized P&L history timestamps...")
+            shifted_pnl_history = {}
+            for uid in range(self.subnet_info.max_uids):
+                if uid in self.realized_pnl_history and self.realized_pnl_history[uid]:
+                    hist = self.realized_pnl_history[uid]
+                    if len(hist) > self.config.scoring.sharpe.lookback:
+                        timestamps_to_keep = sorted(hist.keys())[-self.config.scoring.sharpe.lookback:]
+                        hist = {ts: hist[ts] for ts in timestamps_to_keep}
+                    
+                    shifted_pnl_history[uid] = {}
+                    for prev_time, books in hist.items():
+                        if prev_time >= sharpe_threshold:
+                            time_from_old_end = old_simulation_timestamp - prev_time
+                            new_time = new_simulation_timestamp + time_from_old_end
+                            shifted_pnl_history[uid][new_time] = books
+
+            self.realized_pnl_history = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
+            for uid, timestamps in shifted_pnl_history.items():
+                for timestamp, books in timestamps.items():
+                    for book_id, pnl in books.items():
+                        self.realized_pnl_history[uid][timestamp][book_id] = pnl
+
+            bt.logging.info(f"Shifted realized P&L history: {len(shifted_pnl_history)} UIDs with data")
+            
+            bt.logging.info("Shifting round-trip volume timestamps...")
+            shifted_rt_volumes = {}
+            for uid in range(self.subnet_info.max_uids):
+                if uid in self.roundtrip_volumes:
+                    shifted_rt_volumes[uid] = {}
+                    for bookId in range(self.simulation.book_count):
+                        if bookId in self.roundtrip_volumes[uid]:
+                            shifted_times = {}
+                            for prev_time, volume in self.roundtrip_volumes[uid][bookId].items():
+                                if prev_time >= volume_threshold:
+                                    time_from_old_end = old_simulation_timestamp - prev_time
+                                    new_time = new_simulation_timestamp + time_from_old_end
+                                    shifted_times[new_time] = volume
+                                else:
+                                    pruned_roundtrip[uid][bookId] += volume
+                            if shifted_times:
+                                shifted_rt_volumes[uid][bookId] = shifted_times
+
+
+            self.roundtrip_volumes = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
+            for uid, books in shifted_rt_volumes.items():
+                for book_id, volumes in books.items():
+                    for timestamp, volume in volumes.items():
+                        self.roundtrip_volumes[uid][book_id][timestamp] = volume
+
+            bt.logging.info(f"Shifted round-trip volumes: {len(shifted_rt_volumes)} UIDs with data")
+
+            bt.logging.info("Adjusting round-trip volume sums for pruned data...")
+            for uid in pruned_roundtrip:
+                for bookId in pruned_roundtrip[uid]:
+                    self.roundtrip_volume_sums[uid][bookId] = max(
+                        0.0,
+                        self.roundtrip_volume_sums[uid][bookId] - pruned_roundtrip[uid][bookId]
+                    )
+                    self.roundtrip_volume_sums[uid][bookId] = round(
+                        self.roundtrip_volume_sums[uid][bookId],
+                        volume_decimals
+                    )
+
+            bt.logging.info(f"Adjusted round-trip volume sums: {len(self.roundtrip_volume_sums)} total entries")
 
             self.start_time = time.time()
             self.simulation_timestamp = timestamp
@@ -752,6 +883,13 @@ if __name__ != "__mp_main__":
             self.last_state_time = None
             self.step_rates = []
             self.simulation.logDir = event.logDir
+
+            bt.logging.info("Clearing open positions (simulation-specific state)...")
+            self.open_positions = defaultdict(lambda: defaultdict(lambda: {
+                'longs': deque(),
+                'shorts': deque()
+            }))
+
             self.compress_outputs(start=True)
 
             bt.logging.info("-"*40)
@@ -775,67 +913,8 @@ if __name__ != "__mp_main__":
                 for uid in range(self.subnet_info.max_uids)
             }
 
-            self.realized_pnl_history = {
-                uid: {
-                    prev_time - self.simulation_timestamp: pnl_books
-                    for prev_time, pnl_books in self.realized_pnl_history[uid].items()
-                    if prev_time - self.simulation_timestamp < self.simulation_timestamp
-                } for uid in range(self.subnet_info.max_uids)
-            }
-
-            bt.logging.info("Shifting round-trip volume timestamps...")
-            self.roundtrip_volumes = {
-                uid: {
-                    bookId: {
-                        prev_time - self.simulation_timestamp: volume
-                        for prev_time, volume in self.roundtrip_volumes.get(uid, {}).get(bookId, {}).items()
-                        if prev_time - self.simulation_timestamp < self.simulation_timestamp
-                    } for bookId in range(self.simulation.book_count)
-                } for uid in range(self.subnet_info.max_uids)
-            }
-
-            bt.logging.info("Recalculating round-trip volume sums after timestamp shift...")
-            self.roundtrip_volume_sums = defaultdict(lambda: defaultdict(float))
-            for uid in range(self.subnet_info.max_uids):
-                for bookId in range(self.simulation.book_count):
-                    if uid in self.roundtrip_volumes and bookId in self.roundtrip_volumes[uid]:
-                        total_rt_volume = sum(self.roundtrip_volumes[uid][bookId].values())
-                        if total_rt_volume > 0:
-                            self.roundtrip_volume_sums[uid][bookId] = round(
-                                total_rt_volume,
-                                volume_decimals
-                            )
-
-            bt.logging.info(f"Recalculated round-trip volume sums: {len(self.roundtrip_volume_sums)} total entries")
-
-            self.open_positions = defaultdict(lambda: defaultdict(lambda: {
-                'longs': deque(),
-                'shorts': deque()
-            }))
-
-            bt.logging.info("Simulation restart complete - all timestamps shifted and sums recalculated")
+            bt.logging.info("Simulation restart complete - historical data persisted with correct retention periods")
             self.save_state()
-
-        def onEnd(self) -> None:
-            """
-            Handles the simulator end event.
-
-            Responsibilities:
-                - Logs simulation end.
-                - Clears active log directory and resets fundamental price data.
-                - Clears pending notices for all UIDs.
-                - Saves state one final time.
-                - Pulls repo updates and rebuilds simulator if needed.
-
-            Returns:
-                None
-            """
-            bt.logging.info("SIMULATION ENDED")
-            self.simulation.logDir = None
-            self.fundamental_price = {bookId : None for bookId in range(self.simulation.book_count)}
-            self.pending_notices = {uid : [] for uid in range(self.subnet_info.max_uids)}
-            self.save_state()
-            self.update_repo(end=True)
 
         def _construct_save_data(self):
             """
