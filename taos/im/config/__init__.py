@@ -139,14 +139,14 @@ def add_im_validator_args(cls, parser):
         "--scoring.sharpe.unrealized_weight",
         type=int,
         help="The weight assigned to unrealized PnL score in the reward function.",
-        default=0.5,
+        default=0.0,
     )
     
     parser.add_argument(
         "--scoring.sharpe.realized_weight",
         type=int,
         help="The weight assigned to realized PnL score in the reward function.",
-        default=0.5,
+        default=1.0,
     )
     
     parser.add_argument(
