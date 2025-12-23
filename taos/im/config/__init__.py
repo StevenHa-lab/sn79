@@ -190,6 +190,20 @@ def add_im_validator_args(cls, parser):
         help="The period in simulation timesteps over which agent trading volumes are aggregated when evaluating activity.",
         default=86400_000_000_000,
     )
+    
+    parser.add_argument(
+        "--scoring.activity.impact",
+        type=int,
+        help="Multiplied onto activity factors to modify the impact of volume weighting in scoring calculations.",
+        default=0.33,
+    )
+    
+    parser.add_argument(
+        "--scoring.activity.decay_grace_period",
+        type=int,
+        help="The period in simulation timesteps for which the decay factor is unaccelerated.  After this duration of not trading/round-tripping, activity factor decay accelerates.",
+        default=600_000_000_000,
+    )
 
     parser.add_argument(
         "--scoring.activity.capital_turnover_cap",

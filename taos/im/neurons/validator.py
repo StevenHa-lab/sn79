@@ -464,6 +464,13 @@ if __name__ != "__mp_main__":
             self.main_loop = asyncio.new_event_loop()
             self._main_loop_ready = Event()
             core_allocation = get_core_allocation()
+            ipc_cores = core_allocation['ipc']
+            self.ipc_executor = ThreadPoolExecutor(
+                max_workers=4,
+                thread_name_prefix='ipc',
+                initializer=lambda: os.sched_setaffinity(0, set(ipc_cores))
+            )
+            bt.logging.info(f"IPC executor assigned to cores: {ipc_cores}")
             validator_cores = core_allocation['validator']
             os.sched_setaffinity(0, set(validator_cores))
             bt.logging.info(f"Validator assigned to cores: {validator_cores}")
@@ -638,6 +645,35 @@ if __name__ != "__mp_main__":
                             bt.logging.debug(f"Still waiting for {wait_process}... ({elapsed:.1f}s)")
                 total_wait = time.time() - start_wait
                 bt.logging.debug(f"Waited {total_wait:.1f}s for {wait_process}")
+                
+        async def _write_ipc_nonblocking(self, mem, queue, data_bytes, operation="IPC"):
+            """
+            Write to shared memory in executor thread.
+            """
+            write_timeout = 5.0
+            
+            def write_worker():
+                try:
+                    mem.seek(0)
+                    mem.write(struct.pack('Q', len(data_bytes)))
+                    mem.write(data_bytes)
+                    return True
+                except Exception as e:
+                    bt.logging.error(f"{operation} write failed: {e}")
+                    return False
+            
+            try:
+                result = await asyncio.wait_for(
+                    asyncio.get_event_loop().run_in_executor(
+                        self.ipc_executor,
+                        write_worker
+                    ),
+                    timeout=write_timeout
+                )
+                return result
+            except asyncio.TimeoutError:
+                bt.logging.error(f"{operation} write timeout after {write_timeout}s")
+                return False
 
         def load_fundamental(self):
             """
@@ -1017,22 +1053,26 @@ if __name__ != "__mp_main__":
             try:
                 bt.logging.info(f"Starting state saving for step {self.step}...")
                 start = time.time()
-                simulation_state_data, validator_state_data = self._construct_save_data()
-                bt.logging.debug("Saving state...")
-                future_start = time.time()
 
-                future = asyncio.get_running_loop().run_in_executor(
-                    self.save_state_executor,
+                construct_start = time.time()
+                simulation_state_data, validator_state_data = self._construct_save_data()
+                bt.logging.debug(f"Constructed save data ({time.time()-construct_start:.4f}s)")
+
+                save_start = time.time()
+                
+                future = self.save_state_executor.submit(
                     save_state_worker,
                     simulation_state_data,
                     validator_state_data,
                     self.simulation_state_file,
                     self.validator_state_file
                 )
+                
                 while not future.done():
                     await asyncio.sleep(0.1)
+                
                 result = future.result()
-                bt.logging.debug(f"Saved state ({time.time() - future_start}s)")
+                bt.logging.debug(f"Saved state ({time.time() - save_start:.4f}s)")
 
                 if result['success']:
                     bt.logging.success(
@@ -1043,12 +1083,9 @@ if __name__ != "__mp_main__":
                         f"Validator state saved to {self.validator_state_file} "
                         f"({result['validator_save_time']:.4f}s)"
                     )
-                    bt.logging.info(f"Total save time: {result['total_time']:.4f}s | {time.time()-start}s")
+                    bt.logging.info(f"Total save time: {result['total_time']:.4f}s")
                     return True
                 else:
-                    bt.logging.error(f"Failed to save state: {result['error']}")
-                    if result.get('traceback'):
-                        bt.logging.debug(result['traceback'])
                     self.pagerduty_alert(
                         f"Failed to save state: {result['error']}",
                         details={"trace": result.get('traceback')}
@@ -1056,8 +1093,6 @@ if __name__ != "__mp_main__":
                     return False
 
             except Exception as ex:
-                bt.logging.error(f"Error preparing state for save: {ex}")
-                bt.logging.debug(traceback.format_exc())
                 self.pagerduty_alert(
                     f"Failed to prepare state for save: {ex}",
                     details={"trace": traceback.format_exc()}
@@ -1586,26 +1621,98 @@ if __name__ != "__mp_main__":
             self.load_fundamental()
             bt.logging.debug(f"Retrieved fundamental prices ({time.time()-start:.4f}s).")
 
+            book_count = self.simulation.book_count
+
+            bt.logging.debug("Building minimal inventory...")
+            inv_start = time.time()
+            minimal_inventory = {}
+            for uid, hist in self.inventory_history.items():
+                if not hist:
+                    continue
+                timestamps = sorted(hist.keys())
+                n = len(timestamps)
+                if n >= 3:
+                    minimal_inventory[uid] = {
+                        timestamps[0]: hist[timestamps[0]],
+                        timestamps[-2]: hist[timestamps[-2]],
+                        timestamps[-1]: hist[timestamps[-1]]
+                    }
+                elif n > 0:
+                    minimal_inventory[uid] = {ts: hist[ts] for ts in timestamps}
+            bt.logging.debug(f"Built minimal inventory ({time.time()-inv_start:.4f}s)")
+
+            bt.logging.debug("Serializing volume sums...")
+            serialize_start = time.time()
+            
             def serialize_nested_dict(d):
-                """Convert nested dict to flat string keys."""
                 return {
                     f"{uid}:{book_id}": vol
                     for uid, books in d.items()
-                    for book_id, vol in books.items()    }
+                    for book_id, vol in books.items()
+                }
+            
+            volume_sums_flat = serialize_nested_dict(self.volume_sums)
+            maker_volume_sums_flat = serialize_nested_dict(self.maker_volume_sums)
+            taker_volume_sums_flat = serialize_nested_dict(self.taker_volume_sums)
+            self_volume_sums_flat = serialize_nested_dict(self.self_volume_sums)
+            roundtrip_volume_sums_flat = serialize_nested_dict(self.roundtrip_volume_sums)
+            
+            bt.logging.debug(f"Serialized volume sums ({time.time()-serialize_start:.4f}s)")
 
-            return {
-                'metagraph_data': {
-                    'hotkeys': [str(hk) for hk in self.metagraph.hotkeys],
-                    'stake': self.metagraph.stake.tolist(),
-                    'trust': self.metagraph.trust.tolist(),
-                    'consensus': self.metagraph.consensus.tolist(),
-                    'incentive': self.metagraph.incentive.tolist(),
-                    'emission': self.metagraph.emission.tolist(),
-                    'validator_trust': self.metagraph.validator_trust.tolist(),
-                    'dividends': self.metagraph.dividends.tolist(),
-                    'active': self.metagraph.active.tolist(),
-                    'last_update': self.metagraph.last_update.tolist(),
-                },
+            bt.logging.debug("Building metagraph data...")
+            meta_start = time.time()
+            metagraph_data = {
+                'hotkeys': [str(hk) for hk in self.metagraph.hotkeys],
+                'stake': self.metagraph.stake.tolist(),
+                'trust': self.metagraph.trust.tolist(),
+                'consensus': self.metagraph.consensus.tolist(),
+                'incentive': self.metagraph.incentive.tolist(),
+                'emission': self.metagraph.emission.tolist(),
+                'validator_trust': self.metagraph.validator_trust.tolist(),
+                'dividends': self.metagraph.dividends.tolist(),
+                'active': self.metagraph.active.tolist(),
+                'last_update': self.metagraph.last_update.tolist(),
+            }
+            bt.logging.debug(f"Built metagraph data ({time.time()-meta_start:.4f}s)")
+
+            bt.logging.debug("Building recent trades...")
+            trades_start = time.time()
+            recent_trades = {
+                bookId: [t.model_dump() for t in trades[-25:]]
+                for bookId, trades in self.recent_trades.items()
+            }
+            
+            recent_miner_trades = {
+                uid: {
+                    bookId: [
+                        {'trade': miner_trade.model_dump(), 'role': role}
+                        for miner_trade, role in trades[-5:]
+                    ]
+                    for bookId, trades in book_trades.items()
+                }
+                for uid, book_trades in self.recent_miner_trades.items()
+            }
+            bt.logging.debug(f"Built recent trades ({time.time()-trades_start:.4f}s)")
+
+            bt.logging.debug("Building position summary...")
+            pos_start = time.time()
+            open_positions = {
+                uid: {
+                    book_id: {
+                        'longs_count': len(pos['longs']),
+                        'shorts_count': len(pos['shorts'])
+                    }
+                    for book_id, pos in books.items()
+                }
+                for uid, books in self.open_positions.items()
+            }
+            bt.logging.debug(f"Built position summary ({time.time()-pos_start:.4f}s)")
+
+            bt.logging.debug("Assembling final data structure...")
+            final_start = time.time()
+            
+            data = {
+                'metagraph_data': metagraph_data,
                 'simulation': self.simulation.model_dump(),
                 'last_state': {
                     'accounts': self.last_state.accounts,
@@ -1614,13 +1721,15 @@ if __name__ != "__mp_main__":
                 },
                 'simulation_timestamp': self.simulation_timestamp,
                 'step': self.step,
-                'step_rates': list(self.step_rates),
-                'volume_sums': serialize_nested_dict(self.volume_sums),
-                'maker_volume_sums': serialize_nested_dict(self.maker_volume_sums),
-                'taker_volume_sums': serialize_nested_dict(self.taker_volume_sums),
-                'self_volume_sums': serialize_nested_dict(self.self_volume_sums),
-                'roundtrip_volume_sums': serialize_nested_dict(self.roundtrip_volume_sums),
-                'inventory_history': self.inventory_history,
+                'step_rates': list(self.step_rates[-100:]),
+                'volume_sums': volume_sums_flat,
+                'maker_volume_sums': maker_volume_sums_flat,
+                'taker_volume_sums': taker_volume_sums_flat,
+                'self_volume_sums': self_volume_sums_flat,
+                'roundtrip_volume_sums': roundtrip_volume_sums_flat,
+                'inventory_history': minimal_inventory,
+                'realized_pnl_history': dict(self.realized_pnl_history),
+                'book_count': book_count,
                 'activity_factors': self.activity_factors,
                 'activity_factors_realized': self.activity_factors_realized,
                 'sharpe_values': self.sharpe_values,
@@ -1629,30 +1738,18 @@ if __name__ != "__mp_main__":
                 'miner_stats': self.miner_stats,
                 'initial_balances': self.initial_balances,
                 'initial_balances_published': self.initial_balances_published,
-                'recent_trades': {bookId: [t.model_dump() for t in trades] for bookId, trades in self.recent_trades.items()},
-                'recent_miner_trades': {
-                    uid: {
-                        bookId: [{'trade': miner_trade.model_dump(), 'role': role} for miner_trade, role in trades]
-                        for bookId, trades in book_trades.items()
-                    }
-                    for uid, book_trades in self.recent_miner_trades.items()
-                },
-                'realized_pnl_history': self.realized_pnl_history,
-                'open_positions': {
-                    uid: {
-                        book_id: {
-                            'longs_count': len(pos['longs']),
-                            'shorts_count': len(pos['shorts'])
-                        }
-                        for book_id, pos in books.items()
-                    }
-                    for uid, books in self.open_positions.items()
-                },
+                'recent_trades': recent_trades,
+                'recent_miner_trades': recent_miner_trades,
+                'open_positions': open_positions,
                 'fundamental_price': self.fundamental_price,
                 'shared_state_rewarding': self.shared_state_rewarding,
                 'current_block': self.current_block,
                 'uid': self.uid,
             }
+            
+            bt.logging.debug(f"Assembled final structure ({time.time()-final_start:.4f}s)")
+            
+            return data
 
         async def _report(self):
             if self._reporting:
@@ -1679,39 +1776,67 @@ if __name__ != "__mp_main__":
                     except posix_ipc.BusyError:
                         break
 
+                prep_start = time.time()
                 data = self._prepare_reporting_data()
+                prep_time = time.time() - prep_start
+                bt.logging.info(f"Prepared reporting data ({prep_time:.4f}s)")
+
+                serialize_start = time.time()
+                data_bytes = await asyncio.get_event_loop().run_in_executor(
+                    self.ipc_executor,
+                    lambda: msgpack.packb(data, use_bin_type=True)
+                )
+                serialize_time = time.time() - serialize_start
+                data_mb = len(data_bytes) / 1024 / 1024
+                bt.logging.info(f"Reporting data: {data_mb:.2f} MB (prep={prep_time:.4f}s, serialize={serialize_time:.4f}s)")
 
                 write_start = time.time()
-                serialize_start = time.time()
-                data_bytes = await asyncio.to_thread(msgpack.packb, data, use_bin_type=True)
-                serialize_time = time.time() - serialize_start
-
-                data_mb = len(data_bytes) / 1024 / 1024
-                bt.logging.info(f"Reporting data: {data_mb:.2f} MB (serialize={serialize_time:.4f}s)")
-
-                def write_data():
-                    self.reporting_request_mem.seek(0)
-                    self.reporting_request_mem.write(struct.pack('Q', len(data_bytes)))
-                    self.reporting_request_mem.write(data_bytes)
-
-                await asyncio.to_thread(write_data)
+                write_success = await self._write_ipc_nonblocking(
+                    self.reporting_request_mem,
+                    self.reporting_request_queue,
+                    data_bytes,
+                    "Reporting"
+                )
+                
+                if not write_success:
+                    bt.logging.error("Failed to write reporting data")
+                    return
+                
                 bt.logging.info(f"Wrote reporting data ({time.time()-write_start:.4f}s)")
 
+                await asyncio.get_event_loop().run_in_executor(
+                    self.ipc_executor,
+                    self.reporting_request_queue.send,
+                    b'publish'
+                )
+
                 receive_start = time.time()
-                await asyncio.to_thread(self.reporting_request_queue.send, b'publish')
-                message, _ = await asyncio.to_thread(self.reporting_response_queue.receive)
-                bt.logging.info(f"Received reporting response ({time.time()-receive_start:.4f}s).")
+                try:
+                    message, _ = await asyncio.wait_for(
+                        asyncio.get_event_loop().run_in_executor(
+                            self.ipc_executor,
+                            self.reporting_response_queue.receive
+                        ),
+                        timeout=60.0
+                    )
+                    bt.logging.debug(f"Received reporting response ({time.time()-receive_start:.4f}s)")
+                except asyncio.TimeoutError:
+                    bt.logging.error("Reporting response timeout after 5s")
+                    return
 
                 read_start = time.time()
-
-                def read_response():
+                
+                async def read_response():
                     self.reporting_response_mem.seek(0)
                     size_bytes = self.reporting_response_mem.read(8)
                     data_size = struct.unpack('Q', size_bytes)[0]
                     result_bytes = self.reporting_response_mem.read(data_size)
                     return msgpack.unpackb(result_bytes, raw=False, strict_map_key=False)
 
-                result = await asyncio.to_thread(read_response)
+                result = await asyncio.get_event_loop().run_in_executor(
+                    self.ipc_executor,
+                    lambda: asyncio.run(read_response())
+                )
 
                 bt.logging.info(f"Read reporting response data ({time.time()-read_start:.4f}s)")
                 self.initial_balances_published = result['initial_balances_published']
@@ -1723,7 +1848,7 @@ if __name__ != "__mp_main__":
                 bt.logging.error(traceback.format_exc())
             finally:
                 self._reporting = False
-                bt.logging.info(f"Completed reporting for step {reporting_step} ({time.time() - start}s)")
+                bt.logging.info(f"Completed reporting for step {reporting_step} ({time.time() - start:.4f}s)")
 
         def report(self) -> None:
             if self.config.reporting.disabled or not self.last_state or self.last_state.timestamp % self.config.scoring.interval != 0:
@@ -1737,23 +1862,14 @@ if __name__ != "__mp_main__":
         async def _compute_compact_volumes(self) -> Dict:
             """
             Compute compact volume metrics used for activity-weighted scoring.
-
-            This method aggregates each UID’s total trade volumes across all books
-            into two compressed metrics:
-
-            • **lookback_volume** — Total traded value within the scoring lookback window
-            • **latest_volume** — Most recent sampled trade volume entry
-
-            These values are consumed later during reward computation for activity scoring.
-
             Returns:
                 Dict[int, Dict[int, Dict[str, float]]]:
-                    Nested structure:
                     {
                         uid: {
                             book_id: {
                                 "lookback_volume": float,
-                                "latest_volume": float
+                                "latest_volume": float,
+                                "latest_timestamp": int
                             }
                         }
                     }
@@ -1762,6 +1878,10 @@ if __name__ != "__mp_main__":
                 self.config.scoring.sharpe.lookback *
                 self.simulation.publish_interval
             )
+            
+            sampled_timestamp = math.ceil(
+                self.simulation_timestamp / self.config.scoring.activity.trade_volume_sampling_interval
+            ) * self.config.scoring.activity.trade_volume_sampling_interval
 
             compact_volumes = {}
             for uid in self.metagraph.uids:
@@ -1774,41 +1894,56 @@ if __name__ != "__mp_main__":
                         if not total_trades:
                             compact_volumes[uid_item][book_id] = {
                                 'lookback_volume': 0.0,
-                                'latest_volume': 0.0
+                                'latest_volume': 0.0,
+                                'latest_timestamp': 0
                             }
                             continue
-                        timestamps = total_trades.keys()
-                        latest_time = max(timestamps)
-                        latest_volume = total_trades[latest_time]
+
+                        timestamps_with_volume = sorted([
+                            ts for ts, vol in total_trades.items() if vol > 0
+                        ])
+                        
+                        if timestamps_with_volume:
+                            latest_time = timestamps_with_volume[-1]
+                        else:
+                            latest_time = 0
+
+                        if latest_time == sampled_timestamp:
+                            latest_volume = total_trades[sampled_timestamp]
+                        else:
+                            latest_volume = 0.0
+                        
                         lookback_volume = sum(
                             vol for t, vol in total_trades.items()
                             if t >= lookback_threshold
                         )
+                        
                         compact_volumes[uid_item][book_id] = {
                             'lookback_volume': lookback_volume,
-                            'latest_volume': latest_volume
+                            'latest_volume': latest_volume,
+                            'latest_timestamp': latest_time
                         }
                 else:
                     for book_id in range(self.simulation.book_count):
                         compact_volumes[uid_item][book_id] = {
                             'lookback_volume': 0.0,
-                            'latest_volume': 0.0
+                            'latest_volume': 0.0,
+                            'latest_timestamp': 0
                         }
             return compact_volumes
 
         async def _compute_compact_roundtrip_volumes(self) -> Dict:
             """
-            Compute compact round-trip volume metrics for realized Sharpe activity scoring.
-            Round-trip volume represents trades that opened AND closed positions,
-            indicating actual realized trading activity rather than just position building.
-
+            Compute compact round-trip volume metrics including latest round-trip timestamp.
+            
             Returns:
                 Dict[int, Dict[int, Dict[str, float]]]:
                     {
                         uid: {
                             book_id: {
                                 "lookback_roundtrip_volume": float,
-                                "latest_roundtrip_volume": float
+                                "latest_roundtrip_volume": float,
+                                "latest_roundtrip_timestamp": int
                             }
                         }
                     }
@@ -1817,6 +1952,10 @@ if __name__ != "__mp_main__":
                 self.config.scoring.sharpe.lookback *
                 self.simulation.publish_interval
             )
+            
+            sampled_timestamp = math.ceil(
+                self.simulation_timestamp / self.config.scoring.activity.trade_volume_sampling_interval
+            ) * self.config.scoring.activity.trade_volume_sampling_interval
 
             compact_roundtrip = {}
             for uid in self.metagraph.uids:
@@ -1828,14 +1967,25 @@ if __name__ != "__mp_main__":
                         if not rt_volumes:
                             compact_roundtrip[uid_item][book_id] = {
                                 'lookback_roundtrip_volume': 0.0,
-                                'latest_roundtrip_volume': 0.0
+                                'latest_roundtrip_volume': 0.0,
+                                'latest_roundtrip_timestamp': 0
                             }
                             continue
 
-                        timestamps = rt_volumes.keys()
-                        latest_time = max(timestamps)
-                        latest_volume = rt_volumes[latest_time]
+                        timestamps_with_volume = sorted([
+                            ts for ts, vol in rt_volumes.items() if vol > 0
+                        ])
+                        
+                        if timestamps_with_volume:
+                            latest_time = timestamps_with_volume[-1]
+                        else:
+                            latest_time = 0
 
+                        if latest_time == sampled_timestamp:
+                            latest_volume = rt_volumes[sampled_timestamp]
+                        else:
+                            latest_volume = 0.0
+                        
                         lookback_volume = sum(
                             vol for t, vol in rt_volumes.items()
                             if t >= lookback_threshold
@@ -1843,13 +1993,15 @@ if __name__ != "__mp_main__":
 
                         compact_roundtrip[uid_item][book_id] = {
                             'lookback_roundtrip_volume': lookback_volume,
-                            'latest_roundtrip_volume': latest_volume
+                            'latest_roundtrip_volume': latest_volume,
+                            'latest_roundtrip_timestamp': latest_time
                         }
                 else:
                     for book_id in range(self.simulation.book_count):
                         compact_roundtrip[uid_item][book_id] = {
                             'lookback_roundtrip_volume': 0.0,
-                            'latest_roundtrip_volume': 0.0
+                            'latest_roundtrip_volume': 0.0,
+                            'latest_roundtrip_timestamp': 0
                         }
 
             return compact_roundtrip
@@ -2274,7 +2426,95 @@ if __name__ != "__mp_main__":
             bt.logging.debug(f"[UPDATE_VOLUMES] Total: {total_time:.4f}s")
             await asyncio.sleep(0)
 
-        async def _reward(self, state : MarketSimulationStateUpdate):
+        async def _prepare_inventory_compact(self):
+            """
+            Convert inventory history to compact format with async yielding.
+            
+            Returns:
+                Dict: Compact inventory history with lookback applied
+                    Format: {uid: {timestamp: {book_id: value}}}
+            """
+            bt.logging.debug("[REWARD] Converting inventory history...")
+            convert_start = time.time()
+            inventory_compact = {}
+            
+            for i, uid in enumerate(self.metagraph.uids):
+                uid_item = uid.item()
+                if uid_item in self.inventory_history and len(self.inventory_history[uid_item]) > 0:
+                    hist = self.inventory_history[uid_item]
+                    lookback = min(self.config.scoring.sharpe.lookback, len(hist))
+                    sorted_timestamps = sorted(hist.keys())[-lookback:]
+                    inventory_compact[uid_item] = {ts: hist[ts] for ts in sorted_timestamps}
+                else:
+                    inventory_compact[uid_item] = {}
+                if i % 32 == 0:
+                    await asyncio.sleep(0)
+            
+            bt.logging.debug(f"[REWARD] Converted inventory history in {time.time()-convert_start:.4f}s")
+            return inventory_compact
+
+        async def _prepare_realized_pnl_compact(self):
+            """
+            Convert realized P&L history to compact format with async yielding.
+            
+            Returns:
+                Dict: Compact realized P&L history with lookback applied
+                    Format: {uid: {timestamp: {book_id: pnl}}}
+            """
+            bt.logging.debug("[REWARD] Converting realized P&L history...")
+            convert_start = time.time()
+            realized_pnl_compact = {}
+            
+            for i, uid in enumerate(self.metagraph.uids):
+                uid_item = uid.item()
+                if uid_item in self.realized_pnl_history and len(self.realized_pnl_history[uid_item]) > 0:
+                    hist = self.realized_pnl_history[uid_item]
+                    lookback = min(self.config.scoring.sharpe.lookback, len(hist))
+                    sorted_timestamps = sorted(hist.keys())[-lookback:]
+                    realized_pnl_compact[uid_item] = {ts: hist[ts] for ts in sorted_timestamps}
+                else:
+                    realized_pnl_compact[uid_item] = {}
+                if i % 32 == 0:
+                    await asyncio.sleep(0)
+            
+            bt.logging.debug(f"[REWARD] Converted realized P&L history in {time.time()-convert_start:.4f}s")
+            return realized_pnl_compact
+
+        async def _extract_miner_positions(self, state: MarketSimulationStateUpdate):
+            """
+            Extract current miner positions from simulation state with async yielding.
+            
+            Args:
+                state (MarketSimulationStateUpdate): Current simulation state
+            
+            Returns:
+                Dict: Miner positions for all UIDs
+                    Format: {uid: {book_id: {'base': float, 'quote': float, 'midquote': float}}}
+            """
+            bt.logging.debug("[REWARD] Extracting miner positions...")
+            positions_start = time.time()
+            miner_positions = {}
+            
+            for i, uid in enumerate(self.metagraph.uids):
+                uid_item = uid.item()
+                if uid_item in state.accounts:
+                    miner_positions[uid_item] = {}
+                    for book_id, account in state.accounts[uid_item].items():
+                        miner_positions[uid_item][book_id] = {
+                            'base': account['bb']['t'] - account['bl'] + account['bc'],
+                            'quote': account['qb']['t'] - account['ql'] + account['qc'],
+                            'midquote': round(
+                                (state.books[book_id]['b'][0]['p'] + state.books[book_id]['a'][0]['p']) / 2,
+                                self.simulation.priceDecimals
+                            )
+                        }
+                if i % 32 == 0:
+                    await asyncio.sleep(0)
+            
+            bt.logging.debug(f"[REWARD] Extracted positions for {len(miner_positions)} miners in {time.time()-positions_start:.4f}s")
+            return miner_positions
+
+        async def _reward(self, state: MarketSimulationStateUpdate):
             """
             Asynchronously perform the full reward computation pipeline.
 
@@ -2285,16 +2525,14 @@ if __name__ != "__mp_main__":
                 1. Acquire async lock to prevent concurrent reward computation.
                 2. Update trade volumes via `_update_trade_volumes()`.
                 3. If the timestamp does not align with the scoring interval, exit early.
-                4. Convert inventory history into compact, lookback-bounded form.
-                5. Compute compact volume metrics.
-                6. Extract current miner balances from simulation state.
-                7. Construct the complete `validator_data` payload for the scoring engine.
-                8. Call the reward function (`get_rewards`) to compute:
-                    • Sharpe values (both unrealized and realized)
-                    • Activity factors
-                    • Updated simulation timestamp
-                    • Final per-UID reward values
-                9. Apply computed rewards and update internal score tables.
+                4. Convert inventory history into compact, lookback-bounded form (async).
+                5. Compute compact volume metrics (async).
+                6. Compute compact round-trip volume metrics (async).
+                7. Convert realized P&L history to compact form (async).
+                8. Extract current miner balances from simulation state (async).
+                9. Construct the complete `validator_data` payload for the scoring engine.
+                10. Run get_rewards() in a thread pool to prevent blocking.
+                11. Apply computed rewards and update internal score tables.
 
             Args:
                 state (MarketSimulationStateUpdate):
@@ -2333,64 +2571,11 @@ if __name__ != "__mp_main__":
                     if timestamp % self.config.scoring.interval != 0:
                         bt.logging.info(f"Agent Scores Data Updated for {duration} ({time.time()-start:.4f}s)")
                         return
-                    bt.logging.debug("[REWARD] Converting inventory history...")
-                    convert_start = time.time()
-                    inventory_compact = {}
-
-                    total_timestamps = 0
-                    for uid in self.metagraph.uids:
-                        uid_item = uid.item()
-                        if uid_item in self.inventory_history and len(self.inventory_history[uid_item]) > 0:
-                            hist = self.inventory_history[uid_item]
-                            lookback = min(self.config.scoring.sharpe.lookback, len(hist))
-                            sorted_timestamps = sorted(hist.keys())[-lookback:]
-                            inventory_compact[uid_item] = {ts: hist[ts] for ts in sorted_timestamps}
-                            total_timestamps += len(sorted_timestamps)
-                        else:
-                            inventory_compact[uid_item] = {}
-
-                    bt.logging.debug(f"[REWARD] Converted inventory history in {time.time()-convert_start:.4f}s")
-
-                    compact_start = time.time()
+                    inventory_compact = await self._prepare_inventory_compact()
                     compact_volumes = await self._compute_compact_volumes()
-                    bt.logging.debug(f"[REWARD] Computed compact volumes in {time.time()-compact_start:.4f}s")
-
-                    roundtrip_start = time.time()
                     compact_roundtrip_volumes = await self._compute_compact_roundtrip_volumes()
-                    bt.logging.debug(f"[REWARD] Computed compact round-trip volumes in {time.time()-roundtrip_start:.4f}s")
-
-                    bt.logging.debug("[REWARD] Converting realized P&L history...")
-                    convert_start = time.time()
-
-                    realized_pnl_compact = {}
-                    for uid in self.metagraph.uids:
-                        uid_item = uid.item()
-                        if uid_item in self.realized_pnl_history and len(self.realized_pnl_history[uid_item]) > 0:
-                            hist = self.realized_pnl_history[uid_item]
-                            lookback = min(self.config.scoring.sharpe.lookback, len(hist))
-                            sorted_timestamps = sorted(hist.keys())[-lookback:]
-                            realized_pnl_compact[uid_item] = {ts: hist[ts] for ts in sorted_timestamps}
-                        else:
-                            realized_pnl_compact[uid_item] = {}
-
-                    bt.logging.debug(f"[REWARD] Converted realized P&L history in {time.time()-convert_start:.4f}s")
-
-                    bt.logging.debug("[REWARD] Extracting miner positions...")
-                    positions_start = time.time()
-                    miner_positions = {}
-
-                    for uid in self.metagraph.uids:
-                        uid_item = uid.item()
-                        if uid_item in state.accounts:
-                            miner_positions[uid_item] = {}
-                            for book_id, account in state.accounts[uid_item].items():
-                                miner_positions[uid_item][book_id] = {
-                                    'base': account['bb']['t'] - account['bl'] + account['bc'],
-                                    'quote': account['qb']['t'] - account['ql'] + account['qc'],
-                                    'midquote': round((state.books[book_id]['b'][0]['p'] + state.books[book_id]['a'][0]['p']) / 2, self.simulation.priceDecimals)
-                                }
-
-                    bt.logging.debug(f"[REWARD] Extracted positions for {len(miner_positions)} miners in {time.time()-positions_start:.4f}s")
+                    realized_pnl_compact = await self._prepare_realized_pnl_compact()
+                    miner_positions = await self._extract_miner_positions(state)
 
                     prep_start = time.time()
                     validator_data = {
@@ -2416,8 +2601,10 @@ if __name__ != "__mp_main__":
                                     'capital_turnover_cap': self.config.scoring.activity.capital_turnover_cap,
                                     'trade_volume_sampling_interval': self.config.scoring.activity.trade_volume_sampling_interval,
                                     'trade_volume_assessment_period': self.config.scoring.activity.trade_volume_assessment_period,
+                                    'decay_grace_period': self.config.scoring.activity.decay_grace_period,
+                                    'impact' : self.config.scoring.activity.impact
                                 },
-                                "inventory" : {
+                                "inventory": {
                                     'min_balance_ratio_multiplier': self.config.scoring.inventory.min_balance_ratio_multiplier,
                                     'max_balance_ratio_multiplier': self.config.scoring.inventory.max_balance_ratio_multiplier
                                 },
@@ -2448,7 +2635,12 @@ if __name__ != "__mp_main__":
 
                     await asyncio.sleep(0)
 
-                    rewards, updated_data = get_rewards(validator_data)
+                    bt.logging.info("Starting threaded reward calculation...")
+                    calc_start = time.time()
+                    
+                    rewards, updated_data = await asyncio.to_thread(get_rewards, validator_data)
+                    
+                    bt.logging.info(f"Threaded reward calculation completed ({time.time()-calc_start:.4f}s)")
 
                     self.sharpe_values = updated_data.get('sharpe_values', self.sharpe_values)
                     self.activity_factors = updated_data.get('activity_factors', self.activity_factors)
@@ -2972,6 +3164,14 @@ if __name__ != "__mp_main__":
                         bt.logging.info("reward_executor processes terminated")
                     except Exception as term_ex:
                         bt.logging.error(f"Error terminating reward_executor: {term_ex}")
+            
+            if hasattr(self, 'ipc_executor') and self.ipc_executor is not None:
+                try:
+                    bt.logging.info("Shutting down ipc_executor...")
+                    self.ipc_executor.shutdown(wait=True, cancel_futures=False)
+                    bt.logging.info("ipc_executor shut down successfully")
+                except Exception as ex:
+                    bt.logging.error(f"Error shutting down ipc_executor: {ex}")
 
             thread_executors = {
                 'save_state_executor': getattr(self, 'save_state_executor', None),

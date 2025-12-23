@@ -194,11 +194,13 @@ class ReportingService:
         self.self_volume_sums = deserialize_to_nested_dict(data['self_volume_sums'])
         self.roundtrip_volume_sums = deserialize_to_nested_dict(data['roundtrip_volume_sums'])
     
-        for key in ['inventory_history', 'realized_pnl_history', 'activity_factors', 
-                    'activity_factors_realized', 'sharpe_values', 
-                    'unnormalized_scores', 'scores', 'miner_stats', 'initial_balances', 'initial_balances_published',
-                    'simulation_timestamp', 'step', 'step_rates', 'fundamental_price',
-                    'shared_state_rewarding', 'current_block', 'uid', 'metagraph_data']:
+        self.inventory_history = data['inventory_history']
+        self.realized_pnl_history = data['realized_pnl_history']
+        for key in ['activity_factors', 'activity_factors_realized', 'sharpe_values', 
+                    'unnormalized_scores', 'scores', 'miner_stats', 'initial_balances', 
+                    'initial_balances_published', 'simulation_timestamp', 'step', 
+                    'step_rates', 'fundamental_price', 'shared_state_rewarding', 
+                    'current_block', 'uid', 'metagraph_data']:
             setattr(self, key, data[key])
         
         class SimpleState:
@@ -336,6 +338,29 @@ def report_worker(validator_data: Dict, state_data: Dict) -> Dict:
         'error': None
     }
 
+    def compute_realized_pnl_aggregates(realized_pnl_history, book_count):
+        """
+        Compute total and per-book realized P&L aggregates.
+        Runs in report worker process to avoid blocking validator.
+        """
+        total_realized_pnl = {}
+        realized_pnl_by_book = {}
+        
+        for uid, hist in realized_pnl_history.items():
+            if not hist:
+                total_realized_pnl[uid] = 0.0
+                realized_pnl_by_book[uid] = {book_id: 0.0 for book_id in range(book_count)}
+                continue
+            
+            book_totals = [0.0] * book_count
+            for timestamp_data in hist.values():
+                for book_id, pnl in timestamp_data.items():
+                    book_totals[book_id] += pnl
+            
+            realized_pnl_by_book[uid] = {book_id: book_totals[book_id] for book_id in range(book_count)}
+            total_realized_pnl[uid] = sum(book_totals)
+        
+        return total_realized_pnl, realized_pnl_by_book
     try:
         simulation_timestamp = validator_data['simulation_timestamp']
         step = validator_data['step']
@@ -343,6 +368,14 @@ def report_worker(validator_data: Dict, state_data: Dict) -> Dict:
         books = state_data['books']
         if not accounts:
             return result
+        
+        bt.logging.debug("Computing realized P&L aggregates in report worker...")
+        pnl_start = time.time()
+        total_realized_pnl, realized_pnl_by_book = compute_realized_pnl_aggregates(
+            validator_data['realized_pnl_history'],
+            validator_data['book_count']
+        )
+        bt.logging.debug(f"Computed realized P&L aggregates ({time.time()-pnl_start:.4f}s)")
 
         volume_sums = validator_data['volume_sums']
         maker_volume_sums = validator_data['maker_volume_sums']
@@ -376,25 +409,20 @@ def report_worker(validator_data: Dict, state_data: Dict) -> Dict:
         inventory_history = validator_data['inventory_history']
         total_inventory_history = {}
         pnl = {}
-            
-        realized_pnl_history = validator_data['realized_pnl_history']
-        total_realized_pnl = {}
 
         for agentId in accounts.keys():
-            if agentId < 0 or len(inventory_history[agentId]) < 3:
+            if agentId < 0:
                 continue
-            total_inventory_history[agentId] = [                
+            if agentId not in inventory_history or not inventory_history[agentId]:
+                continue
+            if len(inventory_history[agentId]) < 2:
+                continue
+            
+            total_inventory_history[agentId] = [
                 sum(list(inventory_value.values()))
                 for inventory_value in list(inventory_history[agentId].values())
             ]
             pnl[agentId] = total_inventory_history[agentId][-1] - total_inventory_history[agentId][0]
-            if agentId in realized_pnl_history and realized_pnl_history[agentId]:
-                total_realized_pnl[agentId] = sum(
-                    sum(book_pnl.values()) 
-                    for book_pnl in realized_pnl_history[agentId].values()
-                )
-            else:
-                total_realized_pnl[agentId] = 0.0
 
         scores = torch.FloatTensor(list(validator_data['scores'].values()))
         indices = scores.argsort(dim=-1, descending=True)
@@ -404,7 +432,9 @@ def report_worker(validator_data: Dict, state_data: Dict) -> Dict:
 
         miner_metrics = {}
         for agentId, accounts_data in accounts.items():
-            if agentId < 0 or len(inventory_history[agentId]) < 3:
+            if agentId < 0:
+                continue
+            if agentId not in total_inventory_history:
                 continue
 
             base_decimals = validator_data['simulation_config']['baseDecimals']
@@ -495,7 +525,7 @@ def report_worker(validator_data: Dict, state_data: Dict) -> Dict:
                     pnl[agentId] - (total_inventory_history[agentId][-2] - total_inventory_history[agentId][0])
                     if len(total_inventory_history[agentId]) > 1 else 0.0
                 ),
-                'total_realized_pnl': total_realized_pnl[agentId],
+                'total_realized_pnl': total_realized_pnl.get(agentId, 0.0),
                 'total_daily_volume': total_daily_volume,
                 'average_daily_volume': average_daily_volume,
                 'min_daily_volume': min_daily_volume,
@@ -523,6 +553,8 @@ def report_worker(validator_data: Dict, state_data: Dict) -> Dict:
             'daily_volumes': daily_volumes,
             'daily_roundtrip_volumes': daily_roundtrip_volumes,
             'total_inventory_history': total_inventory_history,
+            'total_realized_pnl': total_realized_pnl,  # ADD THIS LINE
+            'realized_pnl_by_book': realized_pnl_by_book,
             'pnl': pnl,
             'scores': scores.tolist(),
             'placements': placements.tolist(),
@@ -746,6 +778,7 @@ async def report(self: ReportingService) -> None:
         miner_metrics = metrics['miner_metrics']
         daily_volumes = metrics['daily_volumes']
         daily_roundtrip_volumes = metrics['daily_roundtrip_volumes']
+        self.realized_pnl_by_book = metrics['realized_pnl_by_book']
 
         bt.logging.debug(f"Collecting agent book metrics...")
         start = time.time()
@@ -757,7 +790,11 @@ async def report(self: ReportingService) -> None:
         last_inventories = {}
         sharpe_data = {}
         for agentId in self.last_state.accounts.keys():
-            if agentId < 0 or len(self.inventory_history[agentId]) < 3:
+            if agentId < 0:
+                continue
+            if agentId not in self.inventory_history or not self.inventory_history[agentId]:
+                continue
+            if len(self.inventory_history[agentId]) < 2:  # Need at least 2 points
                 continue
             inv_values = list(self.inventory_history[agentId].values())
             start_inventories[agentId] = [i for i in inv_values if len(i) > 0][0]
@@ -803,11 +840,8 @@ async def report(self: ReportingService) -> None:
                 updates.append((agent_gauges, account['f']['t'], wallet_addr, netuid, bookId, agentId, "fees_taker_rate"))
                 updates.append((agent_gauges, last_inv[bookId], wallet_addr, netuid, bookId, agentId, "inventory_value"))
                 updates.append((agent_gauges, last_inv[bookId] - start_inv[bookId], wallet_addr, netuid, bookId, agentId, "pnl"))
-                if agentId in self.realized_pnl_history and self.realized_pnl_history[agentId]:
-                    book_realized_pnl = sum(
-                        pnl_dict.get(bookId, 0.0) 
-                        for pnl_dict in self.realized_pnl_history[agentId].values()
-                    )
+                if agentId in self.realized_pnl_by_book:
+                    book_realized_pnl = self.realized_pnl_by_book[agentId].get(bookId, 0.0)
                     updates.append((agent_gauges, book_realized_pnl, wallet_addr, netuid, bookId, agentId, "realized_pnl"))
                 else:
                     updates.append((agent_gauges, 0.0, wallet_addr, netuid, bookId, agentId, "realized_pnl"))

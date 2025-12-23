@@ -147,9 +147,7 @@ void DynamicFeePolicy::resetHistory() noexcept
 //-------------------------------------------------------------------------
 
 void DynamicFeePolicy::resetHistory(const std::unordered_set<AgentId>& agentIds) noexcept
-{
-    resetHistory();
-}
+{}
 
 //-------------------------------------------------------------------------
 

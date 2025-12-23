@@ -144,7 +144,9 @@ void FeePolicyWrapper::resetHistory() noexcept
 void FeePolicyWrapper::resetHistory(const std::unordered_set<AgentId>& agentIds) noexcept
 {
     m_feePolicy->resetHistory(agentIds);
+
     std::unordered_map<std::string, std::unordered_set<AgentId>> categorizedAgents;
+
     for (const auto& agentId : agentIds) {
         const auto agentBaseName = m_accountRegistry->getAgentBaseName(agentId);
         if (agentBaseName.has_value()) {
@@ -152,6 +154,7 @@ void FeePolicyWrapper::resetHistory(const std::unordered_set<AgentId>& agentIds)
             categorizedAgents[baseName].insert(agentId);
         }
     }
+
     for (auto& [baseName, idsForBase] : categorizedAgents) {
         auto it = m_agentBaseNameFeePolicies.find(baseName);
         if (it != m_agentBaseNameFeePolicies.end() && it->second) {

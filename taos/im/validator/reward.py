@@ -23,6 +23,7 @@ import random
 import bittensor as bt
 import numpy as np
 from typing import Dict, Tuple
+from collections import defaultdict
 from taos.im.neurons.validator import Validator
 from taos.im.protocol import MarketSimulationStateUpdate, FinanceAgentResponse
 from taos.im.utils import normalize
@@ -30,7 +31,7 @@ from taos.im.utils.sharpe import sharpe, batch_sharpe
 
 def score_uid(validator_data: Dict, uid: int) -> float:
     """
-    Calculates the new score value for a specific UID
+    Calculates the new score value for a specific UID.
 
     Args:
         validator_data (Dict): Dictionary containing validator state
@@ -49,6 +50,9 @@ def score_uid(validator_data: Dict, uid: int) -> float:
     simulation_config = validator_data['simulation_config']
     reward_weights = validator_data['reward_weights']
 
+    simulation_timestamp = validator_data['simulation_timestamp']
+    publish_interval = simulation_config['publish_interval']
+
     if not sharpe_values[uid]:
         return 0.0
 
@@ -58,45 +62,112 @@ def score_uid(validator_data: Dict, uid: int) -> float:
     
     norm_min = config['sharpe']['normalization_min']
     norm_max = config['sharpe']['normalization_max']
-    normalized_sharpes_unrealized = {book_id: normalize(norm_min, norm_max, sharpe_val)
-                                     for book_id, sharpe_val in sharpes_unrealized.items()}
+    normalized_sharpes_unrealized = {
+        book_id: normalize(norm_min, norm_max, sharpe_val)
+        for book_id, sharpe_val in sharpes_unrealized.items()
+    }
     normalized_sharpes_realized = {
         book_id: (normalize(norm_min, norm_max, sharpe_val) if sharpe_val is not None else 0.0)
         for book_id, sharpe_val in sharpes_realized.items()
     }
 
-    volume_cap = round(config['activity']['capital_turnover_cap'] * simulation_config['miner_wealth'],
-                      simulation_config['volumeDecimals'])
+    volume_cap = round(
+        config['activity']['capital_turnover_cap'] * simulation_config['miner_wealth'],
+        simulation_config['volumeDecimals']
+    )
 
-    # Calculate the factor to be multiplied on the Sharpes when there has been no trading activity in the previous Sharpe assessment window
-    # This factor is designed to reduce the activity multiplier by half after each `sharpe.lookback` steps of inactivity
-    inactivity_decay_factor = 2 ** (-1 / config['sharpe']['lookback'])
+    lookback = config['sharpe']['lookback']
+    
+    decay_grace_period = config['activity'].get('decay_grace_period', 600_000_000_000)  # 10 minutes in nanoseconds
+    activity_impact = config['activity'].get('impact', 0.33)  # Reduced impact factor
+    time_acceleration_power = 2.0  # Quadratic time acceleration
+    
+    scoring_interval_seconds = config['interval'] / 1e9
+    total_intervals = lookback // scoring_interval_seconds
+    grace_intervals = decay_grace_period / config['interval']
+    decay_window_intervals = total_intervals - grace_intervals
+    base_decay_factor = 2 ** (-1 / decay_window_intervals)
 
     compact_volumes_uid = compact_volumes[uid]
     miner_volumes = {book_id: data['lookback_volume'] for book_id, data in compact_volumes_uid.items()}
     latest_volumes = {book_id: data['latest_volume'] for book_id, data in compact_volumes_uid.items()}
+    latest_timestamps = {book_id: data['latest_timestamp'] for book_id, data in compact_volumes_uid.items()}
     
     # Calculate the activity factors to be multiplied onto the unrealized Sharpes to obtain the final values for assessment
-    # If the miner has traded in the previous Sharpe assessment window, the factor is equal to the ratio of the miner trading volume to the cap
-    # If the miner has not traded, their existing activity factor is decayed by the factor defined above so as to halve the miner score over each Sharpe assessment window where they remain inactive
+    # If the miner has traded in the previous Sharpe assessment window, the factor is equal to the ratio of the miner trading volume to the cap multipled by the impact factor
+    # If the miner has not traded, their existing activity factor is decayed by the factor defined above, with accelerating decay after the grace period
     activity_factors_uid = activity_factors[uid]
     for book_id, miner_volume in miner_volumes.items():
         if latest_volumes[book_id] > 0:
-            activity_factors_uid[book_id] = min(1 + (miner_volume / volume_cap), 2.0)
+            activity_factors_uid[book_id] = min(1 + ((miner_volume / volume_cap) * activity_impact), 2.0)
         else:
-            activity_factors_uid[book_id] *= inactivity_decay_factor
-    compact_roundtrip_volumes_uid = compact_roundtrip_volumes[uid]
-    miner_roundtrip_volumes = {book_id: data['lookback_roundtrip_volume'] 
-                               for book_id, data in compact_roundtrip_volumes_uid.items()}
-    latest_roundtrip_volumes = {book_id: data['latest_roundtrip_volume'] 
-                                for book_id, data in compact_roundtrip_volumes_uid.items()}
+            latest_time = latest_timestamps[book_id]
+            
+            if latest_time > 0 and latest_time < simulation_timestamp:
+                inactive_time = simulation_timestamp - latest_time
+            else:
+                inactive_time = simulation_timestamp
+            
+            current_factor = activity_factors_uid[book_id]
+
+            activity_multiplier = max(current_factor, 1.0)
+
+            if inactive_time <= decay_grace_period:
+                time_acceleration = 1.0
+            else:
+                time_beyond_grace = inactive_time - decay_grace_period
+                decay_window_ns = (lookback * config['interval']) - decay_grace_period
+                time_ratio = time_beyond_grace / decay_window_ns
+                time_acceleration = 1 + (time_ratio ** time_acceleration_power)
+            
+            total_acceleration = activity_multiplier * time_acceleration
+            decay_factor = base_decay_factor ** total_acceleration
+            activity_factors_uid[book_id] *= decay_factor
     
+    compact_roundtrip_volumes_uid = compact_roundtrip_volumes[uid]
+    miner_roundtrip_volumes = {
+        book_id: data['lookback_roundtrip_volume'] 
+        for book_id, data in compact_roundtrip_volumes_uid.items()
+    }
+    latest_roundtrip_volumes = {
+        book_id: data['latest_roundtrip_volume'] 
+        for book_id, data in compact_roundtrip_volumes_uid.items()
+    }
+    latest_roundtrip_timestamps = {
+        book_id: data['latest_roundtrip_timestamp']
+        for book_id, data in compact_roundtrip_volumes_uid.items()
+    }
+    
+    # Calculate the activity factors to be multiplied onto the realized Sharpes to obtain the final values for assessment
+    # If the miner has traded in the previous Sharpe assessment window, the factor is equal to the ratio of the miner trading volume to the cap multipled by the impact factor
+    # If the miner has not traded, their existing activity factor is decayed by the factor defined above, with accelerating decay after the grace period
     activity_factors_realized_uid = activity_factors_realized[uid]
     for book_id, roundtrip_volume in miner_roundtrip_volumes.items():
         if latest_roundtrip_volumes[book_id] > 0:
-            activity_factors_realized_uid[book_id] = min(1 + (roundtrip_volume / volume_cap), 2.0)
+            activity_factors_realized_uid[book_id] = min(1 + ((roundtrip_volume / volume_cap) * activity_impact), 2.0)
         else:
-            activity_factors_realized_uid[book_id] *= inactivity_decay_factor
+            # Inactive: calculate time since last round-trip
+            latest_time = latest_roundtrip_timestamps[book_id]
+            
+            if latest_time > 0 and latest_time < simulation_timestamp:
+                inactive_time = simulation_timestamp - latest_time
+            else:
+                inactive_time = simulation_timestamp
+            
+            current_factor = activity_factors_realized_uid[book_id]
+            activity_multiplier = max(current_factor, 1.0)
+
+            if inactive_time <= decay_grace_period:
+                time_acceleration = 1.0
+            else:
+                time_beyond_grace = inactive_time - decay_grace_period
+                decay_window_ns = (lookback * config['interval']) - decay_grace_period
+                time_ratio = time_beyond_grace / decay_window_ns
+                time_acceleration = 1 + (time_ratio ** time_acceleration_power)
+            
+            total_acceleration = activity_multiplier * time_acceleration
+            decay_factor = base_decay_factor ** total_acceleration
+            activity_factors_realized_uid[book_id] *= decay_factor
     
     # Calculate activity weighted normalized sharpes
     activity_weighted_normalized_sharpes_unrealized = []
@@ -108,9 +179,6 @@ def score_uid(validator_data: Dict, uid: int) -> float:
             weighted = (2 - activity_factor) * norm_sharpe
         activity_weighted_normalized_sharpes_unrealized.append(min(weighted, 1))
 
-    # Calculate the activity factors to be multiplied onto the realized Sharpes to obtain the final values for assessment
-    # If the miner has round-tripped in the previous Sharpe assessment window, the factor is equal to the ratio of the miner round-trip volume to the cap
-    # If the miner has not round-tripped, their existing activity factor is decayed by the factor defined above so as to halve the miner score over each Sharpe assessment window where they remain inactive
     activity_weighted_normalized_sharpes_realized = []
     for book_id, activity_factor_realized in activity_factors_realized_uid.items():
         norm_sharpe_realized = normalized_sharpes_realized[book_id]
@@ -120,34 +188,55 @@ def score_uid(validator_data: Dict, uid: int) -> float:
             weighted_realized = (2 - activity_factor_realized) * norm_sharpe_realized
         activity_weighted_normalized_sharpes_realized.append(min(weighted_realized, 1))
 
-    uid_sharpe['books_weighted'] = {book_id: weighted_sharpe
-                                    for book_id, weighted_sharpe in enumerate(activity_weighted_normalized_sharpes_unrealized)}
-    uid_sharpe['books_weighted_realized'] = {book_id: weighted_sharpe
-                                              for book_id, weighted_sharpe in enumerate(activity_weighted_normalized_sharpes_realized)}
+    uid_sharpe['books_weighted'] = {
+        book_id: weighted_sharpe
+        for book_id, weighted_sharpe in enumerate(activity_weighted_normalized_sharpes_unrealized)
+    }
+    uid_sharpe['books_weighted_realized'] = {
+        book_id: weighted_sharpe
+        for book_id, weighted_sharpe in enumerate(activity_weighted_normalized_sharpes_realized)
+    }
     ## Use the 1.5 rule to detect left-hand outliers in the activity-weighted Sharpes
     data_unrealized = np.array(activity_weighted_normalized_sharpes_unrealized)
     q1_unrealized, q3_unrealized = np.percentile(data_unrealized, [25, 75])
     iqr_unrealized = q3_unrealized - q1_unrealized
     lower_threshold_unrealized = q1_unrealized - 1.5 * iqr_unrealized
     outliers_unrealized = data_unrealized[data_unrealized < lower_threshold_unrealized]
+    
     # Outliers detected here are activity-weighted Sharpes which are significantly lower than those achieved on other books
     # A penalty equal to 67% of the difference between the mean outlier value and the value at the centre of the possible activity weighted Sharpe values is calculated
-    outlier_penalty_unrealized = (0.5 - np.mean(outliers_unrealized)) / 1.5 if len(outliers_unrealized) > 0 and np.mean(outliers_unrealized) < 0.5 else 0
+    outlier_penalty_unrealized = (
+        (0.5 - np.mean(outliers_unrealized)) / 1.5 
+        if len(outliers_unrealized) > 0 and np.mean(outliers_unrealized) < 0.5 
+        else 0
+    )
     # The median of the activity weighted Sharpes provides the base score for the miner
     activity_weighted_normalized_median_unrealized = np.median(data_unrealized)
     # The penalty factor is subtracted from the base score to punish particularly poor performance on any particular book
-    sharpe_score_unrealized = max(activity_weighted_normalized_median_unrealized - abs(outlier_penalty_unrealized), 0.0)
+    sharpe_score_unrealized = max(
+        activity_weighted_normalized_median_unrealized - abs(outlier_penalty_unrealized), 
+        0.0
+    )
 
-    # The same penalty logic is applied to the realized Sharpe performance
     data_realized = np.array(activity_weighted_normalized_sharpes_realized)
     q1_realized, q3_realized = np.percentile(data_realized, [25, 75])
     iqr_realized = q3_realized - q1_realized
     lower_threshold_realized = q1_realized - 1.5 * iqr_realized
     outliers_realized = data_realized[data_realized < lower_threshold_realized]
-
-    outlier_penalty_realized = (0.5 - np.mean(outliers_realized)) / 1.5 if len(outliers_realized) > 0 and np.mean(outliers_realized) < 0.5 else 0
+    # Outliers detected here are activity-weighted Sharpes which are significantly lower than those achieved on other books
+    # A penalty equal to 67% of the difference between the mean outlier value and the value at the centre of the possible activity weighted Sharpe values is calculated
+    outlier_penalty_realized = (
+        (0.5 - np.mean(outliers_realized)) / 1.5 
+        if len(outliers_realized) > 0 and np.mean(outliers_realized) < 0.5 
+        else 0
+    )
+    # The median of the activity weighted Sharpes provides the base score for the miner
     activity_weighted_normalized_median_realized = np.median(data_realized)
-    sharpe_score_realized = max(activity_weighted_normalized_median_realized - abs(outlier_penalty_realized), 0.0)
+    # The penalty factor is subtracted from the base score to punish particularly poor performance on any particular book
+    sharpe_score_realized = max(
+        activity_weighted_normalized_median_realized - abs(outlier_penalty_realized), 
+        0.0
+    )
 
     uid_sharpe['activity_weighted_normalized_median'] = activity_weighted_normalized_median_unrealized
     uid_sharpe['penalty'] = abs(outlier_penalty_unrealized)
@@ -156,57 +245,15 @@ def score_uid(validator_data: Dict, uid: int) -> float:
     uid_sharpe['score_realized'] = sharpe_score_realized
 
     balance_ratio_multiplier = 1.0 
-    min_multiplier = config['inventory']['min_balance_ratio_multiplier']
-    max_multiplier = config['inventory']['max_balance_ratio_multiplier']
-    # # Balance ratio reward/penalty; designed to disincentivize risk-avoidance by penalizing selling of all BASE.
-    # # Superceded by realized Sharpe, but retained in case use is found in future.
-    # miner_positions = validator_data.get('miner_positions', {})
-    # if uid in miner_positions and miner_positions[uid]:
-    #     positions = miner_positions[uid]
-    #     book_multipliers = []
-    #     book_ratios = {}        
-    #     for book_id, position in positions.items():
-    #         base_balance = position.get('base', 0.0)
-    #         quote_balance = position.get('quote', 0.0)
-    #         current_price = position.get('midquote', 1.0)
-            
-    #         base_value = abs(base_balance) * current_price
-    #         quote_value = abs(quote_balance)
-    #         total_value = base_value + quote_value
-            
-    #         if total_value > 0:
-    #             book_ratio = base_value / total_value
-    #             book_ratios[book_id] = book_ratio
-                
-    #             if book_ratio < 0.2:
-    #                 normalized = book_ratio / 0.2
-    #                 penalty_curve = normalized ** 3
-    #                 book_multiplier = min_multiplier + (0.95 - min_multiplier) * penalty_curve
-                    
-    #             elif book_ratio <= 0.8:
-    #                 normalized = (book_ratio - 0.2) / 0.6
-    #                 book_multiplier = 0.95 + 0.10 * normalized
-                    
-    #             else:
-    #                 normalized = (book_ratio - 0.8) / 0.2
-    #                 reward_curve = normalized ** 3
-    #                 book_multiplier = 1.05 + (max_multiplier - 1.05) * reward_curve
-                
-    #             book_multipliers.append(book_multiplier)
-        
-    #     if book_multipliers:
-    #         balance_ratio_multiplier = np.median(book_multipliers)
-    #         sharpe_values[uid]['book_balance_multipliers'] = {
-    #             book_id: mult for book_id, mult in zip(sharpes_unrealized.keys(), book_multipliers)
-    #         }
-    
     uid_sharpe['balance_ratio_multiplier'] = balance_ratio_multiplier
 
     sharpe_score_unrealized_adjusted = sharpe_score_unrealized * balance_ratio_multiplier
     uid_sharpe['score_unrealized'] = sharpe_score_unrealized_adjusted    
 
-    combined_score = (reward_weights['sharpe'] * sharpe_score_unrealized_adjusted + 
-                     reward_weights['sharpe_realized'] * sharpe_score_realized)
+    combined_score = (
+        reward_weights['sharpe'] * sharpe_score_unrealized_adjusted + 
+        reward_weights['sharpe_realized'] * sharpe_score_realized
+    )
     uid_sharpe['score'] = combined_score
     
     return combined_score
