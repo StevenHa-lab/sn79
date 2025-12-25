@@ -2295,6 +2295,10 @@ if __name__ != "__mp_main__":
                                 if roundtrip_volume > 0:
                                     roundtrip_value = roundtrip_volume * price
                                     roundtrip_volume_updates[uid_item][sampled_timestamp][book_id] += roundtrip_value
+                                    if timestamp not in self.realized_pnl_history[uid_item]:
+                                        self.realized_pnl_history[uid_item][timestamp] = {
+                                            book_id: 0.0 for book_id in range(book_count)
+                                        }
 
                             for book_id, deltas in volume_deltas[uid_item].items():
                                 self.volume_sums[uid_item][book_id] += deltas['total']

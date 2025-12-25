@@ -103,7 +103,7 @@ def score_uid(validator_data: Dict, uid: int) -> float:
         else:
             latest_time = latest_timestamps[book_id]
             
-            if latest_time > 0 and latest_time < simulation_timestamp:
+            if latest_time > 0:
                 inactive_time = simulation_timestamp - latest_time
             else:
                 inactive_time = simulation_timestamp
@@ -149,7 +149,7 @@ def score_uid(validator_data: Dict, uid: int) -> float:
             # Inactive: calculate time since last round-trip
             latest_time = latest_roundtrip_timestamps[book_id]
             
-            if latest_time > 0 and latest_time < simulation_timestamp:
+            if latest_time > 0:
                 inactive_time = simulation_timestamp - latest_time
             else:
                 inactive_time = simulation_timestamp
