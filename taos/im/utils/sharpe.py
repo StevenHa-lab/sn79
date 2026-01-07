@@ -1,7 +1,9 @@
 # SPDX-FileCopyrightText: 2025 Rayleigh Research <to@rayleigh.re>
 # SPDX-License-Identifier: MIT
+import os
 import numpy as np
 import traceback
+from functools import partial
 from loky.backend.context import set_start_method
 set_start_method('forkserver', force=True)
 from loky import get_reusable_executor
@@ -208,8 +210,23 @@ def sharpe_batch(inventory_values, realized_pnl_values, lookback, norm_min, norm
     }
 
 
+def _init_worker_affinity(cores):
+    """
+    Worker initializer that sets CPU affinity.
+    Must be at module level for pickling.
+    
+    Args:
+        cores: List of CPU cores to bind to
+    """
+    if cores is not None:
+        try:
+            os.sched_setaffinity(0, set(cores))
+        except (AttributeError, OSError):
+            pass
+
+
 def batch_sharpe(inventory_values, realized_pnl_values, batches, lookback, norm_min, norm_max, 
-                 min_lookback, min_realized_observations, grace_period, deregistered_uids):
+                 min_lookback, min_realized_observations, grace_period, deregistered_uids, cores=None):
     """
     Parallel processing of Sharpe calculations with realized P&L.
     
@@ -227,11 +244,20 @@ def batch_sharpe(inventory_values, realized_pnl_values, batches, lookback, norm_
         min_realized_observations: Minimum required non-zero trades for realized Sharpe
         grace_period: Time threshold for changeover detection
         deregistered_uids: List of deregistered UIDs
+        cores: Optional list of CPU cores for worker affinity
         
     Returns:
         Dict of {uid: sharpe_values} for all UIDs
     """
-    pool = get_reusable_executor(max_workers=len(batches))
+    if cores is not None:
+        initializer = partial(_init_worker_affinity, cores)
+    else:
+        initializer = None
+    pool = get_reusable_executor(
+        max_workers=len(batches),
+        initializer=initializer,
+        timeout=300  # Workers timeout after 5 min idle
+    )
     
     tasks = [
         pool.submit(

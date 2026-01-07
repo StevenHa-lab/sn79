@@ -162,9 +162,14 @@ async def forward(self, synapse: MarketSimulationStateUpdate) -> List[FinanceAge
     }
     bt.logging.info(f"Request Data Prepared ({time.time()-data_start:.4f}s).")
 
-    while self.should_block_queries():
-        await asyncio.sleep(0.1)
-        bt.logging.warning(f"Waiting for rewarding to catch up before querying ({self._pending_reward_tasks} tasks pending)...")
+    if self.should_block_queries():
+        last_log_time = time.time()
+        while self._pending_reward_tasks > 0:
+            await asyncio.sleep(0.1)
+            current_time = time.time()
+            if current_time - last_log_time >= 1.0:
+                bt.logging.warning(f"Waiting for rewarding to catch up before querying ({self._pending_reward_tasks} tasks pending)...")
+                last_log_time = current_time
     bt.logging.info(f"Rewarding up to date, proceeding with query!")
 
     query_start = time.time()
@@ -183,73 +188,54 @@ async def forward(self, synapse: MarketSimulationStateUpdate) -> List[FinanceAge
         bt.logging.info(f"Drained Query Response Queue ({time.time()-query_start:.4f}s).")
 
         write_start = time.time()
-        data_bytes = await asyncio.get_event_loop().run_in_executor(
-            self.query_ipc_executor,
-            pickle.dumps,
-            request_data,
-            5
-        )
-        bt.logging.info(f"Request data size: {len(data_bytes) / 1024 / 1024:.2f} MB")
+        data_bytes = pickle.dumps(request_data, protocol=5)
+        bt.logging.info(f"Query request data size: {len(data_bytes) / 1024 / 1024:.2f} MB")
         
-        def write_request():
-            self.request_mem.seek(0)
-            self.request_mem.write(struct.pack('Q', len(data_bytes)))
-            self.request_mem.write(data_bytes)
-        
-        await asyncio.get_event_loop().run_in_executor(
-            self.query_ipc_executor,
-            write_request
-        )
-        bt.logging.info(f"Wrote request data ({time.time()-write_start:.4f}s).")
+        self.request_mem.seek(0)
+        self.request_mem.write(struct.pack('Q', len(data_bytes)))
+        self.request_mem.write(data_bytes)
+        bt.logging.info(f"Wrote query request data ({time.time()-write_start:.4f}s).")
+
+        self.response_mem.seek(0)
+        self.response_mem.write(struct.pack('Q', 0))
 
         receive_start = time.time()
-        await asyncio.get_event_loop().run_in_executor(
-            self.query_ipc_executor,
-            self.request_queue.send,
-            b'query'
-        )
+        self.request_queue.send(b'query')
 
         max_wait = self.config.neuron.global_query_timeout + 10
-        elapsed = 0
-        message = None
-        poll_count = 0
-
-        while elapsed < max_wait:
-            poll_count += 1            
-            try:
-                message, _ = self.response_queue.receive(timeout=0.0)
-                bt.logging.info(f"Received Query Response after {poll_count} polls ({time.time()-receive_start:.4f}s).")
-                break
-            except posix_ipc.BusyError:
+        check_count = 0
+        data_size = 0
+        time.sleep(self.config.neuron.timeout)
+        
+        while time.time() - receive_start < max_wait:
+            check_count += 1
+            data_size = struct.unpack_from('Q', self.response_mem, 0)[0]            
+            if data_size > 0:
                 elapsed = time.time() - receive_start
-                if poll_count % 100000 == 0:
-                    await asyncio.sleep(0)
-                    bt.logging.debug(f"Still polling for query response ({elapsed:.1f}s, {poll_count} polls)")                
-                continue
+                bt.logging.info(f"Received Query Response after {check_count} checks ({elapsed:.4f}s)")
+                read_start = time.time()
+                result_bytes = bytes(self.response_mem[8:8+data_size])
+                if len(result_bytes) != data_size:
+                    bt.logging.warning(f"Incomplete read: got {len(result_bytes)}, expected {data_size}")
+                    time.sleep(0.001)
+                    continue
+                try:
+                    result = pickle.loads(result_bytes)
+                    bt.logging.info(f"Read query response data ({time.time()-read_start:.4f}s)")
+                    break
+                except (pickle.UnpicklingError, UnicodeDecodeError) as e:
+                    bt.logging.warning(f"Corrupt data on attempt {check_count}: {e}")
+                    self.response_mem.seek(0)
+                    self.response_mem.write(struct.pack('Q', 0))
+                    time.sleep(0.01)
+                    continue            
+            time.sleep(0.001)
         else:
-            bt.logging.error(f"Query service response timeout after {max_wait}s ({poll_count} total polls)")
             self.pagerduty_alert(f"Query service response timeout after {max_wait}s")
             return responses
-
-        if message is None:
-            bt.logging.error(f"Query service response timeout after {max_wait}s ({poll_count} total polls)")
-            self.pagerduty_alert(f"Query service response timeout after {max_wait}s")
+        if data_size == 0:
+            self.pagerduty_alert(f"Query service response timeout - size still 0")
             return responses
-
-        read_start = time.time()
-        
-        def read_response():
-            self.response_mem.seek(0)
-            size_bytes = self.response_mem.read(8)
-            data_size = struct.unpack('Q', size_bytes)[0]
-            result_bytes = self.response_mem.read(data_size)
-            return pickle.loads(result_bytes)
-        
-        result = await asyncio.get_event_loop().run_in_executor(
-            self.query_ipc_executor,
-            read_response
-        )
-        bt.logging.info(f"Read response data ({time.time()-read_start:.4f}s).")
 
     except posix_ipc.BusyError:
         self.pagerduty_alert(f"Query service response timeout")

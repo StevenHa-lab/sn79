@@ -289,7 +289,9 @@ class QueryService:
                     'traceback': str (optional)
                 }
         """
+        gc_was_enabled = gc.isenabled()
         try:
+            gc.disable()
             class MinimalMetagraph:
                 def __init__(self, axons, uids):
                     self.axons = axons
@@ -487,6 +489,10 @@ class QueryService:
                 'error': str(e),
                 'traceback': traceback.format_exc()
             }
+        finally:
+            if gc_was_enabled:
+                gc.enable()
+
 
     async def run(self):
         """
@@ -506,7 +512,6 @@ class QueryService:
         await self.initialize()
 
         bt.logging.info("Query service ready, waiting for requests...")
-    
         while True:
             try:
                 self.request_queue.receive(timeout=0.0)
@@ -517,7 +522,6 @@ class QueryService:
         while self.running:
             try:
                 message, _ = self.request_queue.receive(timeout=1.0)
-
                 command = message.decode('utf-8')
 
                 if command == 'query':
@@ -527,49 +531,21 @@ class QueryService:
                     data_size = struct.unpack('Q', size_bytes)[0]
                     request_bytes = self.request_mem.read(data_size)
                     request_data = pickle.loads(request_bytes)
-                    bt.logging.info(f"Read request data ({time.time()-read_start:.4f}s).")
+                    bt.logging.info(f"Read Query request data ({time.time()-read_start:.4f}s).")
 
                     result = await self.query_miners(request_data)
 
                     write_start = time.time()
                     result_bytes = pickle.dumps(result, protocol=5)
                     self.response_mem.seek(0)
-                    self.response_mem.write(struct.pack('Q', len(result_bytes)))
+                    self.response_mem.write(struct.pack('Q', 0))
                     self.response_mem.write(result_bytes)
-                    bt.logging.info(f"Wrote response data ({time.time()-write_start:.4f}s).")
+                    self.response_mem.flush()
+                    self.response_mem.seek(0)
+                    self.response_mem.write(struct.pack('Q', len(result_bytes)))
+                    self.response_mem.flush()
                     
-                    drain_start = time.time()
-                    drained = 0
-                    while True:
-                        try:
-                            self.response_queue.receive(timeout=0.0)
-                            drained += 1
-                        except posix_ipc.BusyError:
-                            break
-
-                    if drained > 0:
-                        bt.logging.warning(f"Drained {drained} stale response signals ({time.time()-drain_start:.4f}s)")
-
-                    send_start = time.time()
-                    max_retries = 3
-                    for attempt in range(max_retries):
-                        try:
-                            self.response_queue.send(b'ready', timeout=1.0)
-                            bt.logging.info(f"Response signal sent ({time.time()-send_start:.4f}s)")
-                            break
-                        except posix_ipc.BusyError:
-                            if attempt < max_retries - 1:
-                                bt.logging.warning(f"Response queue full, retry {attempt+1}/{max_retries}")
-                                try:
-                                    self.response_queue.receive(timeout=0.0)
-                                    bt.logging.debug("Drained one more stale message")
-                                except posix_ipc.BusyError:
-                                    pass
-                            else:
-                                bt.logging.error(f"Failed to send response signal after {max_retries} attempts")
-                        except Exception as e:
-                            bt.logging.error(f"Error sending response signal: {e}")
-                            break
+                    bt.logging.info(f"Wrote Query response data ({time.time()-write_start:.4f}s).")
 
                 elif command == 'shutdown':
                     bt.logging.info("Shutdown command received")

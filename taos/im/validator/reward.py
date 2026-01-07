@@ -324,7 +324,10 @@ def score_uids(validator_data: Dict, inventory_values: Dict) -> Dict:
             for uid in uids
         })
     else:
-        num_processes = config['sharpe']['parallel_workers']
+        if config['sharpe']['parallel_workers'] == -1:
+            num_processes = len(config['sharpe']['reward_cores'])
+        else:
+            num_processes = config['sharpe']['parallel_workers']
         batch_size = int(256 / num_processes)
         batches = [uids[i:i+batch_size] for i in range(0, 256, batch_size)]
         sharpe_values.update(batch_sharpe(
@@ -337,7 +340,8 @@ def score_uids(validator_data: Dict, inventory_values: Dict) -> Dict:
             config['sharpe']['min_lookback'],
             config['sharpe']['min_realized_observations'],
             simulation_config['grace_period'],
-            deregistered_uids
+            deregistered_uids,
+            cores=config['sharpe']['reward_cores'][:num_processes]
         ))
 
     validator_data['sharpe_values'] = sharpe_values

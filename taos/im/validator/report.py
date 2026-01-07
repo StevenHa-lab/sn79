@@ -162,26 +162,26 @@ class ReportingService:
                         except posix_ipc.BusyError:
                             break
                     if drained > 0:
-                        bt.logging.warning(f"Drained {drained} stale response signals ({time.time()-drain_start:.4f}s)")
+                        bt.logging.warning(f"Drained {drained} stale reporting response signals ({time.time()-drain_start:.4f}s)")
                     send_start = time.time()
                     max_retries = 3
                     sent = False
                     for attempt in range(max_retries):
                         try:
                             self.response_queue.send(b'ready', timeout=1.0)
-                            bt.logging.info(f"Response signal sent ({time.time()-send_start:.4f}s)")
+                            bt.logging.info(f"Reporting Response signal sent ({time.time()-send_start:.4f}s)")
                             sent = True
                             break
                         except posix_ipc.BusyError:
-                            bt.logging.warning(f"Response queue full, retry {attempt+1}/{max_retries}")
+                            bt.logging.warning(f"Reporting Response queue full, retry {attempt+1}/{max_retries}")
                             try:
                                 self.response_queue.receive(timeout=0.0)
-                                bt.logging.debug("Drained one more stale message")
+                                bt.logging.debug("Drained one more stale message from Reporting Response Queue")
                             except posix_ipc.BusyError:
                                 pass
                             time.sleep(0.1)
                         except Exception as e:
-                            bt.logging.error(f"Error sending response signal: {e}")
+                            bt.logging.error(f"Error sending Reporting response signal: {e}")
                             break
                     
                 elif command == 'shutdown':

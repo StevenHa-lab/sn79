@@ -10,9 +10,9 @@ def get_core_allocation():
     total_cores = multiprocessing.cpu_count()
     validator_pct = 0.20    # Main validator loop
     query_pct = 0.20        # Miner queries (subprocess)
-    reward_pct = 0.30       # Reward computation (ProcessPool)
-    reporting_pct = 0.12    # Metrics reporting (subprocess)
-    ipc_pct = 0.10          # IPC operations (ThreadPool)
+    reward_pct = 0.25       # Reward computation (ProcessPool)
+    reporting_pct = 0.1     # Metrics reporting (subprocess)
+    ipc_pct = 0.15          # IPC operations (ThreadPool)
     
     validator_count = max(2, int(total_cores * validator_pct))
     query_count = max(2, int(total_cores * query_pct))
