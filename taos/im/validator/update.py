@@ -16,10 +16,23 @@ from taos.common.utils.misc import run_process
 from taos.im.neurons.validator import Validator
         
 def check_repo(self : Validator) -> Tuple[bool, bool, bool, bool]:
+    """
+    Check repository for updates with timeout protection.
+    
+    Returns:
+        Tuple[bool, bool, bool, bool]: (validator_py_changed, simulator_config_changed,
+                                        simulator_py_changed, simulator_cpp_changed)
+    """
+    check_timeout = 30.0
     try:
         bt.logging.info("Checking repo for updates...")
+        start_time = time.time()
         remote = self.repo.remotes[self.config.repo.remote]
+        fetch_start = time.time()
         fetch = remote.fetch(self.repo.active_branch.name)
+        fetch_time = time.time() - fetch_start
+        if fetch_time > 10.0:
+            bt.logging.warning(f"Git fetch took {fetch_time:.1f}s (slow network?)")
         local_commit = self.repo.head.commit
         remote_commit = remote.refs[self.repo.active_branch.name].commit
         validator_py_files_changed = False
@@ -27,6 +40,7 @@ def check_repo(self : Validator) -> Tuple[bool, bool, bool, bool]:
         simulator_py_files_changed = False
         simulator_cpp_files_changed = False
         if local_commit != remote_commit:
+            diff_start = time.time()
             diff = remote_commit.diff(local_commit)
             for cht in diff.change_type:
                 changes = list(diff.iter_change_type(cht))
@@ -40,141 +54,364 @@ def check_repo(self : Validator) -> Tuple[bool, bool, bool, bool]:
                             simulator_py_files_changed = True
                         else:
                             validator_py_files_changed = True
-        if not any([validator_py_files_changed, simulator_config_changed, simulator_py_files_changed, simulator_cpp_files_changed]):
-            bt.logging.info("Nothing to update.")
+            diff_time = time.time() - diff_start
+            bt.logging.debug(f"Git diff processed in {diff_time:.1f}s")
+        total_time = time.time() - start_time
+        if total_time > check_timeout:
+            bt.logging.warning(f"Repo check took {total_time:.1f}s (timeout threshold: {check_timeout}s)")
+        if not any([validator_py_files_changed, simulator_config_changed, 
+                   simulator_py_files_changed, simulator_cpp_files_changed]):
+            bt.logging.info(f"Nothing to update (checked in {total_time:.1f}s)")
         else:
-            bt.logging.info(f"Changes to pull : [{validator_py_files_changed=}, {simulator_config_changed=}, {simulator_py_files_changed=}, {simulator_cpp_files_changed=}]")
-        return validator_py_files_changed, simulator_config_changed, simulator_py_files_changed, simulator_cpp_files_changed
+            bt.logging.info(
+                f"Changes to pull (checked in {total_time:.1f}s): "
+                f"[{validator_py_files_changed=}, {simulator_config_changed=}, "
+                f"{simulator_py_files_changed=}, {simulator_cpp_files_changed=}]"
+            )
+        return (validator_py_files_changed, simulator_config_changed, 
+                simulator_py_files_changed, simulator_cpp_files_changed)
     except Exception as ex:
-        self.pagerduty_alert(f"Failed to check repo : {ex}", details={"traceback" : traceback.format_exc()})
+        bt.logging.error(f"Failed to check repo: {ex}")
+        bt.logging.error(traceback.format_exc())
+        self.pagerduty_alert(
+            f"Failed to check repo: {ex}", 
+            details={"traceback": traceback.format_exc()}
+        )
         return False, False, False, False
 
 def update_validator(self : Validator) -> None:
     """
-    Updates, installs and restarts validator.
+    Updates, installs and restarts validator with timeout protection.
     """
-    py_cmd = ["pip", "install", "-e", "."]
-    bt.logging.info(f"UPDATING VALIDATOR (PY)...")
-    make = run_process(py_cmd, cwd=(self.repo_path ).resolve())
-    if make.returncode == 0:
-        bt.logging.success("VALIDATOR PY UPDATE SUCCESSFUL.  RESTARTING...")
-    else:
-        raise Exception(f"FAILED TO COMPLETE VALIDATOR PY UPDATE:\n{make.stderr}")
-
-    pm2_json = subprocess.run(['pm2', 'jlist'],capture_output = True, text = True).stdout
-    pm2_js = json.loads(pm2_json) if pm2_json else []
-    restart_cmd = None
-    if len(pm2_js) > 0:
-        pm2_processes = {p['name'] : p for p in pm2_js}
-        if 'validator' in pm2_processes:
-            bt.logging.info("FOUND VALIDATOR IN pm2 PROCESSES.")
-            restart_cmd = ["pm2 restart validator"]
-    if not restart_cmd:
-        for proc in psutil.process_iter():
-            if 'python validator.py' in ' '.join(proc.cmdline()):
-                bt.logging.info(f"FOUND VALIDATOR PROCESS `{proc.name()}` WITH PID {proc.pid}")
-                proc.kill()
-        restart_cmd = [f"pm2 start --name=validator \"python validator.py --netuid {self.config.netuid} --subtensor.chain_endpoint {self.config.subtensor.chain_endpoint} --wallet.path {self.config.wallet.path} --wallet.name {self.config.wallet.name} --wallet.hotkey {self.config.wallet.hotkey}\""]
-    bt.logging.info(f"RESTARTING VALIDATOR : {' '.join(restart_cmd)}")
-    validator = subprocess.run(restart_cmd, cwd=str((self.repo_path / 'taos' / 'im' / 'neurons').resolve()), shell=True, capture_output=True)
-    return
-    # if validator.returncode == 0:
-    #     bt.logging.info("VALIDATOR RESTART SUCCESSFUL.")
-    # else:
-    #     raise Exception(f"FAILED TO RESTART VALIDATOR:\nSTDOUT : {validator.stdout}\nSTDERR : {validator.stderr}")
+    try:
+        py_cmd = ["pip", "install", "-e", "."]
+        bt.logging.info(f"UPDATING VALIDATOR (PY)...")
+        
+        update_start = time.time()
+        make = run_process(py_cmd, cwd=(self.repo_path).resolve())
+        update_time = time.time() - update_start
+        
+        if make.returncode == 0:
+            bt.logging.success(f"VALIDATOR PY UPDATE SUCCESSFUL ({update_time:.1f}s). RESTARTING...")
+        else:
+            raise Exception(f"FAILED TO COMPLETE VALIDATOR PY UPDATE:\n{make.stderr}")
+        try:
+            pm2_result = subprocess.run(
+                ['pm2', 'jlist'], 
+                capture_output=True, 
+                text=True, 
+                timeout=10.0
+            )
+            pm2_json = pm2_result.stdout
+            pm2_js = json.loads(pm2_json) if pm2_json else []
+        except subprocess.TimeoutExpired:
+            bt.logging.warning("PM2 jlist timed out after 10s")
+            pm2_js = []
+        except json.JSONDecodeError as e:
+            bt.logging.warning(f"Failed to parse PM2 JSON: {e}")
+            pm2_js = []
+        
+        restart_cmd = None
+        if len(pm2_js) > 0:
+            pm2_processes = {p['name']: p for p in pm2_js}
+            if 'validator' in pm2_processes:
+                bt.logging.info("FOUND VALIDATOR IN pm2 PROCESSES.")
+                restart_cmd = ["pm2", "restart", "validator"]
+        
+        if not restart_cmd:
+            killed_count = 0
+            for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+                try:
+                    cmdline = ' '.join(proc.info['cmdline'] or [])
+                    if 'python validator.py' in cmdline:
+                        bt.logging.info(f"FOUND VALIDATOR PROCESS `{proc.info['name']}` WITH PID {proc.info['pid']}")
+                        proc.kill()
+                        proc.wait(timeout=5.0)
+                        killed_count += 1
+                except (psutil.NoSuchProcess, psutil.TimeoutExpired) as e:
+                    bt.logging.warning(f"Error killing process: {e}")
+            
+            if killed_count > 0:
+                bt.logging.info(f"Killed {killed_count} validator process(es)")
+                time.sleep(2.0)  # Brief pause after kill
+            
+            restart_cmd = [
+                "pm2", "start", "--name=validator",
+                f"python validator.py --netuid {self.config.netuid} "
+                f"--subtensor.chain_endpoint {self.config.subtensor.chain_endpoint} "
+                f"--wallet.path {self.config.wallet.path} "
+                f"--wallet.name {self.config.wallet.name} "
+                f"--wallet.hotkey {self.config.wallet.hotkey}"
+            ]
+        
+        bt.logging.info(f"RESTARTING VALIDATOR: {' '.join(restart_cmd)}")
+        validator = subprocess.run(
+            restart_cmd, 
+            cwd=str((self.repo_path / 'taos' / 'im' / 'neurons').resolve()), 
+            shell=isinstance(restart_cmd, str),
+            capture_output=True,
+            timeout=30.0
+        )
+        
+        if validator.returncode != 0:
+            bt.logging.warning(
+                f"Validator restart returned code {validator.returncode}\n"
+                f"STDOUT: {validator.stdout}\nSTDERR: {validator.stderr}"
+            )
+        
+        return
+        
+    except subprocess.TimeoutExpired:
+        bt.logging.error("Validator restart command timed out after 30s")
+        self.pagerduty_alert("Validator restart timeout")
+        raise
+    except Exception as ex:
+        bt.logging.error(f"Failed to update validator: {ex}")
+        bt.logging.error(traceback.format_exc())
+        self.pagerduty_alert(
+            f"Failed to update validator: {ex}",
+            details={"traceback": traceback.format_exc()}
+        )
+        raise
 
 def rebuild_simulator(self : Validator) -> None:
     """
-    Re-compiles the C++ simulator.
+    Re-compiles the C++ simulator with timeout protection.
     """
-    gcc_version_proc = subprocess.run(['g++ -dumpversion'], shell=True, capture_output=True)
-    if gcc_version_proc.returncode == 0:
-        gcc_version = gcc_version_proc.stdout
-        gcc14_check_proc = subprocess.run(['g++-14 -dumpversion'], shell=True, capture_output=True)
-        if gcc14_check_proc.returncode != 0:
-            raise Exception(f"Could not find g++-14 on system : {gcc14_check_proc.stderr}")
-    else:
-        raise Exception(f"Could not find g++ version : {gcc_version_proc.stderr}")
-    if gcc_version != '14':
-        make_cmd = ["cmake","-DENABLE_TRACES=1", "-DCMAKE_BUILD_TYPE=Release", "..", "-D", "CMAKE_CXX_COMPILER=g++-14"]
-    else:
-        make_cmd = ["cmake","-DENABLE_TRACES=1", "-DCMAKE_BUILD_TYPE=Release", ".."]
-
-    bt.logging.info(f"REBUILDING SIMULATOR (MAKE)...")
-    make = run_process(make_cmd, (self.repo_path / 'simulate' / 'trading' / 'build').resolve())
-    if make.returncode == 0:
-        bt.logging.success("MAKE PROCESS SUCCESSFUL.  BUILDING...")
-        build_cmd = ["cmake", "--build","."]
-        bt.logging.info(f"REBUILDING SIMULATOR (BUILD)...")
-        build = run_process(build_cmd, cwd=(self.repo_path / 'simulate' / 'trading' / 'build').resolve())
-        if build.returncode == 0:
-            bt.logging.success("REBUILT SIMULATOR.")
+    try:
+        gcc_version_proc = subprocess.run(
+            ['g++', '-dumpversion'], 
+            capture_output=True, 
+            timeout=5.0
+        )
+        
+        if gcc_version_proc.returncode == 0:
+            gcc_version = gcc_version_proc.stdout.decode().strip()
+            gcc14_check_proc = subprocess.run(
+                ['g++-14', '-dumpversion'], 
+                capture_output=True, 
+                timeout=5.0
+            )
+            if gcc14_check_proc.returncode != 0:
+                raise Exception(
+                    f"Could not find g++-14 on system: "
+                    f"{gcc14_check_proc.stderr.decode()}"
+                )
         else:
-            raise Exception(f"FAILED TO COMPLETE SIMULATOR BUILD:\n{build.stderr}")
-    else:
-        raise Exception(f"FAILED TO COMPLETE SIMULATOR MAKE:\n{make.stderr}")
+            raise Exception(
+                f"Could not find g++ version: "
+                f"{gcc_version_proc.stderr.decode()}"
+            )
+        
+        if gcc_version != '14':
+            make_cmd = [
+                "cmake", "-DENABLE_TRACES=1", "-DCMAKE_BUILD_TYPE=Release", 
+                "..", "-D", "CMAKE_CXX_COMPILER=g++-14"
+            ]
+        else:
+            make_cmd = [
+                "cmake", "-DENABLE_TRACES=1", "-DCMAKE_BUILD_TYPE=Release", ".."
+            ]
 
-    py_cmd = ["pip", "install", "-e", "."]
-    bt.logging.info(f"REBUILDING SIMULATOR (PY)...")
-    py = run_process(py_cmd, cwd=(self.repo_path / 'simulate' / 'trading').resolve())
-    if py.returncode == 0:
-        bt.logging.success("PY UPDATE SUCCESSFUL.")
-    else:
-        raise Exception(f"FAILED TO COMPLETE SIMULATOR PY UPDATE:\n{make.stderr}")
+        bt.logging.info(f"REBUILDING SIMULATOR (MAKE)...")
+        make_start = time.time()
+        make = run_process(
+            make_cmd, 
+            (self.repo_path / 'simulate' / 'trading' / 'build').resolve()
+        )
+        make_time = time.time() - make_start
+        
+        if make.returncode == 0:
+            bt.logging.success(f"MAKE PROCESS SUCCESSFUL ({make_time:.1f}s). BUILDING...")
+            
+            build_cmd = ["cmake", "--build", "."]
+            bt.logging.info(f"REBUILDING SIMULATOR (BUILD)...")
+            build_start = time.time()
+            build = run_process(
+                build_cmd, 
+                cwd=(self.repo_path / 'simulate' / 'trading' / 'build').resolve()
+            )
+            build_time = time.time() - build_start
+            
+            if build.returncode == 0:
+                bt.logging.success(f"REBUILT SIMULATOR ({build_time:.1f}s).")
+            else:
+                raise Exception(
+                    f"FAILED TO COMPLETE SIMULATOR BUILD:\n{build.stderr}"
+                )
+        else:
+            raise Exception(f"FAILED TO COMPLETE SIMULATOR MAKE:\n{make.stderr}")
+
+        py_cmd = ["pip", "install", "-e", "."]
+        bt.logging.info(f"REBUILDING SIMULATOR (PY)...")
+        py_start = time.time()
+        py = run_process(
+            py_cmd, 
+            cwd=(self.repo_path / 'simulate' / 'trading').resolve()
+        )
+        py_time = time.time() - py_start
+        
+        if py.returncode == 0:
+            bt.logging.success(f"PY UPDATE SUCCESSFUL ({py_time:.1f}s).")
+        else:
+            raise Exception(
+                f"FAILED TO COMPLETE SIMULATOR PY UPDATE:\n{py.stderr}"
+            )
+            
+    except subprocess.TimeoutExpired as e:
+        bt.logging.error(f"Simulator rebuild timeout: {e}")
+        self.pagerduty_alert(f"Simulator rebuild timeout: {e}")
+        raise
+    except Exception as ex:
+        bt.logging.error(f"Failed to rebuild simulator: {ex}")
+        bt.logging.error(traceback.format_exc())
+        self.pagerduty_alert(
+            f"Failed to rebuild simulator: {ex}",
+            details={"traceback": traceback.format_exc()}
+        )
+        raise
 
 def restart_simulator(self : Validator) -> None:
     """
-    Restarts the C++ simulator process.
+    Restarts the C++ simulator process with timeout protection.
     """
-    pm2_json = subprocess.run(['pm2', 'jlist'],capture_output = True, text = True).stdout
-    pm2_js = json.loads(pm2_json) if pm2_json else []
+    try:
+        try:
+            pm2_result = subprocess.run(
+                ['pm2', 'jlist'], 
+                capture_output=True, 
+                text=True, 
+                timeout=10.0
+            )
+            pm2_json = pm2_result.stdout
+            pm2_js = json.loads(pm2_json) if pm2_json else []
+        except subprocess.TimeoutExpired:
+            bt.logging.warning("PM2 jlist timed out after 10s")
+            pm2_js = []
+        except json.JSONDecodeError as e:
+            bt.logging.warning(f"Failed to parse PM2 JSON: {e}")
+            pm2_js = []
 
-    restart_cmd = None
-    if len(pm2_js) > 0:
-        pm2_processes = {p['name'] : p for p in pm2_js}
-        if 'simulator' in pm2_processes:
-            bt.logging.info("FOUND SIMULATOR IN pm2 PROCESSES.")
-            restart_cmd = ["pm2 restart simulator"]
-    if not restart_cmd:
-        for proc in psutil.process_iter():
-            if '../build/src/cpp/taosim' in ' '.join(proc.cmdline()):
-                bt.logging.info(f"FOUND SIMULATOR PROCESS `{proc.name()}` WITH PID {proc.pid}")
-                proc.kill()
-        restart_cmd = [f"pm2 start --no-autorestart --name=simulator \"../build/src/cpp/taosim -f {self.simulator_config_file}\""]
-    bt.logging.info(f"RESTARTING SIMULATOR : {' '.join(restart_cmd)}")
-    simulator = subprocess.run(restart_cmd, cwd=str((self.repo_path / 'simulate' / 'trading' / 'run').resolve()), shell=True, capture_output=True)
-    if simulator.returncode == 0:
-        if check_simulator(self):
-            bt.logging.success("SIMULATOR RESTART SUCCESSFUL.")
+        restart_cmd = None
+        if len(pm2_js) > 0:
+            pm2_processes = {p['name']: p for p in pm2_js}
+            if 'simulator' in pm2_processes:
+                bt.logging.info("FOUND SIMULATOR IN pm2 PROCESSES.")
+                restart_cmd = ["pm2", "restart", "simulator"]
+        
+        if not restart_cmd:
+            killed_count = 0
+            for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+                try:
+                    cmdline = ' '.join(proc.info['cmdline'] or [])
+                    if '../build/src/cpp/taosim' in cmdline:
+                        bt.logging.info(
+                            f"FOUND SIMULATOR PROCESS `{proc.info['name']}` "
+                            f"WITH PID {proc.info['pid']}"
+                        )
+                        proc.kill()
+                        proc.wait(timeout=5.0)
+                        killed_count += 1
+                except (psutil.NoSuchProcess, psutil.TimeoutExpired) as e:
+                    bt.logging.warning(f"Error killing simulator process: {e}")
+            
+            if killed_count > 0:
+                bt.logging.info(f"Killed {killed_count} simulator process(es)")
+                time.sleep(2.0)  # Brief pause after kill
+            
+            restart_cmd = [
+                "pm2", "start", "--no-autorestart", "--name=simulator",
+                f"../build/src/cpp/taosim -f {self.simulator_config_file}"
+            ]
+        
+        bt.logging.info(f"RESTARTING SIMULATOR: {' '.join(restart_cmd)}")
+        simulator = subprocess.run(
+            restart_cmd, 
+            cwd=str((self.repo_path / 'simulate' / 'trading' / 'run').resolve()), 
+            shell=isinstance(restart_cmd, str),
+            capture_output=True,
+            timeout=30.0
+        )
+        
+        if simulator.returncode == 0:
+            time.sleep(2.0)  # Give simulator time to start
+            if check_simulator(self):
+                bt.logging.success("SIMULATOR RESTART SUCCESSFUL.")
+            else:
+                self.pagerduty_alert(
+                    "FAILED TO RESTART SIMULATOR! NOT FOUND IN PM2 AFTER RESTART."
+                )
         else:
-            self.pagerduty_alert("FAILED TO RESTART SIMULATOR!  NOT FOUND IN PM2 AFTER RESTART.")
-    else:
-        raise Exception(f"FAILED TO RESTART SIMULATOR:\nSTDOUT : {simulator.stdout}\nSTDERR : {simulator.stderr}")
+            raise Exception(
+                f"FAILED TO RESTART SIMULATOR:\n"
+                f"STDOUT: {simulator.stdout}\n"
+                f"STDERR: {simulator.stderr}"
+            )
+            
+    except subprocess.TimeoutExpired:
+        bt.logging.error("Simulator restart command timed out after 30s")
+        self.pagerduty_alert("Simulator restart timeout")
+        raise
+    except Exception as ex:
+        bt.logging.error(f"Failed to restart simulator: {ex}")
+        bt.logging.error(traceback.format_exc())
+        self.pagerduty_alert(
+            f"Failed to restart simulator: {ex}",
+            details={"traceback": traceback.format_exc()}
+        )
+        raise
 
 def check_simulator(self : Validator) -> bool:
     """
-    If no new state update has been retrieved for 5 minutes, check if the simulator process is still running.
-    If the simulator is found not to be online, restart it.
-    TODO: Use checkpointing functionality to resume latest simulation.
+    Check if the simulator process is still running with timeout protection.
+    
+    Returns:
+        bool: True if simulator is healthy, False otherwise
     """
-    if self.last_state_time and self.last_state_time < time.time() - 300:
-        pm2_json = subprocess.run(['pm2', 'jlist'],capture_output = True, text = True).stdout
-        pm2_js = json.loads(pm2_json) if pm2_json else []
-        pm2_processes = {p['name'] : p for p in pm2_js}
+    try:
+        if not self.last_state_time or self.last_state_time >= time.time() - 300:
+            return True
+        try:
+            pm2_result = subprocess.run(
+                ['pm2', 'jlist'], 
+                capture_output=True, 
+                text=True, 
+                timeout=10.0
+            )
+            pm2_json = pm2_result.stdout
+            pm2_js = json.loads(pm2_json) if pm2_json else []
+        except subprocess.TimeoutExpired:
+            bt.logging.error("PM2 jlist timed out after 10s during health check")
+            return False
+        except json.JSONDecodeError as e:
+            bt.logging.error(f"Failed to parse PM2 JSON during health check: {e}")
+            pm2_js = []
+        pm2_processes = {p['name']: p for p in pm2_js}
         if 'simulator' in pm2_processes:
-            if pm2_processes['simulator']['pm2_env']['status'] != 'online':
-                self.pagerduty_alert(f"Simulator process (PM2) has stopped! Status={pm2_processes['simulator']['pm2_env']['status']}")
+            status = pm2_processes['simulator']['pm2_env']['status']
+            if status != 'online':
+                self.pagerduty_alert(
+                    f"Simulator process (PM2) has stopped! Status={status}"
+                )
                 return False
-            else: 
-                return True
-        else:
-            found = False
-            for proc in psutil.process_iter():
-                if '../build/src/cpp/taosim' in ' '.join(proc.cmdline()):
+            return True
+        found = False
+        try:
+            for proc in psutil.process_iter(['cmdline']):
+                cmdline = ' '.join(proc.info['cmdline'] or [])
+                if '../build/src/cpp/taosim' in cmdline:
                     found = True
-            if not found:
-                self.pagerduty_alert(f"Simulator process (No PM2) has stopped!")
-                return False
-            else: 
-                return True
-    return True
+                    break
+        except Exception as e:
+            bt.logging.error(f"Error checking simulator processes: {e}")
+            return False
+        
+        if not found:
+            self.pagerduty_alert("Simulator process (No PM2) has stopped!")
+            return False
+        
+        return True
+    except Exception as ex:
+        bt.logging.error(f"Error during simulator health check: {ex}")
+        bt.logging.error(traceback.format_exc())
+        return False

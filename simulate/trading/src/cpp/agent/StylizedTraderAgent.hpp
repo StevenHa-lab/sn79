@@ -8,7 +8,6 @@
 #include "GBMValuationModel.hpp"
 #include "Distribution.hpp"
 #include "Order.hpp"
-#include "Trade.hpp"
 
 #include <boost/circular_buffer.hpp>
 
@@ -19,7 +18,19 @@
 class StylizedTraderAgent : public Agent
 {
 public:
+
+    StylizedTraderAgent() noexcept = default;
     StylizedTraderAgent(Simulation* simulation) noexcept;
+
+    // TODO: Wrap state into a struct and provide a single access point here.
+    [[nodiscard]] auto&& tauF(this auto&& self) noexcept { return self.m_tauF; }
+    [[nodiscard]] auto&& orderFlag(this auto&& self) noexcept { return self.m_orderFlag; }
+    [[nodiscard]] auto&& regimeChangeProb(this auto&& self) noexcept { return self.m_regimeChangeProb; }
+    [[nodiscard]] auto&& regimeState(this auto&& self) noexcept { return self.m_regimeState; }
+    [[nodiscard]] auto&& topLevel(this auto&& self) noexcept { return self.m_topLevel; }
+    [[nodiscard]] auto&& priceHist(this auto&& self) noexcept { return self.m_priceHist; }
+    [[nodiscard]] auto&& logReturns(this auto&& self) noexcept { return self.m_logReturns; }
+    [[nodiscard]] auto&& tradePrice(this auto&& self) noexcept { return self.m_tradePrice; }
 
     virtual void configure(const pugi::xml_node& node) override;
     virtual void receiveMessage(Message::Ptr msg) override;
@@ -47,7 +58,9 @@ private:
         Timestamp min, max;
     };
 
-    struct Weight { double F, C, N; };
+    struct Weight {
+        double F, C, N; 
+    };
 
     
     enum RegimeState {
@@ -92,7 +105,9 @@ private:
     void updateRegime(BookId bookId);
     Timestamp orderPlacementLatency();
     Timestamp marketFeedLatency();
-    Timestamp decisionMakingDelay();
+    Timestamp decisionMakingDelay(BookId bookId);
+
+    // Parameters, injections.
     std::mt19937* m_rng;
     std::string m_exchange;
     uint32_t m_bookCount;
@@ -100,47 +115,56 @@ private:
     double m_weightNormalizer;
     double m_priceF0;
     double m_price0;
-    Timestamp m_tau;
-    Timestamp m_tau0;
-    Timestamp m_tauHist;
-    std::vector<double> m_tauF;
+    double m_tauFOrig;
     double m_sigmaEps;
     double m_hara;
-    double m_riskAversion;
     double m_riskAversion0;
-    double m_priceIncrement;
-    double m_volumeIncrement;
+    double m_riskAversion;
     float m_volatilityGuard;
     float m_slopeVolGuard;
     float m_volGuardX0;
-
-    std::vector<TopLevel> m_topLevel;
     DelayBounds m_opl;
     double m_price;
-    std::vector<bool> m_orderFlag;
-    std::vector<boost::circular_buffer<double>> m_priceHist;
-    std::vector<boost::circular_buffer<double>> m_logReturns;
-    
+    double m_priceIncrement;
+    double m_volumeIncrement;
     bool m_debug;
-
+    bool m_regimeChangeFlag;
     Weight m_weightRegime;
     double m_tauFRegime;
-    bool m_regimeChangeFlag;
-    std::vector<Timestamp> m_regimeSwitchKickback;
-    std::vector<float> m_regimeChangeProb;
-    std::vector<RegimeState> m_regimeState;
     Weight m_weightOrig;
-    double m_tauFOrig;
-
     double m_alpha;
-
-    Timestamp m_historySize;
     std::normal_distribution<double> m_marketFeedLatencyDistribution;
     std::normal_distribution<double> m_decisionMakingDelayDistribution;
+    Timestamp m_tau0;
+    Timestamp m_tau;
+    Timestamp m_tauHist;
+    Timestamp m_historySize;
     std::unique_ptr<taosim::stats::Distribution> m_orderPlacementLatencyDistribution;
     std::string m_baseName;
     uint32_t m_catUId;
-    double m_wealthFrac = 0.01;
+    double m_wealthFrac{0.01};
+    // Delays, latencys activations and more
+    float m_omegaDu;
+    float m_alphaDu;
+    float m_betaDu;
+    float m_gammaDu;
+    Timestamp m_maxDelay;
+    Timestamp m_minDelay;
+    std::weibull_distribution<float> m_acdDelayDist;
+    
+    // State.
+    std::vector<double> m_tauF;
+    std::vector<bool> m_orderFlag;
+    std::vector<float> m_regimeChangeProb;
+    std::vector<RegimeState> m_regimeState;
+    std::vector<TopLevel> m_topLevel;
+    std::vector<boost::circular_buffer<double>> m_priceHist;
+    std::vector<boost::circular_buffer<double>> m_logReturns;
+    
 };
+
+//-------------------------------------------------------------------------
+
+// namespace taosim::agent
 
 //-------------------------------------------------------------------------

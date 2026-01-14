@@ -522,14 +522,25 @@ class QueryService:
         while self.running:
             try:
                 message, _ = self.request_queue.receive(timeout=1.0)
+                receive_time = time.time()
+                bt.logging.info(f"Received message at {receive_time}")
                 command = message.decode('utf-8')
 
                 if command == 'query':
+                    gc.collect()
                     read_start = time.time()
+                    bt.logging.info(f"Starting read, {read_start - receive_time:.4f}s after receive")                    
                     self.request_mem.seek(0)
+                    seek_time = time.time()
+                    bt.logging.info(f"Seek completed in {seek_time - read_start:.4f}s")                    
                     size_bytes = self.request_mem.read(8)
+                    size_read_time = time.time()
+                    bt.logging.info(f"Read size in {size_read_time - seek_time:.4f}s")                    
                     data_size = struct.unpack('Q', size_bytes)[0]
                     request_bytes = self.request_mem.read(data_size)
+                    data_read_time = time.time()
+                    bt.logging.info(f"Read {data_size} bytes in {data_read_time - size_read_time:.4f}s")
+                    
                     request_data = pickle.loads(request_bytes)
                     bt.logging.info(f"Read Query request data ({time.time()-read_start:.4f}s).")
 

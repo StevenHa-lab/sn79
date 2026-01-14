@@ -447,8 +447,6 @@ void HighFrequencyTraderAgent::placeOrder(BookId bookId, TopLevel& topLevel) {
 
     double skipProb = std::exp(-1.0*std::pow(relativeSpread/m_spreadSensitivityBase, m_spreadSensitivityExp));
     double makerRate = taosim::util::decimal2double(simulation()->exchange()->clearingManager().feePolicy()->getRates(bookId,m_id).maker);
-    // Seed the random number generator
-    m_rng->seed(std::random_device{}());
     
     const double rayleighShift =  m_noiseRay * std::sqrt(-2.0 * std::log(1.0 - m_shiftPercentage));
     const double optimalSpread = m_sigmaSqr*m_gHFT*(1-(simulation()->currentTimestamp()/ m_delta)/(simulation()->duration()/m_delta))

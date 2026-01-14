@@ -153,7 +153,7 @@ def add_im_validator_args(cls, parser):
         "--scoring.sharpe.min_realized_observations",
         type=int,
         help="The minimum number of realized PnL observations (round-trips) required in the assessment window for realized Sharpe score to be assigned.",
-        default=10,
+        default=6,
     )
 
     parser.add_argument(

@@ -57,7 +57,7 @@
             minOPLatency="90000000"
             maxOPLatency="5000000000"
             depth="21"
-            volumeDrawRayleighScale="5000.0"
+            volumeDrawRayleighScale="2000.0"
             alpha="0.2"
             beta="0.7"
             gammaX="0.2"
@@ -179,6 +179,11 @@
             HARA="2.0"
             GBMSigma="0.01"
             regimeChangeFlag="0"
+            acdOmega="2.3"
+            acdAlpha="0.45"
+			acdBeta="0.45"
+            minDMD="2000000000"
+            maxDMD="600000000000"
             pO_alpha="0.0">
             <Balances
                 type="pareto-50"

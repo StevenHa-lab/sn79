@@ -7,6 +7,7 @@
 #include "taosim/message/ExchangeAgentMessagePayloads.hpp"
 #include "taosim/message/MessagePayload.hpp"
 #include "DistributionFactory.hpp"
+#include "MagneticField.hpp"
 #include "RayleighDistribution.hpp"
 #include "Simulation.hpp"
 
@@ -16,20 +17,33 @@
 #include <boost/accumulators/accumulators.hpp>
 #include <boost/accumulators/statistics/stats.hpp>
 #include <boost/accumulators/statistics/variance.hpp>
+#include <boost/algorithm/string/regex.hpp>
 #include <boost/random.hpp>
 #include <boost/random/laplace_distribution.hpp>
 #include <unsupported/Eigen/NonLinearOptimization>
 
-#include <algorithm>
+//-------------------------------------------------------------------------
+
+namespace br = boost::random;
 
 //-------------------------------------------------------------------------
 
 
-inline auto investmentPosition = [](double price, double forecast, double variance, double base, double quote, double risk, double constant) {
-    return std::log(forecast/price)/variance * (1/risk * (base + quote/price) + constant/price);
-};    
+//-------------------------------------------------------------------------
 
-namespace br = boost::random;
+[[nodiscard]] static double investmentPosition(
+    double price,
+    double forecast,
+    double variance,
+    double base,
+    double quote,
+    double risk,
+    double constant)
+{
+    return std::log(forecast / price) / (variance * price)
+        * (1. / risk * (base * price + quote) + constant);
+};
+
 //-------------------------------------------------------------------------
 
 StylizedTraderAgent::StylizedTraderAgent(Simulation* simulation) noexcept
@@ -150,7 +164,6 @@ void StylizedTraderAgent::configure(const pugi::xml_node& node)
 
     m_debug = node.attribute("debug").as_bool();
 
-    m_regimeSwitchKickback.resize(m_bookCount);
     m_regimeChangeFlag = node.attribute("regimeChangeFlag").as_bool();
     if (m_regimeChangeFlag) {
         if (attr = node.attribute("sigmaFRegime"); attr.empty() || attr.as_double() < 0.0f) {
@@ -172,7 +185,7 @@ void StylizedTraderAgent::configure(const pugi::xml_node& node)
             .F = std::abs(br::laplace_distribution{sigmaFRegime, sigmaFRegime}(*m_rng)),
             .C = std::abs(br::laplace_distribution{sigmaCRegime, sigmaCRegime}(*m_rng)),
             .N = std::abs(br::laplace_distribution{sigmaNRegime, sigmaNRegime}(*m_rng))
-            };
+        };
         m_regimeChangeProb = std::vector<float>(m_bookCount, std::clamp(node.attribute("regimeProb").as_float(), 0.0f, 1.0f));
         if (attr = node.attribute("tauFRegime"); attr.empty() || attr.as_double() <= 0.0) {
             throw std::invalid_argument(fmt::format(
@@ -185,7 +198,7 @@ void StylizedTraderAgent::configure(const pugi::xml_node& node)
         m_tauFRegime = 1.0;
     }
     
-    m_regimeState = std::vector<RegimeState>(m_bookCount,RegimeState::NORMAL);
+    m_regimeState = std::vector<RegimeState>(m_bookCount, RegimeState::NORMAL);
 
     m_weightOrig = m_weight;
 
@@ -310,6 +323,28 @@ void StylizedTraderAgent::configure(const pugi::xml_node& node)
     m_orderPlacementLatencyDistribution =  std::make_unique<taosim::stats::RayleighDistribution>(scale, percentile); 
 
 
+    // ACD Things
+    m_acdDelayDist = std::weibull_distribution<float>{1.0, 1.0}; 
+    if (attr = node.attribute("acdOmega"); attr.empty()) {
+        throw std::invalid_argument{fmt::format(
+                    "{}: Missing attribute 'acdOmega'", ctx)};
+    }
+    m_omegaDu = attr.as_float();
+    if (attr = node.attribute("acdAlpha"); attr.empty() || attr.as_float() < 0.0f) {
+            throw std::invalid_argument{fmt::format(
+                    "{}: Missing attribute 'acdAlpha'", ctx)};
+    }
+    m_alphaDu =  attr.as_float(); 
+    if (attr = node.attribute("acdBeta"); attr.empty() || attr.as_float() < 0.0f || m_alphaDu + attr.as_float() > 1) {
+            throw std::invalid_argument{fmt::format(
+                    "{}: Missing attribute 'acdBeta' or values need to be checked", ctx)};
+    }
+    m_betaDu =  attr.as_float(); 
+    attr = node.attribute("maxDMD");
+    m_maxDelay = (attr.empty() || attr.as_ullong() < 1'000'000'000) ? static_cast<Timestamp>(450'000'000'000) : attr.as_ullong();
+    attr = node.attribute("minDMD");
+    m_minDelay = (attr.empty() || attr.as_ullong() < 100'000'000) ? static_cast<Timestamp>(100'000'000) : attr.as_ullong();
+
     m_baseName = [&] {
         std::string res = name();
         boost::algorithm::erase_regex(res, boost::regex("(_\\d+)$"));
@@ -321,7 +356,6 @@ void StylizedTraderAgent::configure(const pugi::xml_node& node)
         std::string numStr = name().substr(pos + 1);
         m_catUId = static_cast<uint64_t>(std::stoul(numStr));
     }
-
 }
 
 //-------------------------------------------------------------------------
@@ -362,25 +396,8 @@ void StylizedTraderAgent::receiveMessage(Message::Ptr msg)
 //-------------------------------------------------------------------------
 
 void StylizedTraderAgent::handleSimulationStart()
-{
-    simulation()->dispatchMessage(
-        simulation()->currentTimestamp(),
-        1,
-        name(),
-        m_exchange,
-        "SUBSCRIBE_EVENT_TRADE");
-}
-
-//-------------------------------------------------------------------------
-
-void StylizedTraderAgent::handleSimulationStop()
-{}
-
-//-------------------------------------------------------------------------
-
-void StylizedTraderAgent::handleTradeSubscriptionResponse()
-{
-   for (BookId bookId = 0; bookId < m_bookCount; ++bookId) {
+{   
+    for (BookId bookId = 0; bookId < m_bookCount; ++bookId) {
         simulation()->dispatchMessage(
             simulation()->currentTimestamp(),
             1,
@@ -398,8 +415,23 @@ void StylizedTraderAgent::handleTradeSubscriptionResponse()
                 fmt::format("{}_{}", m_baseName, chosenAgent),
                 "WAKEUP",
                 MessagePayload::create<RetrieveL1Payload>(bookId));  
+            const auto field = dynamic_cast<MagneticField*>(simulation()->exchange()->process("magneticfield",bookId));
+            float initValue = std::exp((float) m_maxDelay/3.0f);
+            field->insertDurationComp(m_baseName,DurationComp{.delay=initValue, .psi=initValue});
         }
     }
+}
+
+//-------------------------------------------------------------------------
+
+void StylizedTraderAgent::handleSimulationStop()
+{}
+
+//-------------------------------------------------------------------------
+
+void StylizedTraderAgent::handleTradeSubscriptionResponse()
+{
+
 }
 
 //-------------------------------------------------------------------------
@@ -410,7 +442,6 @@ void StylizedTraderAgent::handleRetrieveL1Response(Message::Ptr msg)
 
     const BookId bookId = payload->bookId;
 
-    auto rng = std::mt19937{simulation()->currentTimestamp() + static_cast<Timestamp>(simulation()->bookIdCanon(bookId))};
 
     simulation()->dispatchMessage(
         simulation()->currentTimestamp(),
@@ -425,15 +456,13 @@ void StylizedTraderAgent::handleRetrieveL1Response(Message::Ptr msg)
     topLevel.ask = taosim::util::decimal2double(payload->bestAskPrice);
     
 
-    if  (topLevel.bid == 0.0) topLevel.bid =  m_priceHist.at(bookId).back();
+    if  (topLevel.bid == 0.0) topLevel.bid = m_priceHist.at(bookId).back();
     if  (topLevel.ask == 0.0) topLevel.ask = topLevel.bid + m_priceIncrement;
     const double midQuote = 0.5 * (topLevel.bid + topLevel.ask);
-    const double spotPrice = midQuote;
-    const double lastPrice = midQuote;
 
     m_logReturns.at(bookId).push_back(
-                    std::log(lastPrice / m_priceHist.at(bookId).back()));
-    m_priceHist.at(bookId).push_back(lastPrice);
+        std::log(midQuote / m_priceHist.at(bookId).back()));
+    m_priceHist.at(bookId).push_back(midQuote);
 }
 
 //-------------------------------------------------------------------------
@@ -509,18 +538,17 @@ StylizedTraderAgent::ForecastResult StylizedTraderAgent::forecast(BookId bookId)
         }
     }
     const double compN = std::normal_distribution{0.0, m_sigmaEps}(*m_rng);
-    // const double tauFNormalizer = m_regimeState.at(bookId) == RegimeState::REGIME_A ?  m_tauF.at(bookId) / m_weightNormalizer *0.01 : 1;
     double logReturnForecast = std::clamp(m_weightNormalizer
-        * (m_weight.F * compF + m_weight.C * compC + m_weight.N * compN), -1.0, 1.0);// * tauFNormalizer;
+        * (m_weight.F * compF + m_weight.C * compC + m_weight.N * compN), -1.0, 1.0);
     double varLastLogs = [&] {
-            namespace bacc = boost::accumulators;
-            bacc::accumulator_set<double, bacc::stats<bacc::tag::lazy_variance>> acc;
-            const auto n = logReturns.size();
-            for (auto logRet : logReturns) {
-                acc(logRet);
-            }
-            return bacc::variance(acc) * (n - 1) / n;
-        }();
+        namespace bacc = boost::accumulators;
+        bacc::accumulator_set<double, bacc::stats<bacc::tag::lazy_variance>> acc;
+        const auto n = logReturns.size();
+        for (auto logRet : logReturns) {
+            acc(logRet);
+        }
+        return bacc::variance(acc) * (n - 1) / n;
+    }();
     // Error recovery
     if (isnan(varLastLogs)) {
         varLastLogs = std::abs(std::log(pf/m_price)*0.33);
@@ -573,8 +601,6 @@ void StylizedTraderAgent::placeOrderChiarella(BookId bookId)
         }
         return;
     }
-
-
 
     const auto [indifferencePrice, indifferencePriceConverged] =
         calculateIndifferencePrice(forecastResult, freeBase, freeQuote);
@@ -636,14 +662,16 @@ StylizedTraderAgent::OptimizationResult StylizedTraderAgent::calculateIndifferen
 
         int operator()(const Eigen::VectorXd& x, Eigen::VectorXd& fvec) const
         {
-            fvec[0] = investmentPosition(x[0], 
-                        forecastResult.price, 
-                        forecastResult.varianceOfLastLogReturns, 
-                        freeBase,
-                        freeQuote,
-                        riskAversion,
-                        hara) 
-                    - freeBase;
+            fvec[0] = 
+                investmentPosition(
+                    x[0], 
+                    forecastResult.price, 
+                    forecastResult.varianceOfLastLogReturns, 
+                    freeBase,
+                    freeQuote,
+                    riskAversion,
+                    hara)
+                - freeBase;
             return 0;
         }
     };
@@ -692,14 +720,16 @@ StylizedTraderAgent::OptimizationResult StylizedTraderAgent::calculateMinimumPri
         int operator()(const Eigen::VectorXd& x, Eigen::VectorXd& fvec) const
         {
             fvec[0] = x[0] * 
-                    (investmentPosition(x[0], 
-                            forecastResult.price, 
-                            forecastResult.varianceOfLastLogReturns,
-                            freeBase,
-                            freeQuote,
-                            riskAversion,
-                            hara) 
-                    - freeBase) - freeQuote;
+                (investmentPosition(
+                    x[0], 
+                    forecastResult.price, 
+                    forecastResult.varianceOfLastLogReturns,
+                    freeBase,
+                    freeQuote,
+                    riskAversion,
+                    hara) 
+                    - freeBase)
+                - freeQuote;
             return 0;
         }
     };
@@ -716,10 +746,24 @@ StylizedTraderAgent::OptimizationResult StylizedTraderAgent::calculateMinimumPri
     };
 }
 
-// -------------------------------------------------------------------------
-double StylizedTraderAgent::calcPositionPrice(const StylizedTraderAgent::ForecastResult& forecastResult, double price, double freeBase, double freeQuote) {
-    return investmentPosition(price, forecastResult.price, forecastResult.varianceOfLastLogReturns, freeBase, freeQuote, m_riskAversion, m_hara);
+//-------------------------------------------------------------------------
+
+double StylizedTraderAgent::calcPositionPrice(
+    const StylizedTraderAgent::ForecastResult& forecastResult,
+    double price,
+    double freeBase,
+    double freeQuote)
+{
+    return investmentPosition(
+        price,
+        forecastResult.price,
+        forecastResult.varianceOfLastLogReturns,
+        freeBase,
+        freeQuote,
+        m_riskAversion,
+        m_hara);
 }
+
 //-------------------------------------------------------------------------
 
 void StylizedTraderAgent::placeLimitBuy(
@@ -842,30 +886,14 @@ void StylizedTraderAgent::handleWakeup(Message::Ptr &msg)
     
     simulation()->dispatchMessage(
         simulation()->currentTimestamp(),
-            decisionMakingDelay(),
+            decisionMakingDelay(bookId),
             name(),
             fmt::format("{}_{}", m_baseName, chosenAgent),
             "WAKEUP",
             MessagePayload::create<RetrieveL1Payload>(bookId));  
     placeOrderChiarella(bookId);
 }
-//-------------------------------------------------------------------------
 
-Timestamp StylizedTraderAgent::orderPlacementLatency() {
-    return static_cast<Timestamp>(std::lerp(m_opl.min, m_opl.max, m_orderPlacementLatencyDistribution->sample(*m_rng)));
-}
-
-//-------------------------------------------------------------------------
-Timestamp StylizedTraderAgent::marketFeedLatency() {
-    return static_cast<Timestamp>(std::min(std::abs(m_marketFeedLatencyDistribution(*m_rng)),
-            +m_marketFeedLatencyDistribution.mean() + 3 * m_marketFeedLatencyDistribution.stddev()));
-}
-//-------------------------------------------------------------------------
-Timestamp StylizedTraderAgent::decisionMakingDelay() {
-    return static_cast<Timestamp>(std::min(std::abs(m_decisionMakingDelayDistribution(*m_rng)),
-             m_decisionMakingDelayDistribution.mean()
-            + 3.0 * m_decisionMakingDelayDistribution.stddev()));
-}
 //-------------------------------------------------------------------------
 
 double StylizedTraderAgent::getProcessValue(BookId bookId, const std::string& name)
@@ -877,19 +905,43 @@ double StylizedTraderAgent::getProcessValue(BookId bookId, const std::string& na
 
 void StylizedTraderAgent::updateRegime(BookId bookId)
 {
-    if (!m_regimeChangeFlag) return;
-    
-    auto rng = std::mt19937{simulation()->currentTimestamp()};
-    if (m_regimeState.at(bookId) == RegimeState::NORMAL
-            && std::bernoulli_distribution{m_regimeChangeProb.at(bookId)}(rng)){
-        m_tauF.at(bookId) = m_tauFRegime;
-        m_regimeState.at(bookId) = RegimeState::REGIME_A;
-    } 
-    else if (m_regimeState.at(bookId) == RegimeState::REGIME_A 
-                && std::bernoulli_distribution{1- std::sqrt(m_regimeChangeProb.at(bookId))}(rng)) {
-        m_tauF.at(bookId) = m_tauFOrig;
-        m_regimeState.at(bookId) = RegimeState::NORMAL;
-    }
+
 }
 
-//------------------------------------------------------------------------- 
+//-------------------------------------------------------------------------
+
+Timestamp StylizedTraderAgent::orderPlacementLatency()
+{
+    return static_cast<Timestamp>(
+        std::lerp(m_opl.min, m_opl.max, m_orderPlacementLatencyDistribution->sample(*m_rng)));
+}
+
+//-------------------------------------------------------------------------
+
+Timestamp StylizedTraderAgent::marketFeedLatency()
+{
+    return static_cast<Timestamp>(std::min(
+        std::abs(m_marketFeedLatencyDistribution(*m_rng)),
+        + m_marketFeedLatencyDistribution.mean() + 3 * m_marketFeedLatencyDistribution.stddev()));
+}
+//-------------------------------------------------------------------------
+
+Timestamp StylizedTraderAgent::decisionMakingDelay(BookId bookId)
+{
+    const auto field = dynamic_cast<MagneticField*>(simulation()->exchange()->process("magneticfield", bookId));
+    const auto lastDurationComp = field->getDurationComp(m_baseName);
+    float lastDelay = lastDurationComp.delay;
+    float psi_prev = lastDurationComp.psi; 
+    float psi_next = m_omegaDu + m_alphaDu * lastDelay + m_betaDu *psi_prev;
+    if (isnan(psi_next)) {
+        psi_next = m_omegaDu/(1-m_alphaDu - m_omegaDu);
+    }
+    float delay = std::exp(psi_next) * m_acdDelayDist(*m_rng);
+    return  std::clamp(static_cast<Timestamp>(delay), m_minDelay, m_maxDelay);
+}
+
+//-------------------------------------------------------------------------
+
+// namespace taosim::agent
+
+//-------------------------------------------------------------------------

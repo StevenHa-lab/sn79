@@ -36,7 +36,6 @@ def score_uid(validator_data: Dict, uid: int) -> float:
     Args:
         validator_data (Dict): Dictionary containing validator state
         uid (int): UID of miner being scored
-        inventory_values (Dict[int, Dict[int, float]]): Inventory values for the miner
 
     Returns:
         float: The new score value for the given UID.
@@ -44,8 +43,8 @@ def score_uid(validator_data: Dict, uid: int) -> float:
     sharpe_values = validator_data['sharpe_values']
     activity_factors = validator_data['activity_factors']
     activity_factors_realized = validator_data['activity_factors_realized']
-    compact_volumes = validator_data['compact_volumes']
-    compact_roundtrip_volumes = validator_data['compact_roundtrip_volumes']
+    trade_volumes = validator_data['trade_volumes']
+    roundtrip_volumes = validator_data['roundtrip_volumes']
     config = validator_data['config']['scoring']
     simulation_config = validator_data['simulation_config']
     reward_weights = validator_data['reward_weights']
@@ -81,6 +80,7 @@ def score_uid(validator_data: Dict, uid: int) -> float:
     volume_cap_inv = 1.0 / volume_cap
 
     lookback = config['sharpe']['lookback']
+    lookback_threshold = simulation_timestamp - (lookback * publish_interval)
     
     decay_grace_period = config['activity'].get('decay_grace_period', 600_000_000_000)
     activity_impact = config['activity'].get('impact', 0.33)
@@ -95,28 +95,48 @@ def score_uid(validator_data: Dict, uid: int) -> float:
     decay_window_ns = (lookback * config['interval']) - decay_grace_period
     decay_window_ns_inv = 1.0 / decay_window_ns if decay_window_ns > 0 else 0.0
 
-    compact_volumes_uid = compact_volumes[uid]
-    miner_volumes = {book_id: data['lookback_volume'] for book_id, data in compact_volumes_uid.items()}
-    latest_volumes = {book_id: data['latest_volume'] for book_id, data in compact_volumes_uid.items()}
-    latest_timestamps = {book_id: data['latest_timestamp'] for book_id, data in compact_volumes_uid.items()}
-    
-    # Calculate the activity factors to be multiplied onto the unrealized Sharpes to obtain the final values for assessment
-    # If the miner has traded in the previous Sharpe assessment window, the factor is equal to the ratio of the miner trading volume to the cap multipled by the impact factor
-    # If the miner has not traded, their existing activity factor is decayed by the factor defined above, with accelerating decay after the grace period
+    sampling_interval = config['activity']['trade_volume_sampling_interval']
+    sampled_timestamp = (simulation_timestamp // sampling_interval) * sampling_interval
+
+    book_count = len(sharpes_unrealized)
     activity_factors_uid = activity_factors[uid]
-    for book_id, miner_volume in miner_volumes.items():
-        if latest_volumes[book_id] > 0:
-            activity_factors_uid[book_id] = min(1 + ((miner_volume * volume_cap_inv) * activity_impact), 2.0)
-        else:
-            latest_time = latest_timestamps[book_id]
+    
+    for book_id in range(book_count):
+        if uid in trade_volumes and book_id in trade_volumes[uid]:
+            total_trades = trade_volumes[uid][book_id].get('total', {})
+            lookback_volume = sum(
+                vol for ts, vol in total_trades.items()
+                if ts >= lookback_threshold
+            )
             
+            latest_time = 0
+            latest_volume = 0.0
+            for ts, vol in total_trades.items():
+                if vol > 0 and ts <= sampled_timestamp and ts > latest_time:
+                    latest_time = ts
+            
+            if latest_time > 0 and latest_time >= sampled_timestamp - sampling_interval:
+                latest_volume = total_trades[latest_time]
+        else:
+            lookback_volume = 0.0
+            latest_volume = 0.0
+            latest_time = 0
+
+        # Calculate the activity factors to be multiplied onto the unrealized Sharpes to obtain the final values for assessment
+        # If the miner has traded in the previous Sharpe assessment window, the factor is equal to the ratio of the miner trading volume to the cap multipled by the impact factor
+        # If the miner has not traded, their existing activity factor is decayed by the factor defined above, with accelerating decay after the grace period
+        if latest_volume > 0:
+            activity_factors_uid[book_id] = min(
+                1 + ((lookback_volume * volume_cap_inv) * activity_impact), 
+                2.0
+            )
+        else:
             if latest_time > 0:
                 inactive_time = max(0, simulation_timestamp - latest_time)
             else:
                 inactive_time = simulation_timestamp
             
             current_factor = activity_factors_uid[book_id]
-
             activity_multiplier = max(current_factor, 1.0)
 
             if inactive_time <= decay_grace_period:
@@ -129,31 +149,39 @@ def score_uid(validator_data: Dict, uid: int) -> float:
             total_acceleration = activity_multiplier * time_acceleration
             decay_factor = base_decay_factor ** total_acceleration
             activity_factors_uid[book_id] *= decay_factor
-    
-    compact_roundtrip_volumes_uid = compact_roundtrip_volumes[uid]
-    miner_roundtrip_volumes = {
-        book_id: data['lookback_roundtrip_volume'] 
-        for book_id, data in compact_roundtrip_volumes_uid.items()
-    }
-    latest_roundtrip_volumes = {
-        book_id: data['latest_roundtrip_volume'] 
-        for book_id, data in compact_roundtrip_volumes_uid.items()
-    }
-    latest_roundtrip_timestamps = {
-        book_id: data['latest_roundtrip_timestamp']
-        for book_id, data in compact_roundtrip_volumes_uid.items()
-    }
-    
-    # Calculate the activity factors to be multiplied onto the realized Sharpes to obtain the final values for assessment
-    # If the miner has traded in the previous Sharpe assessment window, the factor is equal to the ratio of the miner trading volume to the cap multipled by the impact factor
-    # If the miner has not traded, their existing activity factor is decayed by the factor defined above, with accelerating decay after the grace period
+
     activity_factors_realized_uid = activity_factors_realized[uid]
-    for book_id, roundtrip_volume in miner_roundtrip_volumes.items():
-        if latest_roundtrip_volumes[book_id] > 0:
-            activity_factors_realized_uid[book_id] = min(1 + ((roundtrip_volume * volume_cap_inv) * activity_impact), 2.0)
-        else:
-            latest_time = latest_roundtrip_timestamps[book_id]
+    
+    for book_id in range(book_count):
+        if uid in roundtrip_volumes and book_id in roundtrip_volumes[uid]:
+            rt_volumes = roundtrip_volumes[uid][book_id]
+            lookback_rt_volume = sum(
+                vol for ts, vol in rt_volumes.items()
+                if ts >= lookback_threshold
+            )
             
+            latest_time = 0
+            latest_rt_volume = 0.0
+            for ts, vol in rt_volumes.items():
+                if vol > 0 and ts <= sampled_timestamp and ts > latest_time:
+                    latest_time = ts
+            
+            if latest_time > 0 and latest_time >= sampled_timestamp - sampling_interval:
+                latest_rt_volume = rt_volumes[latest_time]
+        else:
+            lookback_rt_volume = 0.0
+            latest_rt_volume = 0.0
+            latest_time = 0
+
+        # Calculate the activity factors to be multiplied onto the realized Sharpes to obtain the final values for assessment
+        # If the miner has traded in the previous Sharpe assessment window, the factor is equal to the ratio of the miner trading volume to the cap multipled by the impact factor
+        # If the miner has not traded, their existing activity factor is decayed by the factor defined above, with accelerating decay after the grace period
+        if latest_rt_volume > 0:
+            activity_factors_realized_uid[book_id] = min(
+                1 + ((lookback_rt_volume * volume_cap_inv) * activity_impact),
+                2.0
+            )
+        else:
             if latest_time > 0:
                 inactive_time = max(0, simulation_timestamp - latest_time)
             else:
@@ -377,37 +405,78 @@ def distribute_rewards(rewards: list, config: Dict) -> torch.FloatTensor:
     distributed_rewards = distribution * sorted_rewards
     return torch.gather(distributed_rewards, 0, sorted_indices.argsort())
 
-def get_rewards(validator_data: Dict) -> Tuple[torch.FloatTensor, Dict]:
+def get_rewards(validator: 'Validator') -> Tuple[torch.FloatTensor, Dict]:
     """
-    Calculate rewards using pre-computed inventory history and compact volumes.
+    Calculate rewards.
 
     Args:
-        validator_data (Dict): Dictionary containing validator state, compact volumes,
-                              and compact round-trip volumes
+        validator (Validator): Validator instance
 
     Returns:
         Tuple[torch.FloatTensor, Dict]: (rewards, updated_data)
     """
-    inventory_history = validator_data['inventory_history']
-    simulation_timestamp = validator_data['simulation_timestamp']
-    validator_data['simulation_timestamp'] = simulation_timestamp
-
-    if 'activity_factors_realized' not in validator_data:
-        validator_data['activity_factors_realized'] = {
-            uid: {book_id: 0.0 for book_id in range(len(validator_data['activity_factors'][uid]))}
-            for uid in validator_data['uids']
-        }
+    inventory_history = validator.inventory_history
+    realized_pnl_history = validator.realized_pnl_history
+    simulation_timestamp = validator.simulation_timestamp
+    validator_data = {
+        'sharpe_values': validator.sharpe_values,
+        'activity_factors': validator.activity_factors,
+        'activity_factors_realized': validator.activity_factors_realized,
+        'trade_volumes': validator.trade_volumes,
+        'roundtrip_volumes': validator.roundtrip_volumes,
+        'volume_sums': validator.volume_sums,
+        'roundtrip_volume_sums': validator.roundtrip_volume_sums,
+        'realized_pnl_history': realized_pnl_history,
+        'inventory_history': inventory_history,
+        'config': {
+            'scoring': {
+                'sharpe': {
+                    'normalization_min': validator.config.scoring.sharpe.normalization_min,
+                    'normalization_max': validator.config.scoring.sharpe.normalization_max,
+                    'lookback': validator.config.scoring.sharpe.lookback,
+                    'min_lookback': validator.config.scoring.sharpe.min_lookback,
+                    'min_realized_observations': validator.config.scoring.sharpe.min_realized_observations,
+                    'parallel_workers': validator.config.scoring.sharpe.parallel_workers,
+                    'reward_cores': validator.reward_cores,
+                },
+                'activity': {
+                    'capital_turnover_cap': validator.config.scoring.activity.capital_turnover_cap,
+                    'trade_volume_sampling_interval': validator.config.scoring.activity.trade_volume_sampling_interval,
+                    'trade_volume_assessment_period': validator.config.scoring.activity.trade_volume_assessment_period,
+                    'decay_grace_period': validator.config.scoring.activity.decay_grace_period,
+                    'impact': validator.config.scoring.activity.impact
+                },
+                'interval': validator.config.scoring.interval,
+            },
+            'rewarding': {
+                'seed': validator.config.rewarding.seed,
+                'pareto': {
+                    'shape': validator.config.rewarding.pareto.shape,
+                    'scale': validator.config.rewarding.pareto.scale,
+                }
+            },
+        },
+        'simulation_config': {
+            'miner_wealth': validator.simulation.miner_wealth,
+            'publish_interval': validator.simulation.publish_interval,
+            'volumeDecimals': validator.simulation.volumeDecimals,
+            'grace_period': validator.simulation.grace_period,
+        },
+        'reward_weights': validator.reward_weights,
+        'simulation_timestamp': simulation_timestamp,
+        'uids': [uid.item() for uid in validator.metagraph.uids],
+        'deregistered_uids': validator.deregistered_uids,
+        'device': validator.device,
+    }
     
     uid_scores = score_uids(validator_data, inventory_history)
     rewards = list(uid_scores.values())
-    device = validator_data.get('device', 'cpu')
-    distributed_rewards = distribute_rewards(rewards, validator_data['config']).to(device)
+    distributed_rewards = distribute_rewards(rewards, validator_data['config']).to(validator.device)
     
     updated_data = {
         'sharpe_values': validator_data['sharpe_values'],
         'activity_factors': validator_data['activity_factors'],
         'activity_factors_realized': validator_data['activity_factors_realized'],
-        'simulation_timestamp': validator_data['simulation_timestamp'],
     }
     
     return distributed_rewards, updated_data

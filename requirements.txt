@@ -19,3 +19,4 @@ ypyjson>=0.0.2
 scikit-learn
 posix-ipc
 zstandard
+aiofiles

@@ -128,143 +128,148 @@ async def forward(self, synapse: MarketSimulationStateUpdate) -> List[FinanceAge
         if self.query_process.poll() is not None:
             self.pagerduty_alert("Failed to restart query service")
             return responses
-
-    session_start = time.time()
-    bt.logging.debug(f"Session configured ({time.time() - session_start:.4f}s)")
-
-    data_start = time.time()
-    request_data = {
-        'books': synapse.books,
-        'accounts': synapse.accounts,
-        'notices': synapse.notices,
-        'config': synapse.config.model_dump(mode='json'),
-        'version': synapse.version,
-        'timestamp': synapse.timestamp,
-        'metagraph_axons': [
-            {
-                'hotkey': axon.hotkey,
-                'coldkey': axon.coldkey,
-                'ip': axon.ip,
-                'port': axon.port,
-                'ip_type': axon.ip_type,
-                'protocol': axon.protocol,
-            }
-            for axon in self.metagraph.axons
-        ],
-        'deregistered_uids': list(self.deregistered_uids),
-        'uid': self.uid,
-        'miner_wealth': self.simulation.miner_wealth,
-        'volume_decimals': self.simulation.volumeDecimals,
-        'book_count': self.simulation.book_count,
-        'volume_sums': {uid: dict(books) for uid, books in self.volume_sums.items()},
-        'capital_turnover_cap': self.config.scoring.activity.capital_turnover_cap,
-        'max_instructions_per_book': self.config.scoring.max_instructions_per_book,
-    }
-    bt.logging.info(f"Request Data Prepared ({time.time()-data_start:.4f}s).")
-
-    if self.should_block_queries():
-        last_log_time = time.time()
-        while self._pending_reward_tasks > 0:
-            await asyncio.sleep(0.1)
-            current_time = time.time()
-            if current_time - last_log_time >= 1.0:
-                bt.logging.warning(f"Waiting for rewarding to catch up before querying ({self._pending_reward_tasks} tasks pending)...")
-                last_log_time = current_time
-    bt.logging.info(f"Rewarding up to date, proceeding with query!")
-
-    query_start = time.time()
     try:
+        session_start = time.time()
+        bt.logging.debug(f"Session configured ({time.time() - session_start:.4f}s)")
+
+        data_start = time.time()
+        request_data = {
+            'books': synapse.books,
+            'accounts': synapse.accounts,
+            'notices': synapse.notices,
+            'config': synapse.config.model_dump(mode='json'),
+            'version': synapse.version,
+            'timestamp': synapse.timestamp,
+            'metagraph_axons': [
+                {
+                    'hotkey': axon.hotkey,
+                    'coldkey': axon.coldkey,
+                    'ip': axon.ip,
+                    'port': axon.port,
+                    'ip_type': axon.ip_type,
+                    'protocol': axon.protocol,
+                }
+                for axon in self.metagraph.axons
+            ],
+            'deregistered_uids': list(self.deregistered_uids),
+            'uid': self.uid,
+            'miner_wealth': self.simulation.miner_wealth,
+            'volume_decimals': self.simulation.volumeDecimals,
+            'book_count': self.simulation.book_count,
+            'volume_sums': {uid: dict(books) for uid, books in self.volume_sums.items()},
+            'capital_turnover_cap': self.config.scoring.activity.capital_turnover_cap,
+            'max_instructions_per_book': self.config.scoring.max_instructions_per_book,
+        }
+        bt.logging.info(f"Request Data Prepared ({time.time()-data_start:.4f}s).")
+
+        if self.should_block_queries():
+            last_log_time = time.time()
+            while self._pending_reward_tasks > 0:
+                await asyncio.sleep(0.1)
+                current_time = time.time()
+                if current_time - last_log_time >= 1.0:
+                    bt.logging.warning(f"Waiting for rewarding to catch up before querying ({self._pending_reward_tasks} tasks pending)...")
+                    last_log_time = current_time
+        bt.logging.info(f"Rewarding up to date, proceeding with query!")
+
+        self.querying = True
+        query_start = time.time()
         try:
-            await asyncio.wait_for(
-                asyncio.get_event_loop().run_in_executor(
-                    self.query_ipc_executor,
-                    lambda: self.response_queue.receive(timeout=0.001)
-                ),
-                timeout=0.1
-            )
-            bt.logging.warning("Drained stale message from query response queue")
-        except (posix_ipc.BusyError, asyncio.TimeoutError):
-            pass
-        bt.logging.info(f"Drained Query Response Queue ({time.time()-query_start:.4f}s).")
+            try:
+                await asyncio.wait_for(
+                    asyncio.get_event_loop().run_in_executor(
+                        self.query_ipc_executor,
+                        lambda: self.response_queue.receive(timeout=0.001)
+                    ),
+                    timeout=0.1
+                )
+                bt.logging.warning("Drained stale message from query response queue")
+            except (posix_ipc.BusyError, asyncio.TimeoutError):
+                pass
+            bt.logging.info(f"Drained Query Response Queue ({time.time()-query_start:.4f}s).")
 
-        write_start = time.time()
-        data_bytes = pickle.dumps(request_data, protocol=5)
-        bt.logging.info(f"Query request data size: {len(data_bytes) / 1024 / 1024:.2f} MB")
-        
-        self.request_mem.seek(0)
-        self.request_mem.write(struct.pack('Q', len(data_bytes)))
-        self.request_mem.write(data_bytes)
-        bt.logging.info(f"Wrote query request data ({time.time()-write_start:.4f}s).")
+            write_start = time.time()
+            data_bytes = pickle.dumps(request_data, protocol=5)
+            bt.logging.info(f"Query request data size: {len(data_bytes) / 1024 / 1024:.2f} MB")
+            
+            self.request_mem.seek(0)
+            self.request_mem.write(struct.pack('Q', len(data_bytes)))
+            self.request_mem.write(data_bytes)
+            bt.logging.info(f"Wrote query request data ({time.time()-write_start:.4f}s).")
 
-        self.response_mem.seek(0)
-        self.response_mem.write(struct.pack('Q', 0))
+            self.response_mem.seek(0)
+            self.response_mem.write(struct.pack('Q', 0))
 
-        receive_start = time.time()
-        self.request_queue.send(b'query')
+            receive_start = time.time()
+            self.request_queue.send(b'query')
 
-        max_wait = self.config.neuron.global_query_timeout + 10
-        check_count = 0
-        data_size = 0
-        time.sleep(self.config.neuron.timeout)
-        
-        while time.time() - receive_start < max_wait:
-            check_count += 1
-            data_size = struct.unpack_from('Q', self.response_mem, 0)[0]            
-            if data_size > 0:
-                elapsed = time.time() - receive_start
-                bt.logging.info(f"Received Query Response after {check_count} checks ({elapsed:.4f}s)")
-                read_start = time.time()
-                result_bytes = bytes(self.response_mem[8:8+data_size])
-                if len(result_bytes) != data_size:
-                    bt.logging.warning(f"Incomplete read: got {len(result_bytes)}, expected {data_size}")
-                    time.sleep(0.001)
-                    continue
-                try:
-                    result = pickle.loads(result_bytes)
-                    bt.logging.info(f"Read query response data ({time.time()-read_start:.4f}s)")
-                    break
-                except (pickle.UnpicklingError, UnicodeDecodeError) as e:
-                    bt.logging.warning(f"Corrupt data on attempt {check_count}: {e}")
-                    self.response_mem.seek(0)
-                    self.response_mem.write(struct.pack('Q', 0))
-                    time.sleep(0.01)
-                    continue            
-            time.sleep(0.001)
-        else:
-            self.pagerduty_alert(f"Query service response timeout after {max_wait}s")
+            max_wait = self.config.neuron.global_query_timeout + 10
+            check_count = 0
+            data_size = 0
+            time.sleep(self.config.neuron.timeout)
+            
+            while time.time() - receive_start < max_wait:
+                check_count += 1
+                data_size = struct.unpack_from('Q', self.response_mem, 0)[0]            
+                if data_size > 0:
+                    elapsed = time.time() - receive_start
+                    bt.logging.info(f"Received Query Response after {check_count} checks ({elapsed:.4f}s)")
+                    read_start = time.time()
+                    result_bytes = bytes(self.response_mem[8:8+data_size])
+                    if len(result_bytes) != data_size:
+                        bt.logging.warning(f"Incomplete read: got {len(result_bytes)}, expected {data_size}")
+                        time.sleep(0.001)
+                        continue
+                    try:
+                        result = pickle.loads(result_bytes)
+                        bt.logging.info(f"Read query response data ({time.time()-read_start:.4f}s)")
+                        break
+                    except (pickle.UnpicklingError, UnicodeDecodeError) as e:
+                        bt.logging.warning(f"Corrupt data on attempt {check_count}: {e}")
+                        self.response_mem.seek(0)
+                        self.response_mem.write(struct.pack('Q', 0))
+                        time.sleep(0.01)
+                        continue            
+                time.sleep(0.001)
+            else:
+                self.pagerduty_alert(f"Query service response timeout after {max_wait}s")
+                return responses
+            if data_size == 0:
+                self.pagerduty_alert(f"Query service response timeout - size still 0")
+                return responses
+
+        except posix_ipc.BusyError:
+            self.pagerduty_alert(f"Query service response timeout")
             return responses
-        if data_size == 0:
-            self.pagerduty_alert(f"Query service response timeout - size still 0")
+        except Exception as e:
+            self.pagerduty_alert(f"Error communicating with query service: {e}", details={"traceback" : traceback.format_exc()})
             return responses
 
-    except posix_ipc.BusyError:
-        self.pagerduty_alert(f"Query service response timeout")
+        if not result['success']:
+            self.pagerduty_alert(f"Query service error: {result.get('error')}")
+            if 'traceback' in result:
+                bt.logging.error(f"Traceback: {result['traceback']}")
+            return responses
+
+        synapse_responses = result['responses']
+        
+        bt.logging.info(f"Query Completed ({time.time()-query_start:.4f}s).")
+        
+        start = time.time()
+        update_stats(self, synapse_responses)
+        bt.logging.info(f"Updated Stats ({time.time()-start:.4f}s).")
+
+        start = time.time()
+        responses.extend(set_delays(self, synapse_responses))
+        bt.logging.info(f"Set Delays ({time.time()-start:.4f}s).")
+
+        bt.logging.trace(f"Responses: {responses}")
+        bt.logging.info(f"Received {result['validation_stats']['total_responses']} valid responses containing {result['validation_stats']['total_instructions']} instructions at {duration_from_timestamp(synapse.timestamp)} "
+                    f"({result['validation_stats']['success']} SUCCESS | {result['validation_stats']['timeouts']} TIMEOUTS | {result['validation_stats']['failures']} FAILURES).")
         return responses
-    except Exception as e:
-        self.pagerduty_alert(f"Error communicating with query service: {e}", details={"traceback" : traceback.format_exc()})
-        return responses
-
-    if not result['success']:
-        self.pagerduty_alert(f"Query service error: {result.get('error')}")
-        if 'traceback' in result:
-            bt.logging.error(f"Traceback: {result['traceback']}")
-        return responses
-
-    synapse_responses = result['responses']
-    
-    bt.logging.info(f"Query Completed ({time.time()-query_start:.4f}s).")
-    
-    start = time.time()
-    update_stats(self, synapse_responses)
-    bt.logging.info(f"Updated Stats ({time.time()-start:.4f}s).")
-
-    start = time.time()
-    responses.extend(set_delays(self, synapse_responses))
-    bt.logging.info(f"Set Delays ({time.time()-start:.4f}s).")
-
-    bt.logging.trace(f"Responses: {responses}")
-    bt.logging.info(f"Received {result['validation_stats']['total_responses']} valid responses containing {result['validation_stats']['total_instructions']} instructions at {duration_from_timestamp(synapse.timestamp)} "
-                f"({result['validation_stats']['success']} SUCCESS | {result['validation_stats']['timeouts']} TIMEOUTS | {result['validation_stats']['failures']} FAILURES).")
+    finally:
+        self.querying = False
+        bt.logging.debug("Query flag cleared")
 
     return responses
 
