@@ -13,7 +13,7 @@ from taos.im.utils import duration_from_timestamp, timestamp_from_duration
 
 import random
 
-class MinerAgent(FinanceSimulationAgent):
+class Agent_C(FinanceSimulationAgent):
     def initialize(self):
         self.min_spread = 0.01
         self.stale_order_time = 40
@@ -583,4 +583,5 @@ class MinerAgent(FinanceSimulationAgent):
 
 if __name__ == "__main__":
     from taos.common.agents import launch
-    launch(MinerAgent)
+    launch(Agent_C)
+    

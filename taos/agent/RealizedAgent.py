@@ -568,3 +568,4 @@ class RealizedAgent(FinanceSimulationAgent):
 
 if __name__ == "__main__":
     from taos.common.agents import launch
+    launch(RealizedAgent)
