@@ -169,8 +169,12 @@ cython_debug/
 cmd.txt
 reuse_annot.py
 setup.sh
+run_miner.sh
+readme.md
 agents/MaliciousAgent.py
 agents/data
+taos/im/neurons/data
+taos/im/neurons/history
 simulate/trading/src/python
 simulate/trading/run/GBM.py
 simulate/trading/run/HighFrequencyTraderAgent.py

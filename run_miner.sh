@@ -5,7 +5,7 @@ WALLET_NAME=taos
 HOTKEY_NAME=miner
 NETUID=79
 AXON_PORT=8091
-AGENT_PATH=~/.taos/agents
+AGENT_PATH=~/work/sn-79/taos/agent
 AGENT_NAME=SimpleRegressorAgent
 AGENT_PARAMS="min_quantity=0.1 max_quantity=1.0 expiry_period=200 model=PassiveAggressiveRegressor signal_threshold=0.0025"
 LOG_LEVEL=info
@@ -35,10 +35,10 @@ echo "AGENT_NAME: $AGENT_NAME"
 echo "AGENT_PARAMS: $AGENT_PARAMS"
 
 git pull
-pip install -e .
+# pip install -e .
 cd taos/im/neurons
-pm2 delete miner
-pm2 start --name=miner "python miner.py  --netuid $NETUID --subtensor.chain_endpoint $ENDPOINT --wallet.path $WALLET_PATH --wallet.name $WALLET_NAME --wallet.hotkey $HOTKEY_NAME --axon.port $AXON_PORT --logging.debug --agent.path $AGENT_PATH --agent.name $AGENT_NAME  --agent.params $AGENT_PARAMS --logging.$LOG_LEVEL"
+# pm2 delete miner
+pm2 start --name=mn6 "python miner.py  --netuid $NETUID --subtensor.chain_endpoint $ENDPOINT --wallet.path $WALLET_PATH --wallet.name $WALLET_NAME --wallet.hotkey $HOTKEY_NAME --axon.port $AXON_PORT --logging.debug --agent.path $AGENT_PATH --agent.name $AGENT_NAME  --agent.params $AGENT_PARAMS --logging.$LOG_LEVEL"
 pm2 save
 pm2 startup
-pm2 logs miner
+pm2 logs mn6

@@ -15,10 +15,10 @@ import random
 class Agent_O(FinanceSimulationAgent):
     def initialize(self):
         self.min_spread = 0.01
-        self.stale_order_time = 300
+        self.observate_time = 150
         self.history_dirs = {}
         self.overall_window_size = 80
-        self.local_window_size = 80
+        self.local_window_size = 30
         self.regime_window = 250
         self.t_threshold = 1
         self.fill_history = defaultdict(lambda: deque(maxlen=20))
@@ -85,10 +85,9 @@ class Agent_O(FinanceSimulationAgent):
                 tuple(map(float, line.strip().split(",")[1:4]))
                 for line in lines[-window_size:]
             ]
-        if len(price_pairs) < window_size:
-            pad_pair = price_pairs[0] if price_pairs else (1.0, 1.0, 1.0)
-            price_pairs = [pad_pair] * (window_size - len(price_pairs)) + price_pairs
-        return price_pairs[-window_size:]
+        if len(price_pairs) > window_size:
+            price_pairs = price_pairs[-window_size:]
+        return price_pairs
 
 
 
@@ -135,7 +134,7 @@ class Agent_O(FinanceSimulationAgent):
                     'success', 'message'
                 ])
             writer.writerow([
-                getattr(event, 'timestamp', None),
+                int(event.timestamp//1e9),
                 getattr(event, 'bookId', None),
                 getattr(event, 'orderId', None),
                 getattr(event, 'clientOrderId', None),
@@ -160,7 +159,7 @@ class Agent_O(FinanceSimulationAgent):
                     'timestamp', 'bookId', 'orderId', 'quantity', 'success', 'message'
                 ])
             writer.writerow([
-                event.timestamp,
+                int(event.timestamp//1e9),
                 event.bookId,
                 event.orderId,
                 event.quantity,
@@ -182,7 +181,7 @@ class Agent_O(FinanceSimulationAgent):
                     'side', 'price', 'quantity'
                 ])
             writer.writerow([
-                event.timestamp,
+                int(event.timestamp//1e9),
                 event.bookId,
                 event.tradeId,
                 event.clientOrderId,
@@ -269,35 +268,33 @@ class Agent_O(FinanceSimulationAgent):
         side = "BUY" if last_trade["side"] == 0 else "SELL"
         
         role = 'WAIT'
-        last_trade_timestamp = last_order["timestamp"]
-        client_str = str(last_order["clientOrderId"]).lower().strip()
-        if client_str.startswith('entry_'):
+        last_clientOrderId = int(last_order["clientOrderId"])
+        clientOrderId = int(last_trade["clientOrderId"])
+        print(f"last_clientOrderId: {last_clientOrderId}, clientOrderId: {clientOrderId}")
+        orderId = last_order["orderId"]
+        if clientOrderId == last_clientOrderId:
+            if last_clientOrderId == int(last_order["timestamp"]) + 2:
+                role = 'SL_DONE'
+            elif last_clientOrderId == int(last_order["timestamp"]) + 1:
+                role = 'TP_DONE'
+                sl_order = df_order[df_order["clientOrderId"] == clientOrderId + 1]
+                orderId = sl_order.iloc[-1]["orderId"] if len(sl_order) > 0 else None
+            else:
+                print(f"unknown case for clientOrderId == last_clientOrderId")
+        elif clientOrderId == last_clientOrderId - 2:
+            print(f"sdfsfsdfsd1")
             role = 'WAIT'
-            if side == 'BUY':
-                sl_order = df_order[df_order["clientOrderId"] == f"sl_buy_{last_trade_timestamp}"]
-                orderId = sl_order.iloc[-1]["orderId"] if len(sl_order) > 0 else None
-            if side == 'SELL':
-                sl_order = df_order[df_order["clientOrderId"] == f"sl_sell_{last_trade_timestamp}"]
-                orderId = sl_order.iloc[-1]["orderId"] if len(sl_order) > 0 else None
-        elif client_str.startswith('sl_'):
-            role = 'SL_DONE'
-            orderId = last_trade["orderId"]
-        elif client_str.startswith('tp_'):
-            role = 'TP_DONE'
-            if side == 'BUY':
-                sl_order = df_order[df_order["clientOrderId"] == f"sl_buy_{last_trade_timestamp}"]
-                orderId = sl_order.iloc[-1]["orderId"] if len(sl_order) > 0 else None
-            if side == 'SELL':
-                sl_order = df_order[df_order["clientOrderId"] == f"sl_sell_{last_trade_timestamp}"]
-                orderId = sl_order.iloc[-1]["orderId"] if len(sl_order) > 0 else None
+            sl_order = df_order[df_order["clientOrderId"] == clientOrderId + 2]
+            orderId = sl_order.iloc[-1]["orderId"] if len(sl_order) > 0 else None
         else:
+            print(f"sdfsfsdfsd4")
             role = 'UNKNOWN'
-            orderId = last_order["orderId"]
-
+        print(f"orderId: {orderId}, role: {role}, side: {side}, last_trade: {last_trade['timestamp']}")
         return {
             "bookId": book_id,
             "orderId": orderId,
-            "timestamp": last_order["timestamp"],
+            "clientId": clientOrderId,
+            "timestamp": last_trade["timestamp"],
             "side": side,
             "role": role,
         }
@@ -330,7 +327,7 @@ class Agent_O(FinanceSimulationAgent):
                             'side', 'price', 'quantity'
                         ])
                         writer.writerow([
-                            duration_from_timestamp(state.timestamp),40,1128366,0,201,2725396,0.006332678,26,2725324,0.0098073419,0,269.9,0.26
+                            state.timestamp//1e9,40,1128366,0,201,2725396,0.006332678,26,2725324,0.0098073419,0,269.9,0.26
                         ])
             if not os.path.isfile(os.path.join(base_dir, f"orders_{book_id}.csv")):
                 orders_log_file = os.path.join(base_dir, f'orders_{book_id}.csv')
@@ -344,7 +341,7 @@ class Agent_O(FinanceSimulationAgent):
                             'success', 'message'
                         ])
                         writer.writerow([
-                            duration_from_timestamp(state.timestamp),40,180068,0,1,289.61,0,2.2734,0.0,-2,True
+                            state.timestamp//1e9,40,180068,0,1,289.61,0,2.2734,0.0,-2,True
                         ])
 
             self.trim_trades_csv(os.path.join(base_dir, f"trades_{book_id}.csv"))
@@ -356,7 +353,6 @@ class Agent_O(FinanceSimulationAgent):
                 continue
             best_bid = book.bids[0].p
             best_ask = book.asks[0].p
-
             mid = (best_bid + best_ask) / 2
             leverage = 0.7
             spread = best_ask - best_bid
@@ -388,7 +384,7 @@ class Agent_O(FinanceSimulationAgent):
             # sell_rate = 0.01 if base_volume > (initial_volume * 1.4) else 0.004 if base_volume < (initial_volume * 0.4) else 0.007
 
             last_trade = self.last_trade_role_for_uid(df, df_order, book_id, state.timestamp)
-
+            current_time = int(state.timestamp//1e9)
             if last_trade is None:
                 last_trade_timestamp_ns = state.timestamp - min(len(local_prices), 21) * 1e9
                 gap_seconds = (state.timestamp - last_trade_timestamp_ns) / 1e9
@@ -398,15 +394,15 @@ class Agent_O(FinanceSimulationAgent):
                         response.market_order(
                             book_id=book_id, 
                             direction=OrderDirection.BUY, 
-                            clientOrderId = f"entry_buy_{state.timestamp}",
+                            clientOrderId = current_time,
                             quantity=buy_qty,
                         )
                         response.limit_order(
                             book_id=book_id, 
                             direction=OrderDirection.SELL, 
-                            clientOrderId = f"sl_sell_{state.timestamp}",
+                            clientOrderId = current_time + 2,
                             quantity=buy_qty,
-                            price = best_bid - 0.05
+                            price = best_bid - 0.05, 
                             timeInForce=TimeInForce.GTC,    
                         )
                         continue
@@ -415,15 +411,15 @@ class Agent_O(FinanceSimulationAgent):
                         response.market_order(
                             book_id=book_id, 
                             direction=OrderDirection.SELL, 
-                            clientOrderId = f"entry_sell_{state.timestamp}",
+                            clientOrderId = current_time,
                             quantity=sell_qty,
                         )
                         response.limit_order(
                             book_id=book_id, 
                             direction=OrderDirection.BUY, 
-                            clientOrderId = f"sl_buy_{state.timestamp}",
+                            clientOrderId = current_time + 2,
                             quantity=sell_qty,
-                            price = best_ask + 0.05
+                            price = best_ask + 0.05,
                             timeInForce=TimeInForce.GTC,    
                         )
                         continue
@@ -433,39 +429,39 @@ class Agent_O(FinanceSimulationAgent):
                             response.market_order(
                                 book_id=book_id, 
                                 direction=OrderDirection.SELL, 
-                                clientOrderId = f"entry_sell_{state.timestamp}",
+                                clientOrderId = current_time,
                                 quantity=sell_qty,
                             )
                             response.limit_order(
                                 book_id=book_id, 
                                 direction=OrderDirection.BUY, 
-                                clientOrderId = f"sl_buy_{state.timestamp}",
+                                clientOrderId = current_time + 2,
                                 quantity=sell_qty,
-                                price = best_ask + 0.03
+                                price = best_ask + 0.03,
                                 timeInForce=TimeInForce.GTC,    
                             )
                             continue
-                        else prices[-1] < prices[-2]:
+                        else:
                             buy_qty = min(max(min_qty, round(initial_volume*buy_rate, vol_decimals)), max_qty)
                             response.market_order(
                                 book_id=book_id, 
                                 direction=OrderDirection.BUY, 
-                                clientOrderId = f"entry_buy_{state.timestamp}",
+                                clientOrderId = current_time,
                                 quantity=buy_qty,
                             )
                             response.limit_order(
                                 book_id=book_id, 
                                 direction=OrderDirection.SELL, 
-                                clientOrderId = f"sl_sell_{state.timestamp}",
+                                clientOrderId = current_time + 2,
                                 quantity=sell_qty,
-                                price = best_bid - 0.03
+                                price = best_bid - 0.03,
                                 timeInForce=TimeInForce.GTC,    
                             )
                             continue
                     continue
             else:
                 last_trade_timestamp_ns = last_trade['timestamp']
-                gap_seconds = (state.timestamp - last_trade_timestamp_ns) / 1e9
+                gap_seconds = (state.timestamp - last_trade_timestamp_ns * 1e9) / 1e9
                 if gap_seconds < 0:
                     gap_seconds = 86400 + gap_seconds  # handle day wrap-around
                 if last_trade['role'] == "SL_DONE":
@@ -474,15 +470,15 @@ class Agent_O(FinanceSimulationAgent):
                         response.market_order(
                             book_id=book_id, 
                             direction=OrderDirection.BUY, 
-                            clientOrderId = f"entry_buy_{state.timestamp}",
+                            clientOrderId = current_time,
                             quantity=buy_qty,
                         )
                         response.limit_order(
                             book_id=book_id, 
                             direction=OrderDirection.SELL, 
-                            clientOrderId = f"sl_sell_{state.timestamp}",
+                            clientOrderId = current_time + 2,
                             quantity=buy_qty,
-                            price = best_bid - 0.05
+                            price = best_bid - 0.05,
                             timeInForce=TimeInForce.GTC,    
                         )
                         continue
@@ -491,15 +487,15 @@ class Agent_O(FinanceSimulationAgent):
                         response.market_order(
                             book_id=book_id, 
                             direction=OrderDirection.SELL, 
-                            clientOrderId = f"entry_sell_{state.timestamp}",
+                            clientOrderId = current_time,
                             quantity=sell_qty,
                         )
                         response.limit_order(
                             book_id=book_id, 
                             direction=OrderDirection.BUY, 
-                            clientOrderId = f"sl_buy_{state.timestamp}",
+                            clientOrderId = current_time + 2,
                             quantity=sell_qty,
-                            price = best_ask + 0.05
+                            price = best_ask + 0.05,
                             timeInForce=TimeInForce.GTC,    
                         )
                         continue
@@ -509,20 +505,20 @@ class Agent_O(FinanceSimulationAgent):
                         response.market_order(
                             book_id=book_id, 
                             direction=OrderDirection.BUY, 
-                            clientOrderId = f"entry_buy_{state.timestamp}",
+                            clientOrderId = current_time,
                             quantity=buy_qty,
                         )
                         response.limit_order(
                             book_id=book_id, 
                             direction=OrderDirection.SELL, 
-                            clientOrderId = f"sl_sell_{state.timestamp}",
+                            clientOrderId = current_time + 2,
                             quantity=buy_qty,
-                            price = best_bid - 0.05
+                            price = best_bid - 0.05,
                             timeInForce=TimeInForce.GTC,    
                         )
                         response.cancel_order(
                             book_id=book_id,
-                            orderId=last_trade['orderId']
+                            order_id=last_trade['orderId']
                         )
                         continue
                     elif trend == 'down' and spread < 0.025:
@@ -530,72 +526,74 @@ class Agent_O(FinanceSimulationAgent):
                         response.market_order(
                             book_id=book_id, 
                             direction=OrderDirection.SELL, 
-                            clientOrderId = f"entry_sell_{state.timestamp}",
+                            clientOrderId = current_time,
                             quantity=sell_qty,
                         )
                         response.limit_order(
                             book_id=book_id, 
                             direction=OrderDirection.BUY, 
-                            clientOrderId = f"sl_buy_{state.timestamp}",
+                            clientOrderId = current_time + 2,
                             quantity=sell_qty,
-                            price = best_ask + 0.05
+                            price = best_ask + 0.05,
                             timeInForce=TimeInForce.GTC,    
                         )
                         response.cancel_order(
                             book_id=book_id,
-                            orderId=last_trade['orderId']
+                            order_id=last_trade['orderId']
                         )
                         continue
                 if last_trade['role'] == "WAIT" and gap_seconds <= self.observate_time:
                     sell_qty = min(max(min_qty, round(initial_volume*sell_rate, vol_decimals)), max_qty)
+                    last_clientOrderId = int(last_trade['timestamp'])
                     if last_trade['side'] == "BUY" and trend == 'up' and prices[-1] < prices[-2] and best_bid > last_trade.get('price', 0):
                         response.market_order(
                             book_id=book_id, 
                             direction=OrderDirection.SELL, 
-                            clientOrderId = f"tp_sell_{state.timestamp}",
+                            clientOrderId = last_clientOrderId + 1,
                             quantity=sell_qty,
                         )
                         response.cancel_order(
                             book_id=book_id,
-                            orderId=last_trade['orderId']
+                            order_id=last_trade['orderId']
                         )
                         continue
                     elif last_trade['side'] == "SELL" and trend == 'down' and prices[-1] > prices[-2]:
                         response.market_order(
                             book_id=book_id, 
                             direction=OrderDirection.BUY, 
-                            clientOrderId = f"tp_buy_{state.timestamp}",
+                            clientOrderId = last_clientOrderId + 1,
                             quantity=buy_qty,
                         )
                         response.cancel_order(
                             book_id=book_id,
-                            orderId=last_trade['orderId']
+                            order_id=last_trade['orderId']
                         )
                         continue
-                if gap_seconds > self.stale_order_time:
+                if gap_seconds > self.observate_time:
+                    last_clientOrderId = int(last_trade['timestamp'])
                     sell_qty = min(max(min_qty, round(initial_volume*sell_rate, vol_decimals)), max_qty)
                     if last_trade['side'] == "BUY":
                         response.market_order(
                             book_id=book_id, 
                             direction=OrderDirection.SELL, 
-                            clientOrderId = f"tp_sell_{state.timestamp}",
+                            clientOrderId = last_clientOrderId + 1,
                             quantity=sell_qty,
                         )
                         response.cancel_order(
                             book_id=book_id,
-                            orderId=last_trade['orderId']
+                            order_id=last_trade['orderId']
                         )
                         continue
                     elif last_trade['side'] == "SELL":
                         response.market_order(
                             book_id=book_id, 
                             direction=OrderDirection.BUY, 
-                            clientOrderId = f"tp_buy_{state.timestamp}",
+                            clientOrderId = last_clientOrderId + 1,
                             quantity=buy_qty,
                         )
                         response.cancel_order(
                             book_id=book_id,
-                            orderId=last_trade['orderId']
+                            order_id=last_trade['orderId']
                         )
                         continue
                 else:

@@ -33,7 +33,7 @@ class SimulationAgent(ABC):
         Method to handle a new simulation state update.
         """
         start=time.time()
-        self.update(state)  # Update the agent's state based on the new simulation state
+        # self.update(state)  # Update the agent's state based on the new simulation state
         bt.logging.debug(f"Updated ({time.time() - start}s)")
         start=time.time()
         response = self.respond(state)  # Generate a response based on the current state

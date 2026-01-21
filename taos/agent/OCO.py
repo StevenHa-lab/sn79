@@ -12,11 +12,11 @@ from taos.im.protocol.events import LimitOrderPlacementEvent, MarketOrderPlaceme
 
 import random
 
-class Agent_C(FinanceSimulationAgent):
+class OCO(FinanceSimulationAgent):
     def initialize(self):
         self.observate_time = 150
         self.window_size = 50
-        self.t_threshold = 1
+        self.t_threshold = 0.5
         self.history_dirs = {}
         self.data_dir = './data'
         Path(self.data_dir).mkdir(parents=True, exist_ok=True)
@@ -83,9 +83,9 @@ class Agent_C(FinanceSimulationAgent):
         if sigma == 0:
             return "neutral", mean, sigma
         t_stat = mu / (sigma / np.sqrt(local_window))
-        if t_stat > self.t_threshold and prices[-1] > prices[-2]:
+        if t_stat > self.t_threshold:
             return "up"
-        elif t_stat < -self.t_threshold and prices[-1] < prices[-2]:
+        elif t_stat < -self.t_threshold:
             return "down"
         else:
             return "neutral"
@@ -433,4 +433,4 @@ class Agent_C(FinanceSimulationAgent):
         return response
 if __name__ == "__main__":
     from taos.common.agents import launch
-    launch(Agent_C)
+    launch(OCO)
