@@ -12,11 +12,11 @@ from taos.im.protocol.events import LimitOrderPlacementEvent, MarketOrderPlaceme
 
 import random
 
-class Agent_C(FinanceSimulationAgent):
+class OCO(FinanceSimulationAgent):
     def initialize(self):
         self.observate_time = 150
         self.window_size = 50
-        self.t_threshold = 1
+        self.t_threshold = 0.5
         self.history_dirs = {}
         self.data_dir = './data'
         Path(self.data_dir).mkdir(parents=True, exist_ok=True)
@@ -83,9 +83,9 @@ class Agent_C(FinanceSimulationAgent):
         if sigma == 0:
             return "neutral", mean, sigma
         t_stat = mu / (sigma / np.sqrt(local_window))
-        if t_stat > self.t_threshold and prices[-1] > prices[-2]:
+        if t_stat > self.t_threshold:
             return "up"
-        elif t_stat < -self.t_threshold and prices[-1] < prices[-2]:
+        elif t_stat < -self.t_threshold:
             return "down"
         else:
             return "neutral"
@@ -378,14 +378,14 @@ class Agent_C(FinanceSimulationAgent):
                 pass
             elif last_trade['role'] == "WAIT" and gap_seconds <= self.observate_time and gap_seconds > 3:
                 if last_trade['side'] == 'BUY':
-                    if best_bid > last_trade['price'] + 0.1:
+                    if best_bid > last_trade['price'] + 0.2:
                         response.market_order(
                             book_id=book_id, 
                             direction=OrderDirection.SELL, 
                             clientOrderId = last_trade['clientId'] + 1,
                             quantity=qty,
                         )
-                    if best_bid < last_trade['price'] - 0.05:
+                    if best_bid < last_trade['price'] - 0.1:
                         response.market_order(
                             book_id=book_id, 
                             direction=OrderDirection.SELL, 
@@ -393,14 +393,14 @@ class Agent_C(FinanceSimulationAgent):
                             quantity=qty,
                         )
                 if last_trade['side'] == 'SELL':
-                    if best_ask < last_trade['price'] - 0.1:
+                    if best_ask < last_trade['price'] - 0.2:
                         response.market_order(
                             book_id=book_id, 
                             direction=OrderDirection.BUY, 
                             clientOrderId = last_trade['clientId'] + 1,
                             quantity=qty,
                         )
-                    if best_ask > last_trade['price'] + 0.05:
+                    if best_ask > last_trade['price'] + 0.1:
                         response.market_order(
                             book_id=book_id, 
                             direction=OrderDirection.BUY, 
@@ -411,18 +411,20 @@ class Agent_C(FinanceSimulationAgent):
                     pass
             elif gap_seconds > self.observate_time:
                 if last_trade['side'] == 'BUY':
-                    response.market_order(
+                    response.limit_order(
                         book_id=book_id, 
                         direction=OrderDirection.SELL, 
                         clientOrderId = last_trade['clientId'] + 1,
                         quantity=qty,
+                        price=round(best_ask - 0.01, price_decimals),
                     )
                 elif last_trade['side'] == 'SELL':
-                    response.market_order(
+                    response.limit_order(
                         book_id=book_id, 
                         direction=OrderDirection.BUY, 
                         clientOrderId = last_trade['clientId'] + 1,
                         quantity=qty,
+                        price=round(best_bid + 0.01, price_decimals),
                     )
                 else:
                     pass
@@ -433,4 +435,4 @@ class Agent_C(FinanceSimulationAgent):
         return response
 if __name__ == "__main__":
     from taos.common.agents import launch
-    launch(Agent_C)
+    launch(OCO)
