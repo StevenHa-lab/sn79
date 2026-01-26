@@ -3,12 +3,13 @@ import numpy as np
 from pathlib import Path
 import pandas as pd
 import csv
-import bittensor as bt
+import bittensor as bt  
 from collections import defaultdict, deque
 from taos.im.agents import FinanceSimulationAgent
 from taos.im.protocol.response import FinanceAgentResponse, OrderDirection, TimeInForce, LoanSettlementOption, STP
 from taos.im.protocol import MarketSimulationStateUpdate, FinanceAgentResponse, FinanceEventNotification
 from taos.im.protocol.events import LimitOrderPlacementEvent, MarketOrderPlacementEvent, OrderCancellationEvent, TradeEvent
+from taos.im.utils import duration_from_timestamp, timestamp_from_duration
 
 import random
 
@@ -97,12 +98,12 @@ class Agent_O(FinanceSimulationAgent):
 
         t_stat = mu / (sigma / np.sqrt(len(returns)))
         if prices[0] == min(prices) and prices[-2] == max(prices) and t_stat > self.t_threshold and returns[-1] < 0:
-            if prices[-1] > prices[0] + 0.33:
+            if prices[-1] > prices[0] + 0.37:
                 return "sell"
             else:
                 return "neutral"
         elif prices[0] == max(prices) and prices[-2] == min(prices) and t_stat < -self.t_threshold and returns[-1] > 0:
-            if prices[0] > prices[-1] + 0.33:
+            if prices[0] > prices[-1] + 0.37:
                 return "buy"
             else:
                 return "neutral"
