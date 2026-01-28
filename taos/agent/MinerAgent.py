@@ -16,7 +16,7 @@ import random
 class MinerAgent(FinanceSimulationAgent):
     def initialize(self):
         self.min_spread = 0.01
-        self.stale_order_time = 40
+        self.stale_order_time = 60
         self.history_dirs = {}
         self.overall_window_size = 300
         self.local_window_size = 25
@@ -551,27 +551,7 @@ class MinerAgent(FinanceSimulationAgent):
                                 leverage=leverage,
                                 settlement_option=settlement
                             )
-                    elif trend == 'neutral':
-                        if spread > 0 and spread < 0.025:
-                            buy_position = best_bid - 0.01
-                            sell_position = best_ask + 0.01
-                        else:
-                            buy_position = best_bid
-                            sell_position = best_ask
-                        response.limit_order(
-                            book_id=book_id,
-                            direction=OrderDirection.BUY,
-                            quantity=buy_qty,
-                            price=best_bid + 0.01,
-                            timeInForce=TimeInForce.GTC
-                        )    
-                        response.limit_order(
-                            book_id=book_id,
-                            direction=OrderDirection.SELL,
-                            quantity=sell_qty,
-                            price=best_ask - 0.01,
-                            timeInForce=TimeInForce.GTC
-                        )
+                    
                         stale_order_ids = []
                         for order in account.o:
                             # Cancel if open too long or too far from current touch/mid
