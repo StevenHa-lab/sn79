@@ -3190,7 +3190,7 @@ if __name__ != "__mp_main__":
                     self.pagerduty_alert(f"Failed to update trade data for UID {uid_item}: {ex}", details={"trace": traceback.format_exc()})
 
             if should_prune:
-                lookback_time = self.config.scoring.kappa.lookback * self.simulation.publish_interval
+                lookback_time = self.config.scoring.kappa.lookback
                 lookback_threshold = timestamp - lookback_time
                 for uid_item in self.realized_pnl_history:
                     pnl_hist = self.realized_pnl_history[uid_item]
@@ -3241,6 +3241,8 @@ if __name__ != "__mp_main__":
                             self.roundtrip_volumes[uid_item] = defaultdict(lambda: defaultdict(float))
                         if book_id not in self.roundtrip_volumes[uid_item]:
                             self.roundtrip_volumes[uid_item][book_id] = defaultdict(float)
+                        if ts not in self.roundtrip_volumes[uid_item][book_id]:
+                            self.roundtrip_volumes[uid_item][book_id][ts] = 0.0                        
                         self.roundtrip_volumes[uid_item][book_id][ts] += rt_vol
                         self.roundtrip_volume_sums[uid_item][book_id] = self.roundtrip_volume_sums[uid_item].get(book_id, 0.0) + rt_vol
                         uids_to_round.add(uid_item)
