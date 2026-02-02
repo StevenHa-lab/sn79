@@ -593,7 +593,7 @@ if __name__ != "__mp_main__":
             self.last_state_time = None
             self.step_rates = []
             self._last_defrag_hour = -1
-            self._last_prune_timestamp = 0
+            self._last_prune_timestamp = None
 
             self.main_loop = asyncio.new_event_loop()
             self._main_loop_ready = Event()
@@ -1002,6 +1002,7 @@ if __name__ != "__mp_main__":
 
             bt.logging.info("Shifting realized P&L history timestamps...")
             shifted_pnl_history = {}
+            self._last_prune_timestamp = None
             for uid in range(self.subnet_info.max_uids):
                 if uid in self.realized_pnl_history and self.realized_pnl_history[uid]:
                     hist = self.realized_pnl_history[uid]
@@ -3024,11 +3025,14 @@ if __name__ != "__mp_main__":
             sampled_timestamp = (timestamp // self.config.scoring.activity.trade_volume_sampling_interval) * self.config.scoring.activity.trade_volume_sampling_interval
 
             if not hasattr(self, '_last_prune_timestamp'):
-                self._last_prune_timestamp = 0
+                self._last_prune_timestamp = None
 
-            time_since_prune = timestamp - self._last_prune_timestamp
-            prune_interval = 60_000_000_000
-            should_prune = time_since_prune >= prune_interval
+            if self._last_prune_timestamp:
+                time_since_prune = timestamp - self._last_prune_timestamp
+                prune_interval = 60_000_000_000
+                should_prune = time_since_prune >= prune_interval
+            else:
+                should_prune = True
             if should_prune:
                 self._last_prune_timestamp = timestamp
                 bt.logging.info(f"Pruning at step {self.step} (timestamp {timestamp})")
