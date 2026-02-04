@@ -16,7 +16,7 @@ import random
 class MinerAgent(FinanceSimulationAgent):
     def initialize(self):
         self.min_spread = 0.01
-        self.stale_order_time = 60
+        self.stale_order_time = 40
         self.history_dirs = {}
         self.overall_window_size = 300
         self.local_window_size = 25

@@ -97,16 +97,16 @@ class OCO(FinanceSimulationAgent):
             return "neutral", mean, sigma
 
         t_stat = mu / (sigma / np.sqrt(len(returns)))
-        if prices[0] == min(prices) and prices[-2] == max(prices) and t_stat > self.t_threshold and returns[-1] < 0:
-            if prices[-1] > prices[0] + 0.43:
+        if prices[-2] == max(prices) and t_stat > self.t_threshold and returns[-1] < 0:
+            if prices[-1] > prices[0] + 0.5:
                 return "sell"
             else:
                 return "neutral"
-        elif prices[0] == max(prices) and prices[-2] == min(prices) and t_stat < -self.t_threshold and returns[-1] > 0:
-            if prices[0] > prices[-1] + 0.43:
+        elif prices[-2] == min(prices) and t_stat < -self.t_threshold and returns[-1] > 0:
+            if prices[0] > prices[-1] + 0.5:
                 return "buy"
             else:
-                return "neutral"
+                return "neutral"    
         else:
             return "neutral"
 
