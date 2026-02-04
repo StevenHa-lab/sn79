@@ -593,7 +593,7 @@ if __name__ != "__mp_main__":
             self.last_state_time = None
             self.step_rates = []
             self._last_defrag_hour = -1
-            self._last_prune_timestamp = 0
+            self._last_prune_timestamp = None
 
             self.main_loop = asyncio.new_event_loop()
             self._main_loop_ready = Event()
@@ -1002,6 +1002,7 @@ if __name__ != "__mp_main__":
 
             bt.logging.info("Shifting realized P&L history timestamps...")
             shifted_pnl_history = {}
+            self._last_prune_timestamp = None
             for uid in range(self.subnet_info.max_uids):
                 if uid in self.realized_pnl_history and self.realized_pnl_history[uid]:
                     hist = self.realized_pnl_history[uid]
@@ -1592,8 +1593,6 @@ if __name__ != "__mp_main__":
 
                 async def async_save_worker():
                     """Non-blocking async file I/O with atomic writes."""
-                    io_start = time.time()
-
                     try:
                         await wait_for_query_and_receive('serializing simulation state')
                         sim_serialize_start = time.time()
@@ -1653,7 +1652,7 @@ if __name__ != "__mp_main__":
                             'success': True,
                             'simulation_save_time': sim_time,
                             'validator_save_time': val_time,
-                            'io_time': time.time() - io_start,
+                            'io_time': sim_serialize_time + val_serialize_time + sim_time + val_time,
                             'sim_size_mb': sim_mb,
                             'val_size_mb': val_mb
                         }
@@ -2707,6 +2706,30 @@ if __name__ != "__mp_main__":
                 'shared_state_rewarding': self.shared_state_rewarding,
                 'current_block': self.current_block,
                 'uid': self.uid,
+                'validator_config' : {
+                    'scoring': {
+                        'interval': self.config.scoring.interval,
+                        'max_instructions_per_book': self.config.scoring.max_instructions_per_book,
+                        'min_delay': self.config.scoring.min_delay,
+                        'max_delay': self.config.scoring.max_delay,
+                        'min_instruction_delay': self.config.scoring.min_instruction_delay,
+                        'max_instruction_delay': self.config.scoring.max_instruction_delay,
+                        'kappa_lookback': self.config.scoring.kappa.lookback,
+                        'kappa_min_lookback': self.config.scoring.kappa.min_lookback,
+                        'kappa_tau': self.config.scoring.kappa.tau,
+                        'kappa_min_realized_observations': self.config.scoring.kappa.min_realized_observations,
+                        'kappa_normalization_min': self.config.scoring.kappa.normalization_min,
+                        'kappa_normalization_max': self.config.scoring.kappa.normalization_max,
+                        'activity_impact': self.config.scoring.activity.impact,
+                        'activity_trade_volume_sampling_interval': self.config.scoring.activity.trade_volume_sampling_interval,
+                        'activity_trade_volume_assessment_period': self.config.scoring.activity.trade_volume_assessment_period,
+                        'activity_decay_grace_period': self.config.scoring.activity.decay_grace_period,
+                        'activity_decay_rate': self.config.scoring.activity.decay_rate,
+                        'activity_capital_turnover_cap': self.config.scoring.activity.capital_turnover_cap,
+                        'activity_max_volume': self.config.scoring.activity.capital_turnover_cap * self.simulation.miner_wealth,
+                        'activity_decay_rate': self.config.scoring.activity.decay_rate,
+                    }
+                }
             }
 
             bt.logging.debug(f"Assembled final structure ({time.time()-final_start:.4f}s)")
@@ -3002,11 +3025,14 @@ if __name__ != "__mp_main__":
             sampled_timestamp = (timestamp // self.config.scoring.activity.trade_volume_sampling_interval) * self.config.scoring.activity.trade_volume_sampling_interval
 
             if not hasattr(self, '_last_prune_timestamp'):
-                self._last_prune_timestamp = 0
+                self._last_prune_timestamp = None
 
-            time_since_prune = timestamp - self._last_prune_timestamp
-            prune_interval = 60_000_000_000
-            should_prune = time_since_prune >= prune_interval
+            if self._last_prune_timestamp:
+                time_since_prune = timestamp - self._last_prune_timestamp
+                prune_interval = 60_000_000_000
+                should_prune = time_since_prune >= prune_interval
+            else:
+                should_prune = True
             if should_prune:
                 self._last_prune_timestamp = timestamp
                 bt.logging.info(f"Pruning at step {self.step} (timestamp {timestamp})")
@@ -3190,7 +3216,7 @@ if __name__ != "__mp_main__":
                     self.pagerduty_alert(f"Failed to update trade data for UID {uid_item}: {ex}", details={"trace": traceback.format_exc()})
 
             if should_prune:
-                lookback_time = self.config.scoring.kappa.lookback * self.simulation.publish_interval
+                lookback_time = self.config.scoring.kappa.lookback
                 lookback_threshold = timestamp - lookback_time
                 for uid_item in self.realized_pnl_history:
                     pnl_hist = self.realized_pnl_history[uid_item]
@@ -3241,6 +3267,8 @@ if __name__ != "__mp_main__":
                             self.roundtrip_volumes[uid_item] = defaultdict(lambda: defaultdict(float))
                         if book_id not in self.roundtrip_volumes[uid_item]:
                             self.roundtrip_volumes[uid_item][book_id] = defaultdict(float)
+                        if ts not in self.roundtrip_volumes[uid_item][book_id]:
+                            self.roundtrip_volumes[uid_item][book_id][ts] = 0.0                        
                         self.roundtrip_volumes[uid_item][book_id][ts] += rt_vol
                         self.roundtrip_volume_sums[uid_item][book_id] = self.roundtrip_volume_sums[uid_item].get(book_id, 0.0) + rt_vol
                         uids_to_round.add(uid_item)

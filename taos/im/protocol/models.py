@@ -1971,7 +1971,7 @@ class OrderCurrency(IntEnum):
 
     Attributes:
         BASE (int): Quantity is specified in BASE currency.
-        BASE (int): Quantity is specified in QUOTE currency.
+        QUOTE (int): Quantity is specified in QUOTE currency.
     """
     BASE=0
     QUOTE=1
