@@ -16,7 +16,7 @@ import random
 class MinerAgent(FinanceSimulationAgent):
     def initialize(self):
         self.min_spread = 0.01
-        self.stale_order_time = 40
+        self.stale_order_time = 30
         self.history_dirs = {}
         self.overall_window_size = 300
         self.local_window_size = 25
@@ -28,7 +28,6 @@ class MinerAgent(FinanceSimulationAgent):
         self.max_base_loan = 50.0
         self.max_leverage = 10.0
         self.min_base_volume_size = 20
-        self.expiry_period = 10_000_000_000
         self.data_dir = './data'
         Path(self.data_dir).mkdir(parents=True, exist_ok=True)
         self.output_dir = os.path.join(self.data_dir, str(self.uid))
@@ -104,22 +103,10 @@ class MinerAgent(FinanceSimulationAgent):
             return 'neutral'  # not enough valid changes
         bubbles = False
         bursts = False        
-        for r in returns[:-1]:
-            if r > 2:
-                bubbles = True
-            elif r < -2:
-                bursts = True
-        
-        if returns[-1] > 2:
-            if bubbles == True:
+        for r in returns:
+            if r > 3:
                 return "bubble"
-            else:
-                return "bubble"
-        
-        if returns[-1] < -2:
-            if bursts == True:
-                return "burst"
-            else:
+            elif r < -3:
                 return "burst"
         
         if returns[-1] > 0 and returns[-2] > 0:
@@ -152,25 +139,6 @@ class MinerAgent(FinanceSimulationAgent):
                 getattr(event, 'quantity', None),
                 getattr(event, 'leverage', None),
                 getattr(event, 'settleFlag', None),
-                event.success,
-                event.message
-            ])
-            
-    def log_cancellation_event(self, event : OrderCancellationEvent, state : MarketSimulationStateUpdate, book_id):
-        """Log OrderCancellationEvent to CSV."""
-        cancellations_log_file = os.path.join(self.simulation_output_dir(state), f"cancellations_{book_id}.csv")
-        file_exists = os.path.exists(cancellations_log_file)
-        with open(cancellations_log_file, mode='a', newline='') as f:
-            writer = csv.writer(f)
-            if not file_exists:
-                writer.writerow([
-                    'timestamp', 'bookId', 'orderId', 'quantity', 'success', 'message'
-                ])
-            writer.writerow([
-                duration_from_timestamp(event.timestamp),
-                event.bookId,
-                event.orderId,
-                event.quantity,
                 event.success,
                 event.message
             ])
@@ -223,15 +191,12 @@ class MinerAgent(FinanceSimulationAgent):
                         case "EVENT_TRADE" | "ET":
                             print(f"TradeEvent: {event}")
                             self.log_trade_event(event, state, book_id)
-                        case "RESPONSE_DISTRIBUTED_CANCEL_ORDERS" | "RDCO":
-                            for cancellation in event.cancellations:
-                                self.log_cancellation_event(cancellation, state, book_id)
                         case _:
                             bt.logging.warning(f"Unknown event : {event}")
 
     def trim_trades_csv(self, csv_path: str):
         MAX_ROWS = 400
-        TRIM_ROWS = 250
+        TRIM_ROWS = 50
         if not os.path.isfile(csv_path):
             return 
         with open(csv_path, newline="") as f:
@@ -368,29 +333,8 @@ class MinerAgent(FinanceSimulationAgent):
             buy_qty = min_qty
             sell_qty = min_qty
 
-
-
             buy_rate = 0.012
-            # buy_rate = 0.004 if base_volume > (initial_volume * 1.4) else 0.01 if base_volume < (initial_volume * 0.4) else 0.007
             sell_rate = 0.012
-            # sell_rate = 0.01 if base_volume > (initial_volume * 1.4) else 0.004 if base_volume < (initial_volume * 0.4) else 0.007
-            
-            if trend == "bubble":
-                buy_qty = quote_volume/mid*0.2
-                # response.market_order(
-                #     book_id=book_id, 
-                #     direction=OrderDirection.BUY, 
-                #     quantity=buy_qty,
-                # )
-                continue
-            elif trend == "burst":
-                sell_qty = base_volume * 0.2
-                # response.market_order(
-                #     book_id=book_id, 
-                #     direction=OrderDirection.SELL, 
-                #     quantity=sell_qty,
-                # )
-                continue
             
             last_trade = self.last_trade_role_for_uid(df, df_order, book_id, self.uid)
             
@@ -478,36 +422,21 @@ class MinerAgent(FinanceSimulationAgent):
                             price=best_ask - 0.01,
                             timeInForce=TimeInForce.GTC
                         )
-                        stale_order_ids = []
-                        for order in account.o:
-                            # Cancel if open too long or too far from current touch/mid
-                            if order.s == 0 and abs(order.p - (best_bid if best_bid is not None else mid)) > 10:
-                                stale_order_ids.append(order.i)
-                            elif order.s == 1 and abs(order.p - (best_ask if best_ask is not None else mid)) > 10:
-                                stale_order_ids.append(order.i)
-                        if len(stale_order_ids) > 0:
-                            response.cancel_orders(book_id=book_id, order_ids=stale_order_ids)
-                        print(f"trend: {trend}")
+                    else:
+                        continue
             else:
                 last_trade_timestamp_ns = timestamp_from_duration(last_trade['timestamp'])
                 gap_seconds = (state.timestamp - last_trade_timestamp_ns) / 1e9
                 if gap_seconds > self.stale_order_time or gap_seconds < 0:
-                    if trend == 'up':
+                    if trend == 'up' and base_volume < 20:
                         buy_qty = min(max(min_qty, round(initial_volume*buy_rate, vol_decimals)), max_qty)
-                        leverage = 0.0
-                        # leverage = 0.4 if account.quote_loan == 0.0 else 0.0
-                        settlement = LoanSettlementOption.NONE if account.base_loan == 0.0 else LoanSettlementOption.FIFO
                         if spread > 0.015:
                             response.limit_order(
                                 book_id=book_id,
                                 direction=OrderDirection.BUY,
                                 quantity=buy_qty,
                                 price=best_bid + 0.01,
-                                timeInForce=TimeInForce.GTT,
-                                expiryPeriod=5_000_000_000,
-                                stp=STP.CANCEL_OLDEST, 
-                                leverage=leverage,
-                                settlement_option=settlement
+                                timeInForce=TimeInForce.GTC
                             )
                         else:
                             response.limit_order(
@@ -515,29 +444,17 @@ class MinerAgent(FinanceSimulationAgent):
                                 direction=OrderDirection.BUY,
                                 quantity=buy_qty,
                                 price=best_ask,
-                                timeInForce=TimeInForce.GTT,
-                                expiryPeriod=5_000_000_000,
-                                stp=STP.CANCEL_OLDEST, 
-                                leverage=leverage,
-                                settlement_option=settlement
+                                timeInForce=TimeInForce.GTC
                             )
-                    elif trend == 'down':
-                        
+                    elif trend == 'down' and base_volume > 0.5:
                         sell_qty = min(max(min_qty, round(initial_volume*sell_rate, vol_decimals)), max_qty)
-                        settlement = LoanSettlementOption.NONE if account.quote_loan == 0 else LoanSettlementOption.FIFO
-                        leverage = 0.0
-                        # leverage = 0.4 if account.base_loan < min(15, initial_volume/5) and base_volume < 25 else 0.0
                         if spread < 0.015:
                             response.limit_order(
                                 book_id=book_id,
                                 direction=OrderDirection.SELL,
                                 quantity=sell_qty,
                                 price=best_bid,
-                                timeInForce=TimeInForce.GTT,
-                                expiryPeriod=5_000_000_000,
-                                stp=STP.CANCEL_OLDEST, 
-                                leverage=leverage,
-                                settlement_option=settlement
+                                timeInForce=TimeInForce.GTC
                             )
                         else:
                             response.limit_order(
@@ -545,11 +462,7 @@ class MinerAgent(FinanceSimulationAgent):
                                 direction=OrderDirection.SELL,
                                 quantity=sell_qty,
                                 price=best_ask - 0.01,
-                                timeInForce=TimeInForce.GTT,
-                                expiryPeriod=5_000_000_000,
-                                stp=STP.CANCEL_OLDEST, 
-                                leverage=leverage,
-                                settlement_option=settlement
+                                timeInForce=TimeInForce.GTC
                             )
                     
                         stale_order_ids = []
@@ -561,7 +474,8 @@ class MinerAgent(FinanceSimulationAgent):
                                 stale_order_ids.append(order.i)
                         if len(stale_order_ids) > 0:
                             response.cancel_orders(book_id=book_id, order_ids=stale_order_ids)
-                        print(f"trend: {trend}")
+                    else:
+                        continue
                 else:
                     continue
             if(validator_hotkey == "5EWwdZB7qCCMaAso5Mzcks4UUcPxKYvpAj32t5Mg1v6HSxoF"):

@@ -12,11 +12,11 @@ from taos.im.protocol.events import LimitOrderPlacementEvent, MarketOrderPlaceme
 from taos.im.utils import duration_from_timestamp, timestamp_from_duration
 
 import random
-
+    
 class Agent_O(FinanceSimulationAgent):
     def initialize(self):
         self.min_spread = 0.01
-        self.stale_order_time = 40
+        self.stale_order_time = 30
         self.history_dirs = {}
         self.overall_window_size = 300
         self.local_window_size = 25
