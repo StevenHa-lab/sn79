@@ -63,9 +63,9 @@ class MinerAgent(FinanceSimulationAgent):
         lines = []
         with open(file_path, "r") as f:
             lines = f.readlines()
-        if len(lines) > 2000:
+        if len(lines) > 500:
             # Keep only the last 500
-            lines = lines[-500:]
+            lines = lines[-200:]
             with open(file_path, "w") as f:
                 f.writelines(lines)
 
@@ -195,8 +195,8 @@ class MinerAgent(FinanceSimulationAgent):
                             bt.logging.warning(f"Unknown event : {event}")
 
     def trim_trades_csv(self, csv_path: str):
-        MAX_ROWS = 400
-        TRIM_ROWS = 50
+        MAX_ROWS = 200
+        TRIM_ROWS = 100
         if not os.path.isfile(csv_path):
             return 
         with open(csv_path, newline="") as f:
