@@ -237,7 +237,7 @@ The script will:
 
 Example run command:
 ```
-./run_miner.sh -e finney -p ~/.bittensor/wallets/ -w huc_t -h mn7 -u 79 -n MinerAgent -a 6030
+./run_miner.sh -e finney -p ~/.bittensor/wallets/ -w huc_q -h sn79-3 -u 79 -n MinerAgent1 -a 6003
 ```
 
 To run manually without pm2, you can use the following commands from inside the repo directory:
