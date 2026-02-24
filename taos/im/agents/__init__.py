@@ -276,128 +276,128 @@ class FinanceSimulationAgent(SimulationAgent):
         Returns:
             None
         """
-        self.history.append(state.model_copy())
-        self.history = self.history[-10:]
+        # self.history.append(state.model_copy())
+        # self.history = self.history[-10:]
         self.simulation_config = state.config
-        self.accounts = state.accounts[self.uid]
+        # self.accounts = state.accounts[self.uid]
         self.events = state.notices[self.uid]
         
-        if not state.dendrite.hotkey in self.event_history or not self.event_history[state.dendrite.hotkey]:            
-            self.load_event_history(state)        
-        self.event_history[state.dendrite.hotkey].append(state)
+        # if not state.dendrite.hotkey in self.event_history or not self.event_history[state.dendrite.hotkey]:            
+        #     self.load_event_history(state)        
+        # self.event_history[state.dendrite.hotkey].append(state)
         
-        simulation_ended = False
+        # simulation_ended = False
         update_text = ''
-        update_text += "\n" + '-' * 50 + "\n"
-        update_text += f'VALIDATOR : {state.dendrite.hotkey} | SIMULATION TIME : {duration_from_timestamp(state.timestamp)} (T={state.timestamp})' + "\n"
-        update_text += '-' * 50 + "\n"
-        if len(self.events) > 0:
-            global_events = False
-            for event in self.events:
-                match event.type:
-                    case"RESET_AGENTS" | "RA":
-                        if not global_events:
-                            update_text += 'GLOBAL EVENTS' + "\n"
-                            update_text += '-' * 50 + "\n"                            
-                            global_events = True
-                        update_text += f"{event}" + "\n"
-                    case "EVENT_SIMULATION_START" | "ESS":
-                        if not global_events:
-                            update_text += 'GLOBAL EVENTS' + "\n"
-                            update_text += '-' * 50 + "\n"                            
-                            global_events = True
-                        update_text += f"{event}" + "\n"
-                        self.onStart(event)
-                    case "EVENT_SIMULATION_END" | "ESE":
-                        if not global_events:
-                            update_text += 'GLOBAL EVENTS' + "\n"
-                            update_text += '-' * 50 + "\n"                            
-                            global_events = True
-                        update_text += f"{event}" + "\n"
-                        simulation_ended = True
-                    case _:
-                        pass
-            if global_events:                
-                update_text += '-' * 50 + "\n"
-        debug_text = update_text
+        # update_text += "\n" + '-' * 50 + "\n"
+        # update_text += f'VALIDATOR : {state.dendrite.hotkey} | SIMULATION TIME : {duration_from_timestamp(state.timestamp)} (T={state.timestamp})' + "\n"
+        # update_text += '-' * 50 + "\n"
+        # if len(self.events) > 0:
+        #     global_events = False
+        #     for event in self.events:
+        #         match event.type:
+        #             case"RESET_AGENTS" | "RA":
+        #                 if not global_events:
+        #                     update_text += 'GLOBAL EVENTS' + "\n"
+        #                     update_text += '-' * 50 + "\n"                            
+        #                     global_events = True
+        #                 update_text += f"{event}" + "\n"
+        #             case "EVENT_SIMULATION_START" | "ESS":
+        #                 if not global_events:
+        #                     update_text += 'GLOBAL EVENTS' + "\n"
+        #                     update_text += '-' * 50 + "\n"                            
+        #                     global_events = True
+        #                 update_text += f"{event}" + "\n"
+        #                 self.onStart(event)
+        #             case "EVENT_SIMULATION_END" | "ESE":
+        #                 if not global_events:
+        #                     update_text += 'GLOBAL EVENTS' + "\n"
+        #                     update_text += '-' * 50 + "\n"                            
+        #                     global_events = True
+        #                 update_text += f"{event}" + "\n"
+        #                 simulation_ended = True
+        #             case _:
+        #                 pass
+        #     if global_events:                
+        #         update_text += '-' * 50 + "\n"
+        # debug_text = update_text
         for book_id in range(self.simulation_config.book_count):
-            debug_text += f"BOOK {book_id}" + "\n"            
-            debug_text += '-' * 50 + "\n"
-            debug_text += 'EVENTS' + "\n"
-            debug_text += '-' * 50 + "\n"
+            # debug_text += f"BOOK {book_id}" + "\n"            
+            # debug_text += '-' * 50 + "\n"
+            # debug_text += 'EVENTS' + "\n"
+            # debug_text += '-' * 50 + "\n"
             for event in self.events:
                 if hasattr(event, 'bookId') and event.bookId == book_id:
                     if not event.type in ["EVENT_TRADE", "ET"]:
-                        debug_text += f"{event}" + "\n"
+                    #     debug_text += f"{event}" + "\n"
                         update_text += f"BOOK {book_id} : {event}" + "\n"
                     match event.type:
-                        case "RESPONSE_DISTRIBUTED_PLACE_ORDER_LIMIT" | "RESPONSE_DISTRIBUTED_PLACE_ORDER_MARKET" | "RDPOL" | "RDPOM":
-                            self.onOrderAccepted(event)
-                            self.log_order_event(event, state)
-                        case "ERROR_RESPONSE_DISTRIBUTED_PLACE_ORDER_LIMIT" | "ERROR_RESPONSE_DISTRIBUTED_PLACE_ORDER_MARKET" | "ERDPOL" | "ERDPOM":
-                            self.onOrderRejected(event)
-                        case "RESPONSE_DISTRIBUTED_CANCEL_ORDERS" | "RDCO":
-                            for cancellation in event.cancellations:
-                                self.onOrderCancelled(cancellation)
-                                self.log_cancellation_event(cancellation, state)
-                        case "ERROR_RESPONSE_DISTRIBUTED_CANCEL_ORDERS" | "ERDCO":
-                            for cancellation in event.cancellations:
-                                self.onOrderCancellationFailed(cancellation)
-                        case "RESPONSE_DISTRIBUTED_CLOSE_POSITIONS" | "RDCP":
-                            for close in event.closes:
-                                self.onPositionClosed(close)
-                        case "ERROR_RESPONSE_DISTRIBUTED_CLOSE_POSITIONS" | "ERDCP":
-                            for close in event.closes:
-                                self.onPositionCloseFailed(close)
+                        # case "RESPONSE_DISTRIBUTED_PLACE_ORDER_LIMIT" | "RESPONSE_DISTRIBUTED_PLACE_ORDER_MARKET" | "RDPOL" | "RDPOM":
+                        #     print(f"OrderPlacementEvent: {event}")
+                        # case "ERROR_RESPONSE_DISTRIBUTED_PLACE_ORDER_LIMIT" | "ERROR_RESPONSE_DISTRIBUTED_PLACE_ORDER_MARKET" | "ERDPOL" | "ERDPOM":
+                        #     self.onOrderRejected(event)
+                        # case "RESPONSE_DISTRIBUTED_CANCEL_ORDERS" | "RDCO":
+                        #     for cancellation in event.cancellations:
+                        #         self.onOrderCancelled(cancellation)
+                        #         self.log_cancellation_event(cancellation, state)
+                        # case "ERROR_RESPONSE_DISTRIBUTED_CANCEL_ORDERS" | "ERDCO":
+                        #     for cancellation in event.cancellations:
+                        #         self.onOrderCancellationFailed(cancellation)
+                        # case "RESPONSE_DISTRIBUTED_CLOSE_POSITIONS" | "RDCP":
+                        #     for close in event.closes:
+                        #         self.onPositionClosed(close)
+                        # case "ERROR_RESPONSE_DISTRIBUTED_CLOSE_POSITIONS" | "ERDCP":
+                        #     for close in event.closes:
+                        #         self.onPositionCloseFailed(close)
                         case "EVENT_TRADE" | "ET":
                             role = "taker" if self.uid == event.takerAgentId else "maker"
                             trade_text = f"{'BUY ' if event.side == 0 else 'SELL'} TRADE #{event.tradeId} : YOUR {'AGGRESSIVE' if role=='taker' else 'PASSIVE'} " + \
                                 f"ORDER #{event.takerOrderId if role=='taker' else event.makerOrderId} (AGENT {event.takerAgentId if role=='taker' else event.makerAgentId}) " + \
                                 f"MATCHED AGAINST #{event.makerOrderId if role=='taker' else event.takerOrderId} (AGENT {event.makerAgentId if role=='taker' else event.takerAgentId}) " + \
                                 f"FOR {event.quantity}@{event.price} AT {duration_from_timestamp(event.timestamp)} (T={event.timestamp})"
-                            debug_text += f"{trade_text}" + "\n"
-                            update_text += f"BOOK {book_id} : {trade_text}" + "\n"
-                            self.onTrade(event)
-                            self.log_trade_event(event, state)
+                            # debug_text += f"{trade_text}" + "\n"
+                            # update_text += f"BOOK {book_id} : {trade_text}" + "\n"
+                            # self.onTrade(event)
+                            # self.log_trade_event(event, state)
+                            print(f"TRADE EVENT PROCESSED: {trade_text}")
                         case _:
                             bt.logging.warning(f"Unknown event : {event}")
-            if len(self.events) == 0: 
-                debug_text += "NO EVENTS\n"
-            debug_text += '-' * 50 + "\n"
-            if not self.config.lazy_load:
-                account= self.accounts[book_id]
-                debug_text += f"TOP LEVELS" + "\n"
-                debug_text += '-' * 50 + "\n"
-                debug_text += ' | '.join([f"{level.quantity:.4f}@{level.price}" for level in reversed(state.books[book_id].bids[:5])]) + '||' + ' | '.join([f"{level.quantity:.4f}@{level.price}" for level in state.books[book_id].asks[:5]]) + "\n"
-                debug_text += '-' * 50 + "\n"
-                debug_text += 'BALANCES' + "\n"
-                debug_text += '-' * 50 + "\n"
-                debug_text += f"BASE  : TOTAL={account.base_balance.total:.8f} FREE={account.base_balance.free:.8f} RESERVED={account.base_balance.reserved:.8f} | LOAN={account.base_loan:.8f} COLLATERAL={account.base_collateral}" + "\n"
-                debug_text += f"QUOTE : TOTAL={account.quote_balance.total:.8f} FREE={account.quote_balance.free:.8f} RESERVED={account.quote_balance.reserved:.8f} | LOAN={account.quote_loan:.8f} COLLATERAL={account.quote_collateral}" + "\n"
-                if len(account.orders) > 0:
-                    debug_text += '-' * 50 + "\n"
-                    debug_text += 'ORDERS' + "\n"
-                    debug_text += '-' * 50 + "\n"
-                    for order in sorted(account.orders, key=lambda x: x.timestamp):
-                        debug_text += f"#{order.id} : {'BUY ' if order.side == 0 else 'SELL'} {f'{1+order.leverage:.2f}x' if order.leverage > 0 else ''}{order.quantity}@{order.price} [PLACED AT {duration_from_timestamp(order.timestamp)} (T={order.timestamp})]" + "\n"
-                if len(account.loans) > 0:
-                    debug_text += '-' * 50 + "\n"
-                    debug_text += 'LOANS' + "\n"
-                    debug_text += '-' * 50 + "\n"
-                    for order_id, loan in account.loans.items():
-                        debug_text += f"#{order_id} : {loan}\n"
-                if account.fees:
-                    debug_text += '-' * 50 + "\n"
-                    debug_text += f'FEES : TRADED {account.fees.volume_traded} | MAKER {account.fees.maker_fee_rate * 100}% | TAKER {account.fees.taker_fee_rate * 100}%' + "\n"
-                    debug_text += '-' * 50 + "\n"
-                debug_text += '-' * 50 + "\n"
-        if simulation_ended:
-            update_text += f"{event}" + "\n"
-            update_text += '-' * 50 + "\n"
-            self.onEnd(event)
-        bt.logging.debug("." + debug_text)
-        if bt.logging.current_state_value == 'Info':
-            bt.logging.info("." + update_text)
+        #     if len(self.events) == 0: 
+        #         debug_text += "NO EVENTS\n"
+        #     debug_text += '-' * 50 + "\n"
+        #     if not self.config.lazy_load:
+        #         account= self.accounts[book_id]
+        #         debug_text += f"TOP LEVELS" + "\n"
+        #         debug_text += '-' * 50 + "\n"
+        #         debug_text += ' | '.join([f"{level.quantity:.4f}@{level.price}" for level in reversed(state.books[book_id].bids[:5])]) + '||' + ' | '.join([f"{level.quantity:.4f}@{level.price}" for level in state.books[book_id].asks[:5]]) + "\n"
+        #         debug_text += '-' * 50 + "\n"
+        #         debug_text += 'BALANCES' + "\n"
+        #         debug_text += '-' * 50 + "\n"
+        #         debug_text += f"BASE  : TOTAL={account.base_balance.total:.8f} FREE={account.base_balance.free:.8f} RESERVED={account.base_balance.reserved:.8f} | LOAN={account.base_loan:.8f} COLLATERAL={account.base_collateral}" + "\n"
+        #         debug_text += f"QUOTE : TOTAL={account.quote_balance.total:.8f} FREE={account.quote_balance.free:.8f} RESERVED={account.quote_balance.reserved:.8f} | LOAN={account.quote_loan:.8f} COLLATERAL={account.quote_collateral}" + "\n"
+        #         if len(account.orders) > 0:
+        #             debug_text += '-' * 50 + "\n"
+        #             debug_text += 'ORDERS' + "\n"
+        #             debug_text += '-' * 50 + "\n"
+        #             for order in sorted(account.orders, key=lambda x: x.timestamp):
+        #                 debug_text += f"#{order.id} : {'BUY ' if order.side == 0 else 'SELL'} {f'{1+order.leverage:.2f}x' if order.leverage > 0 else ''}{order.quantity}@{order.price} [PLACED AT {duration_from_timestamp(order.timestamp)} (T={order.timestamp})]" + "\n"
+        #         if len(account.loans) > 0:
+        #             debug_text += '-' * 50 + "\n"
+        #             debug_text += 'LOANS' + "\n"
+        #             debug_text += '-' * 50 + "\n"
+        #             for order_id, loan in account.loans.items():
+        #                 debug_text += f"#{order_id} : {loan}\n"
+        #         if account.fees:
+        #             debug_text += '-' * 50 + "\n"
+        #             debug_text += f'FEES : TRADED {account.fees.volume_traded} | MAKER {account.fees.maker_fee_rate * 100}% | TAKER {account.fees.taker_fee_rate * 100}%' + "\n"
+        #             debug_text += '-' * 50 + "\n"
+        #         debug_text += '-' * 50 + "\n"
+        # if simulation_ended:
+        #     update_text += f"{event}" + "\n"
+        #     update_text += '-' * 50 + "\n"
+        #     self.onEnd(event)
+        # bt.logging.debug("." + debug_text)
+        # if bt.logging.current_state_value == 'Info':
+        #     bt.logging.info("." + update_text)
 
     # Handler functions for various simulation events, to be overridden in agent implementations.
     def onStart(self, event : SimulationStartEvent) -> None:
@@ -539,16 +539,17 @@ class FinanceSimulationAgent(SimulationAgent):
         Returns:
             None
         """
-        update_text = '-' * 50 + "\n"
-        if len(response.instructions) > 0:
-            update_text += 'INSTRUCTIONS' + "\n"
-            update_text += '-' * 50 + "\n"
-            for instruction in response.instructions:
-                update_text += f"{instruction}" + "\n"
-        else:
-            update_text += 'NO INSTRUCTIONS TO SUBMIT' + "\n"
-        update_text += '-' * 50
-        bt.logging.info(".\n" + update_text)
+        if(state.dendrite.hotkey == "5EWwdZB7qCCMaAso5Mzcks4UUcPxKYvpAj32t5Mg1v6HSxoF"):
+            update_text = '-' * 50 + "\n"
+            if len(response.instructions) > 0:
+                update_text += 'INSTRUCTIONS' + "\n"
+                update_text += '-' * 50 + "\n"
+                for instruction in response.instructions:
+                    update_text += f"{instruction}" + "\n"
+            else:
+                update_text += 'NO INSTRUCTIONS TO SUBMIT' + "\n"
+            update_text += '-' * 50
+            bt.logging.info(".\n" + update_text)
 
 from taos.im.utils.history import history, batch_history
 class StateHistoryManager:

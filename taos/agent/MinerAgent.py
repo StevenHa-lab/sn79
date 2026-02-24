@@ -428,7 +428,7 @@ class MinerAgent(FinanceSimulationAgent):
                 last_trade_timestamp_ns = timestamp_from_duration(last_trade['timestamp'])
                 gap_seconds = (state.timestamp - last_trade_timestamp_ns) / 1e9
                 if gap_seconds > self.stale_order_time or gap_seconds < 0:
-                    if trend == 'up' and base_volume < 20:
+                    if trend == 'up' and base_volume < 10:
                         buy_qty = min(max(min_qty, round(initial_volume*buy_rate, vol_decimals)), max_qty)
                         if spread > 0.015:
                             response.limit_order(
