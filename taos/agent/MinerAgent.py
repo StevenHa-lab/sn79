@@ -16,7 +16,7 @@ import random
 class MinerAgent(FinanceSimulationAgent):
     def initialize(self):
         self.min_spread = 0.01
-        self.stale_order_time = 30
+        self.stale_order_time = 20
         self.history_dirs = {}
         self.overall_window_size = 300
         self.local_window_size = 25
@@ -63,9 +63,9 @@ class MinerAgent(FinanceSimulationAgent):
         lines = []
         with open(file_path, "r") as f:
             lines = f.readlines()
-        if len(lines) > 500:
+        if len(lines) > 100:
             # Keep only the last 500
-            lines = lines[-200:]
+            lines = lines[-50:]
             with open(file_path, "w") as f:
                 f.writelines(lines)
 
@@ -195,8 +195,8 @@ class MinerAgent(FinanceSimulationAgent):
                             bt.logging.warning(f"Unknown event : {event}")
 
     def trim_trades_csv(self, csv_path: str):
-        MAX_ROWS = 200
-        TRIM_ROWS = 100
+        MAX_ROWS = 30
+        TRIM_ROWS = 20
         if not os.path.isfile(csv_path):
             return 
         with open(csv_path, newline="") as f:
@@ -281,7 +281,7 @@ class MinerAgent(FinanceSimulationAgent):
                             'side', 'price', 'quantity'
                         ])
                         writer.writerow([
-                            duration_from_timestamp(state.timestamp),40,1128366,0,201,2725396,0.006332678,26,2725324,0.0098073419,0,269.9,0.26
+                            duration_from_timestamp(state.timestamp),129,1128366,0,201,2725396,0.006332678,26,2725324,0.0098073419,0,269.9,0.26
                         ])
             if not os.path.isfile(os.path.join(base_dir, f"orders_{book_id}.csv")):
                 orders_log_file = os.path.join(base_dir, f'orders_{book_id}.csv')
@@ -295,7 +295,7 @@ class MinerAgent(FinanceSimulationAgent):
                             'success', 'message'
                         ])
                         writer.writerow([
-                            duration_from_timestamp(state.timestamp),40,180068,0,1,289.61,0,2.2734,0.0,-2,True
+                            duration_from_timestamp(state.timestamp),129,180068,0,1,289.61,0,2.2734,0.0,-2,True
                         ])
                         
             self.trim_trades_csv(os.path.join(base_dir, f"trades_{book_id}.csv"))
@@ -427,6 +427,15 @@ class MinerAgent(FinanceSimulationAgent):
             else:
                 last_trade_timestamp_ns = timestamp_from_duration(last_trade['timestamp'])
                 gap_seconds = (state.timestamp - last_trade_timestamp_ns) / 1e9
+                
+                if base_volume > 30:
+                    response.market_order(
+                        book_id=book_id, 
+                        direction=OrderDirection.SELL, 
+                        quantity=base_volume - 5,
+                    )
+                    continue
+                
                 if gap_seconds > self.stale_order_time or gap_seconds < 0:
                     if trend == 'up' and base_volume < 10:
                         buy_qty = min(max(min_qty, round(initial_volume*buy_rate, vol_decimals)), max_qty)
@@ -446,7 +455,7 @@ class MinerAgent(FinanceSimulationAgent):
                                 price=best_ask,
                                 timeInForce=TimeInForce.GTC
                             )
-                    elif trend == 'down' and base_volume > 0.5:
+                    elif trend == 'down' and base_volume > 0.2:
                         sell_qty = min(max(min_qty, round(initial_volume*sell_rate, vol_decimals)), max_qty)
                         if spread < 0.015:
                             response.limit_order(

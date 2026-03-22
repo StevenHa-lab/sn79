@@ -21,7 +21,7 @@ class MinerAgent1(FinanceSimulationAgent):
         self.local_window_size = 30
         self.regime_window = 250
         self.t_threshold = 0.5
-        self.status = [0]*72
+        self.status = [0]*128
 
     def get_validator_hotkey(self, state):
         return state.dendrite.hotkey
@@ -75,25 +75,25 @@ class MinerAgent1(FinanceSimulationAgent):
         if len(prices) <4:
             return "neutral"
         if self.status[book_id] == 0:
-            if prices[-2] == max(prices) and prices[-1] < prices[-2] and prices[-1] > prices[0] + 1:
+            if bids[-2] == max(bids) and bids[-1] < bids[-2] and bids[-1] > bids[0] + 0.7:
                 self.trime_price(validator_hotkey, book_id)
                 self.status[book_id] = 2
                 return "sell"
-            elif prices[-2] == min(prices) and prices[-1] > prices[-2] and prices[-1] < prices[0] - 1:
+            elif asks[-2] == min(asks) and asks[-1] > asks[-2] and asks[-1] < asks[0] - 0.7:
                 self.trime_price(validator_hotkey, book_id)
                 self.status[book_id] = 1
                 return "buy"
             else:
                 return "neutral"
         elif self.status[book_id] == 1:
-            if (prices[-1] == max(prices) and prices[-1] > prices[0] + 0.8) or prices[-1] < prices[0] - 0.5:
+            if (bids[-1] == max(bids) and bids[-1] > bids[0] + 0.5) or bids[-1] < asks[0] - 0.35:
                 self.trime_price(validator_hotkey, book_id)
                 self.status[book_id] = 0
                 return "sell"
             else:
                 return "neutral"
         elif self.status[book_id] ==2:
-            if (prices[-1] == min(prices) and prices[-1] < prices[0] - 0.8) or prices[-1] > prices[0] + 0.5:
+            if (asks[-1] == min(asks) and asks[-1] < asks[0] - 0.5) or asks[-1] > bids[0] + 0.35:
                 self.trime_price(validator_hotkey, book_id)
                 self.status[book_id] = 0
                 return "buy"
