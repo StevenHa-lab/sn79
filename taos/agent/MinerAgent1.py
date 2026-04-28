@@ -21,7 +21,6 @@ class MinerAgent1(FinanceSimulationAgent):
         self.local_window_size = 30
         self.regime_window = 250
         self.t_threshold = 0.5
-        self.status = [0]*128
 
     def get_validator_hotkey(self, state):
         return state.dendrite.hotkey
@@ -74,72 +73,22 @@ class MinerAgent1(FinanceSimulationAgent):
         # Need at least window+1 prices to compute window returns
         if len(prices) <4:
             return "neutral"
-        if self.status[book_id] == 0:
-            if bids[-2] == max(bids) and bids[-1] < bids[-2] and bids[-1] > bids[0] + 0.7:
-                self.trime_price(validator_hotkey, book_id)
-                self.status[book_id] = 2
-                return "sell"
-            elif asks[-2] == min(asks) and asks[-1] > asks[-2] and asks[-1] < asks[0] - 0.7:
-                self.trime_price(validator_hotkey, book_id)
-                self.status[book_id] = 1
-                return "buy"
-            else:
-                return "neutral"
-        elif self.status[book_id] == 1:
-            if (bids[-1] == max(bids) and bids[-1] > bids[0] + 0.5) or bids[-1] < asks[0] - 0.35:
-                self.trime_price(validator_hotkey, book_id)
-                self.status[book_id] = 0
-                return "sell"
-            else:
-                return "neutral"
-        elif self.status[book_id] ==2:
-            if (asks[-1] == min(asks) and asks[-1] < asks[0] - 0.5) or asks[-1] > bids[0] + 0.35:
-                self.trime_price(validator_hotkey, book_id)
-                self.status[book_id] = 0
-                return "buy"
-            else:
-                return "neutral"
-        else:    
+        if bids[-2] == max(bids) and bids[-1] < bids[-2] and bids[-1] > bids[0] + 0.6:
+            self.trime_price(validator_hotkey, book_id)
+            return "sell"
+        elif asks[-2] == min(asks) and asks[-1] > asks[-2] and asks[-1] < asks[0] - 0.6:
+            self.trime_price(validator_hotkey, book_id)
+            return "buy"
+        else:
             return "neutral"
-        
-    def update(self, state : MarketSimulationStateUpdate) -> None:
-
-        self.simulation_config = state.config
-        self.accounts = state.accounts[self.uid]
-        self.events = state.notices[self.uid]
-        validator_hotkey = self.get_validator_hotkey(state)
-        
-        simulation_ended = False
-        for book_id in range(self.simulation_config.book_count):
-            traded_count = 0
-            for event in self.events:
-                if hasattr(event, 'bookId') and event.bookId == book_id:
-                    match event.type:
-                        case "EVENT_TRADE" | "ET":
-                            traded_count += 1
-                            if traded_count > 1:
-                                continue
-                            role = "taker" if self.uid == event.takerAgentId else "maker"
-                            trade_text = f"{'BUY ' if event.side == 0 else 'SELL'} TRADE #{event.tradeId} : YOUR {'AGGRESSIVE' if role=='taker' else 'PASSIVE'} " + \
-                                f"ORDER #{event.takerOrderId if role=='taker' else event.makerOrderId} (AGENT {event.takerAgentId if role=='taker' else event.makerAgentId}) " + \
-                                f"MATCHED AGAINST #{event.makerOrderId if role=='taker' else event.takerOrderId} (AGENT {event.makerAgentId if role=='taker' else event.takerAgentId}) " + \
-                                f"FOR {event.quantity}@{event.price} AT {duration_from_timestamp(event.timestamp)} (T={event.timestamp})"
-                            bt.logging.info(f"TRADE EVENT PROCESSED: {trade_text}")
-                            if self.status[book_id] == 0:
-                                self.status[book_id] = 2 if event.side == 1 else 1
-                            else:
-                                self.status[book_id] = 0
-                        case _:
-                            bt.logging.warning(f"Unknown event : {event}")
                             
     def respond(self, state):
         validator_hotkey = self.get_validator_hotkey(state)
         response = FinanceAgentResponse(agent_id=self.uid)
         price_decimals = getattr(state.config, "priceDecimals", 2)
         vol_decimals = getattr(state.config, "volumeDecimals", 4)
-        min_qty = 1.0
-        max_qty = 1.1
-        # self.update(state)
+        min_qty = 0.25
+        max_qty = 0.3
 
         for book_id, book in state.books.items():
 
@@ -158,28 +107,38 @@ class MinerAgent1(FinanceSimulationAgent):
 
             trend = self.regime_detection(validator_hotkey, book_id)
 
-            rate = 0.012
+            rate = 0.005
             initial_volume = account.base_balance.initial
-            qty = min(max(min_qty, round(initial_volume*rate, vol_decimals)), max_qty)
-            qty = 1.0
+            base_volume = account.base_balance.total
             
-            if trend == 'sell':
+            qty = min(max(min_qty, round(initial_volume*rate, vol_decimals)), max_qty)
+            
+            if base_volume > 20:
                 response.market_order(
                     book_id=book_id, 
                     direction=OrderDirection.SELL, 
+                    quantity=base_volume - 5,
+                )
+                continue
+            if trend == 'sell':
+                response.limit_order(
+                    book_id=book_id, 
+                    direction=OrderDirection.SELL, 
                     quantity=qty,
+                    price=round(best_ask - 0.02, price_decimals),
+                    timeInForce=TimeInForce.GTC
                 )
             elif trend == 'buy':
-                response.market_order(
+                response.limit_order(
                     book_id=book_id, 
                     direction=OrderDirection.BUY, 
                     quantity=qty,
+                    price=round(best_bid + 0.02, price_decimals),
+                    timeInForce=TimeInForce.GTC
                 )
             else:
                 pass
-          
-        if(validator_hotkey == "5EWwdZB7qCCMaAso5Mzcks4UUcPxKYvpAj32t5Mg1v6HSxoF"):
-            print(f"status: {self.status}")
+
         return response
 
 if __name__ == "__main__":
