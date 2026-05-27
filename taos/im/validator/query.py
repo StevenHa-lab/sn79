@@ -14,6 +14,7 @@ import gc
 import pickle
 import os
 import argparse
+import traceback
 from typing import Dict, Any
 from collections import defaultdict
 from taos.im.protocol import STP
@@ -121,7 +122,7 @@ class QueryService:
                 os.write(self.notify_fd, b'R')
                 bt.logging.info("Query service sent ready signal")
             except Exception as e:
-                bt.logging.error(f"Query service failed to send ready signal: {e}")
+                bt.logging.error(f"Query service failed to send ready signal: {e}\n{traceback.format_exc()}")
         bt.logging.info("Query service initialized")
 
     def validate_responses(self, synapses: dict, request_data: dict, deregistered_uids: set) -> dict:
@@ -248,7 +249,7 @@ class QueryService:
                             valid_instructions.append(instruction)
                             
                     except Exception as ex:
-                        bt.logging.warning(f"Error processing instruction by agent {uid}: {ex}\n{instruction}")
+                        bt.logging.warning(f"Error processing instruction by agent {uid}: {ex}\n{instruction}\n{traceback.format_exc()}")
                 
                 if invalid_agent_id:
                     valid_instructions = []
@@ -312,13 +313,15 @@ class QueryService:
                     self.uids = uids
 
             axon_list = []
+            uid_list = []  # Track actual UIDs, not just sequential indices
             version_split = bt.__version__.split(".")
             _version_info = tuple(int(part) for part in version_split)
             _version_int_base = 1000
             version_as_int: int = sum(
                 e * (_version_int_base**i) for i, e in enumerate(reversed(_version_info))
             )
-            for axon_data in request_data['metagraph_axons']:
+
+            for uid, axon_data in enumerate(request_data['metagraph_axons']):
                 axon = bt.AxonInfo(
                     version=version_as_int,
                     hotkey=axon_data['hotkey'],
@@ -330,12 +333,17 @@ class QueryService:
                     placeholder1=0,
                     placeholder2=0,
                 )
-                axon_list.append(axon)
+                if axon_data['ip'] != "0.0.0.0":
+                    axon_list.append(axon)
+                    uid_list.append(uid)
 
-            self.metagraph = MinimalMetagraph(axon_list, list(range(len(axon_list))))
+            self.metagraph = MinimalMetagraph(axon_list, uid_list)
             deregistered_uids = set(request_data['deregistered_uids'])
 
-            bt.logging.info(f"Querying {len(self.metagraph.axons)} miners...")
+            bt.logging.info(
+                f"Querying {len(self.metagraph.axons)} miners "
+                f"(UIDs: {min(uid_list)}-{max(uid_list)})"
+            )
 
             from taos.im.validator.forward import DendriteManager
             DendriteManager.configure_session(self)
@@ -361,7 +369,7 @@ class QueryService:
                 return synapse
 
             create_start = time.time()
-            axon_synapses = {uid: create_axon_synapse(uid) for uid in range(len(self.metagraph.axons))}
+            axon_synapses = {uid: create_axon_synapse(uid) for uid in uid_list}
             bt.logging.info(f"Created axon synapses ({time.time()-create_start:.4f}s)")
 
             synapse_start = time.time()
@@ -372,11 +380,12 @@ class QueryService:
                         engine=self.config.compression.engine,
                         compressed_books=compressed_books
                     )
-                axon_synapses = {uid: compress_axon_synapse(axon_synapses[uid]) for uid in range(len(self.metagraph.axons))}
+                axon_synapses = {uid: compress_axon_synapse(axon_synapses[uid]) for uid in uid_list}
             else:
                 num_processes = self.config.compression.parallel_workers if self.config.compression.parallel_workers > 0 else multiprocessing.cpu_count() // 2
-                num_axons = len(self.metagraph.axons)
-                batches = [self.metagraph.uids[i:i+int(num_axons/num_processes)] for i in range(0, num_axons, int(num_axons/num_processes))]
+                num_axons = len(uid_list)
+                batch_size = max(1, int(num_axons / num_processes))
+                batches = [uid_list[i:i+batch_size] for i in range(0, num_axons, batch_size)]
                 axon_synapses = batch_compress(
                     axon_synapses,
                     compressed_books,
@@ -390,10 +399,11 @@ class QueryService:
             query_start = time.time()
             synapse_responses = {}
 
-            async def query_uid(uid):
+            async def query_uid(index, uid):
+                """Query a specific UID at the given axon index."""
                 try:
                     response = await self.dendrite(
-                        axons=self.metagraph.axons[uid],
+                        axons=self.metagraph.axons[index],
                         synapse=axon_synapses[uid],
                         timeout=self.config.neuron.timeout,
                         deserialize=False
@@ -401,16 +411,16 @@ class QueryService:
                     return uid, response
                 except asyncio.CancelledError:
                     axon_synapses[uid] = self.dendrite.preprocess_synapse_for_request(
-                        self.metagraph.axons[uid],
+                        self.metagraph.axons[index],
                         axon_synapses[uid],
                         self.config.neuron.timeout
                     )
                     axon_synapses[uid].dendrite.status_code = 408
                     return uid, axon_synapses[uid]
                 except Exception as e:
-                    bt.logging.debug(f"Error querying UID {uid}: {e}")
+                    bt.logging.debug(f"Error querying UID {uid}: {e}\n{traceback.format_exc()}")
                     axon_synapses[uid] = self.dendrite.preprocess_synapse_for_request(
-                        self.metagraph.axons[uid],
+                        self.metagraph.axons[index],
                         axon_synapses[uid],
                         self.config.neuron.timeout
                     )
@@ -418,11 +428,14 @@ class QueryService:
                     return uid, axon_synapses[uid]
 
             query_tasks = []
-            for uid in range(len(self.metagraph.axons)):
+            for index, uid in enumerate(uid_list):
                 if uid not in deregistered_uids:
-                    query_tasks.append(asyncio.create_task(query_uid(uid)))
+                    query_tasks.append(asyncio.create_task(query_uid(index, uid)))
 
-            bt.logging.info(f"Created {len(query_tasks)} query tasks, starting wait with {self.config.neuron.global_query_timeout}s timeout")
+            bt.logging.info(
+                f"Created {len(query_tasks)} query tasks, "
+                f"starting wait with {self.config.neuron.global_query_timeout}s timeout"
+            )
 
             done, pending = await asyncio.wait(
                 query_tasks,
@@ -432,7 +445,9 @@ class QueryService:
 
             elapsed = time.time() - query_start
             if elapsed > self.config.neuron.global_query_timeout:
-                bt.logging.warning(f"Query overshot timeout: {elapsed:.4f}s > {self.config.neuron.global_query_timeout}s")
+                bt.logging.warning(
+                    f"Query overshot timeout: {elapsed:.4f}s > {self.config.neuron.global_query_timeout}s"
+                )
                 for task in pending:
                     task.cancel()
                 pending = set()
@@ -447,7 +462,7 @@ class QueryService:
                     synapse_responses[uid] = response
                     completed_count += 1
                 except Exception as e:
-                    bt.logging.debug(f"Task failed: {e}")
+                    bt.logging.debug(f"Task failed: {e}\n{traceback.format_exc()}")
 
             if pending:
                 bt.logging.warning(f"Cancelling {len(pending)} pending tasks")
@@ -455,10 +470,10 @@ class QueryService:
                     task.cancel()
 
             missing_count = 0
-            for uid in range(len(self.metagraph.axons)):
+            for index, uid in enumerate(uid_list):
                 if uid not in deregistered_uids and uid not in synapse_responses:
                     axon_synapses[uid] = self.dendrite.preprocess_synapse_for_request(
-                        self.metagraph.axons[uid],
+                        self.metagraph.axons[index],
                         axon_synapses[uid],
                         self.config.neuron.timeout
                     )
@@ -471,9 +486,11 @@ class QueryService:
 
             bt.logging.info(f"Collected {completed_count} Responses ({time.time()-collect_start:.4f}s)") 
 
-            bt.logging.info(f"Dendrite call completed ({time.time()-query_start:.4f}s | "
-                        f"Timeout {self.config.neuron.timeout}s / {self.config.neuron.global_query_timeout}s). "
-                        f"Total responses collected: {len(synapse_responses)}")
+            bt.logging.info(
+                f"Dendrite call completed ({time.time()-query_start:.4f}s | "
+                f"Timeout {self.config.neuron.timeout}s / {self.config.neuron.global_query_timeout}s). "
+                f"Total responses collected: {len(synapse_responses)}"
+            )
 
             validate_start = time.time()
             total_responses, total_instructions, success, timeouts, failures = self.validate_responses(
@@ -506,8 +523,7 @@ class QueryService:
             }
 
         except Exception as e:
-            bt.logging.error(f"Error in query_miners: {e}")
-            import traceback
+            bt.logging.error(f"Error in query_miners: {e}\n{traceback.format_exc()}")
             return {
                 'success': False,
                 'error': str(e),
@@ -586,7 +602,7 @@ class QueryService:
                             os.write(self.notify_fd, b'1')
                             bt.logging.info("Sent query completion notification")
                         except Exception as e:
-                            bt.logging.error(f"Failed to send notification: {e}")
+                            bt.logging.error(f"Failed to send notification: {e}\n{traceback.format_exc()}")
                     else:
                         bt.logging.error("Cannot send notification - notify_fd is None!")
                     
@@ -600,8 +616,7 @@ class QueryService:
             except posix_ipc.BusyError:
                 await asyncio.sleep(0.01)
             except Exception as e:
-                bt.logging.error(f"Error in main loop: {e}")
-                import traceback
+                bt.logging.error(f"Error in main loop: {e}\n{traceback.format_exc()}")
                 bt.logging.error(traceback.format_exc())
 
         self.cleanup()
@@ -638,7 +653,7 @@ class QueryService:
                 self.response_queue.close()
                 self.response_queue.unlink()
         except Exception as e:
-            bt.logging.error(f"Error cleaning up IPC: {e}")
+            bt.logging.error(f"Error cleaning up IPC: {e}\n{traceback.format_exc()}")
 
 
 if __name__ == '__main__':
@@ -675,6 +690,5 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         bt.logging.info("Query service interrupted")
     except Exception as e:
-        bt.logging.error(f"Query service crashed: {e}")
-        import traceback
+        bt.logging.error(f"Query service crashed: {e}\n{traceback.format_exc()}")
         bt.logging.error(traceback.format_exc())

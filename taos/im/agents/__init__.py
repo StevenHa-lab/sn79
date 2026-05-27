@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: 2025 Rayleigh Research <to@rayleigh.re>
 # SPDX-License-Identifier: MIT
+from dataclasses import dataclass
 import os
 import msgpack
 import traceback
@@ -13,6 +14,80 @@ from taos.im.protocol import MarketSimulationStateUpdate, FinanceAgentResponse, 
 from taos.im.protocol.events import *
 from taos.im.protocol.models import *
 from taos.im.utils import duration_from_timestamp, timestamp_from_duration
+
+@dataclass
+class RollingWindow:
+    """
+    Rolling window configuration for price sampling.
+    Attributes:
+        min (int): Minimum number of samples required before signals are considered reliable.
+        max (int): Maximum length of the rolling buffer (in samples).
+        samples (int): If max is not used or multi-scale approach
+        num_windows (int): Multi-scale approaches
+        sampling_interval (int): timestamps per sample (sec or nanosec)
+    
+    Parameter Tuning Guidelines:
+        - TODO
+    """
+    min: int
+    max: int
+    samples: int
+    num_windows: int
+    sampling_interval: int = 1
+
+@dataclass
+class Thresholds:
+    """
+    Threshold configuration for generating trading signals.
+
+    Attributes:
+        signal (float): 
+        tolerance (float): 
+        model (float): 
+
+    Parameter Tuning Guidelines:
+        - Increase signal_threshold to reduce trading frequency, focus on strong trends.
+        - Increase tolerance to reduce overtrading in noisy markets.
+        - Adjust model_threshold to filter out unreliable signals.
+    """
+    signal: float
+    tolerance: float
+    model: float
+
+@dataclass
+class TimestampedPrice:
+    """Container for midquote prices with timestamps."""
+    price: float
+    timestamp: int = 0
+
+@dataclass
+class Positions:
+    """Container for positions for different books"""
+    open: bool = False
+    direction: OrderDirection = OrderDirection.BUY
+    amount: int = 0
+    qty: float = 0
+    
+class Signals(IntEnum):
+    """
+    Enum to represent signals coming from the model
+
+    Attributes:
+        ENTRY (int): Open a new position
+        EXIT (int): Close current position 
+        HOLD (int): Hold or extend current position
+        NOISE (int): Ignore
+        -- Simplified
+        BULLISH (int): Rising
+        BEARISH (int): Falling
+    """
+    REVERSION=0
+    MOMENTUM=1
+    HOLD=3
+    NOISE=4
+    BULLISH=5
+    BEARISH=6
+
 
 # Base class for agents operating in intelligent market simulations
 class FinanceSimulationAgent(SimulationAgent):
@@ -356,9 +431,8 @@ class FinanceSimulationAgent(SimulationAgent):
                                 f"FOR {event.quantity}@{event.price} AT {duration_from_timestamp(event.timestamp)} (T={event.timestamp})"
                             # debug_text += f"{trade_text}" + "\n"
                             # update_text += f"BOOK {book_id} : {trade_text}" + "\n"
-                            # self.onTrade(event)
+                            # self.onTrade(event,state.dendrite.hotkey)
                             # self.log_trade_event(event, state)
-                            print(f"TRADE EVENT PROCESSED: {trade_text}")
                         case _:
                             bt.logging.warning(f"Unknown event : {event}")
         #     if len(self.events) == 0: 
@@ -492,13 +566,13 @@ class FinanceSimulationAgent(SimulationAgent):
         """
         pass
 
-    def onTrade(self, event : TradeEvent) -> None:
+    def onTrade(self, event : TradeEvent, validator: str = None) -> None:
         """
         Handler for event where an order is traded in the simulator.  To be implemented by subclasses.
 
         Args:
             event (taos.im.protocol.events.TradeEvent): The event class representing a trade.
-
+            validator: Validator identifier (optional)
         Returns:
             None
         """
