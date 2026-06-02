@@ -38,7 +38,7 @@ git pull
 # pip install -e .
 cd taos/im/neurons
 # pm2 delete miner
-pm2 start --name=m-795 "python miner.py  --netuid $NETUID --subtensor.chain_endpoint $ENDPOINT --wallet.path $WALLET_PATH --wallet.name $WALLET_NAME --wallet.hotkey $HOTKEY_NAME --axon.port $AXON_PORT --logging.debug --agent.path $AGENT_PATH --agent.name $AGENT_NAME  --agent.params $AGENT_PARAMS --logging.$LOG_LEVEL"
+pm2 start --name=mn2 "python miner.py  --netuid $NETUID --subtensor.chain_endpoint $ENDPOINT --wallet.path $WALLET_PATH --wallet.name $WALLET_NAME --wallet.hotkey $HOTKEY_NAME --axon.port $AXON_PORT --logging.debug --agent.path $AGENT_PATH --agent.name $AGENT_NAME  --agent.params $AGENT_PARAMS --logging.$LOG_LEVEL"
 pm2 save
 pm2 startup
-pm2 logs m-795
+pm2 logs mn2

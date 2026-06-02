@@ -1,3 +1,4 @@
+
 import os
 import numpy as np
 from pathlib import Path
@@ -73,10 +74,10 @@ class MinerAgent(FinanceSimulationAgent):
         # Need at least window+1 prices to compute window returns
         if len(prices) <4:
             return "neutral"
-        if bids[-2] == max(bids) and bids[-1] < bids[-2] and bids[-1] > bids[0] + 0.6:
+        if bids[-2] == max(bids) and bids[-1] < bids[-2] and bids[-1] > bids[0] + 0.2:
             self.trime_price(validator_hotkey, book_id)
             return "sell"
-        elif asks[-2] == min(asks) and asks[-1] > asks[-2] and asks[-1] < asks[0] - 0.6:
+        elif asks[-2] == min(asks) and asks[-1] > asks[-2] and asks[-1] < asks[0] - 0.2:
             self.trime_price(validator_hotkey, book_id)
             return "buy"
         else:
@@ -88,7 +89,7 @@ class MinerAgent(FinanceSimulationAgent):
         price_decimals = getattr(state.config, "priceDecimals", 2)
         vol_decimals = getattr(state.config, "volumeDecimals", 4)
         min_qty = 0.5
-        max_qty = 0.7
+        max_qty = 2
 
         for book_id, book in state.books.items():
 
@@ -107,19 +108,12 @@ class MinerAgent(FinanceSimulationAgent):
 
             trend = self.regime_detection(validator_hotkey, book_id)
 
-            rate = 0.005
+            rate = 0.02
             initial_volume = account.base_balance.initial
             base_volume = account.base_balance.total
             
             qty = min(max(min_qty, round(initial_volume*rate, vol_decimals)), max_qty)
-            
-            if base_volume > 20:
-                response.market_order(
-                    book_id=book_id, 
-                    direction=OrderDirection.SELL, 
-                    quantity=base_volume - 5,
-                )
-                continue
+
             if trend == 'sell':
                 response.limit_order(
                     book_id=book_id, 

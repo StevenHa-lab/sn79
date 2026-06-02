@@ -11,136 +11,139 @@ from taos.im.protocol import MarketSimulationStateUpdate, FinanceAgentResponse, 
 from taos.im.protocol.events import LimitOrderPlacementEvent, MarketOrderPlacementEvent, OrderCancellationEvent, TradeEvent
 from taos.im.utils import duration_from_timestamp, timestamp_from_duration
 
-import random
-
-class OCO(FinanceSimulationAgent):
+class MinerAgent(FinanceSimulationAgent):
     def initialize(self):
         self.min_spread = 0.01
         self.history_dirs = {}
-        self.overall_window_size = 35
-        self.local_window_size = 30
-        self.regime_window = 250
-        self.t_threshold = 0.5
+        self.price_buffers = {}        # in-memory, no disk I/O per tick
+        self.order_tracker = {}        # track open orders to cancel stale ones
+        self.window = 50
+        self.vol_window = 20
+        self.target_inventory = 0.5    # target base ratio (0=all quote, 1=all base)
+        self.max_position_pct = 0.8    # max % of capital in base
 
-    def get_validator_hotkey(self, state):
-        return state.dendrite.hotkey
+    # --- Core improvements ---
 
-    def get_history_dir(self, validator_hotkey):
-        if validator_hotkey not in self.history_dirs:
-            path = os.path.abspath(f"history/history_{validator_hotkey}_{self.uid}")
-            os.makedirs(path, exist_ok=True)
-            self.history_dirs[validator_hotkey] = path
-        return self.history_dirs[validator_hotkey]
+    def get_mid_and_spread(self, book):
+        best_bid = book.bids[0].p
+        best_ask = book.asks[0].p
+        return (best_bid + best_ask) / 2, best_ask - best_bid
 
-    def get_history_file(self, validator_hotkey, book_id):
-        return os.path.join(self.get_history_dir(validator_hotkey), f"price_history_{book_id}.csv")
+    def get_price_buffer(self, key):
+        if key not in self.price_buffers:
+            self.price_buffers[key] = deque(maxlen=self.window)
+        return self.price_buffers[key]
 
-    def append_price(self, validator_hotkey, book_id, timestamp, best_bid, best_ask, current_balance):
-        file_path = self.get_history_file(validator_hotkey, book_id)
-        mid_value = round((best_bid + best_ask) / 2, 3)
-        with open(file_path, "a") as f:
-            f.write(f"{timestamp},{best_bid},{best_ask},{mid_value},{current_balance}\n")
+    def compute_volatility(self, prices):
+        if len(prices) < 3:
+            return 0.01
+        arr = np.array(prices)
+        returns = np.diff(arr) / arr[:-1]
+        return np.std(returns[-self.vol_window:]) + 1e-8
 
-    def trime_price(self, validator_hotkey, book_id):
-        file_path = self.get_history_file(validator_hotkey, book_id)
-        lines = []
-        
-        with open(file_path, "r") as f:
-            lines = f.readlines()
-        with open(file_path, "w") as f:
-            f.writelines(lines[-2:])  # Keep only the last two lines
+    def compute_trend(self, prices):
+        """Simple linear regression slope as trend signal"""
+        if len(prices) < 5:
+            return 0.0
+        y = np.array(prices[-10:])
+        x = np.arange(len(y))
+        slope = np.polyfit(x, y, 1)[0]
+        return slope / (np.mean(y) + 1e-8)   # normalized slope
 
-    def load_windowed_history(self, validator_hotkey, book_id):
-        file_path = self.get_history_file(validator_hotkey, book_id)
-        if not os.path.exists(file_path):
-            # Pad with default values if file doesn't exist
-            return [(1.0, 1.0, 1.0)]
-        
-        with open(file_path, "r") as f:
-            lines = f.readlines()
-            price_pairs = [
-                tuple(map(float, line.strip().split(",")[1:4]))
-                for line in lines
-            ]
-        return price_pairs
-
-    def regime_detection(self, validator_hotkey, book_id):
-        price_history = self.load_windowed_history(validator_hotkey, book_id)
-        bids = [p[0] for p in price_history]
-        asks = [p[1] for p in price_history]
-        prices = [p[2] for p in price_history]
-        prices = np.asarray(prices, dtype=float)
-        # Need at least window+1 prices to compute window returns
-        if len(prices) <4:
-            return "neutral"
-        if bids[-2] == max(bids) and bids[-1] < bids[-2] and bids[-1] > bids[0] + 0.6:
-            self.trime_price(validator_hotkey, book_id)
-            return "sell"
-        elif asks[-2] == min(asks) and asks[-1] > asks[-2] and asks[-1] < asks[0] - 0.6:
-            self.trime_price(validator_hotkey, book_id)
-            return "buy"
-        else:
-            return "neutral"
-                            
     def respond(self, state):
-        validator_hotkey = self.get_validator_hotkey(state)
         response = FinanceAgentResponse(agent_id=self.uid)
         price_decimals = getattr(state.config, "priceDecimals", 2)
         vol_decimals = getattr(state.config, "volumeDecimals", 4)
-        min_qty = 0.5
-        max_qty = 0.7
 
         for book_id, book in state.books.items():
-
             if not book.bids or not book.asks:
                 continue
+
             best_bid = book.bids[0].p
             best_ask = book.asks[0].p
-            mid = (best_bid + best_ask) / 2
+            mid, raw_spread = self.get_mid_and_spread(book)
             account = state.accounts[self.uid][book_id]
 
             own_base = account.own_base
             own_quote = account.own_quote
-            current_balance = own_quote + mid * own_base
+            portfolio_value = own_quote + mid * own_base
+            base_ratio = (mid * own_base) / (portfolio_value + 1e-8)
 
-            self.append_price(validator_hotkey, book_id, state.timestamp, best_bid, best_ask, current_balance)
+            # --- Update in-memory price buffer ---
+            buf = self.get_price_buffer((state.dendrite.hotkey, book_id))
+            buf.append(mid)
+            prices = list(buf)
 
-            trend = self.regime_detection(validator_hotkey, book_id)
+            vol = self.compute_volatility(prices)
+            trend = self.compute_trend(prices)
 
-            rate = 0.005
-            initial_volume = account.base_balance.initial
-            base_volume = account.base_balance.total
-            
-            qty = min(max(min_qty, round(initial_volume*rate, vol_decimals)), max_qty)
-            
-            if base_volume > 20:
-                response.market_order(
-                    book_id=book_id, 
-                    direction=OrderDirection.SELL, 
-                    quantity=base_volume - 5,
-                )
-                continue
-            if trend == 'sell':
-                response.limit_order(
-                    book_id=book_id, 
-                    direction=OrderDirection.SELL, 
-                    quantity=qty,
-                    price=round(best_ask - 0.02, price_decimals),
-                    timeInForce=TimeInForce.GTC
-                )
-            elif trend == 'buy':
-                response.limit_order(
-                    book_id=book_id, 
-                    direction=OrderDirection.BUY, 
-                    quantity=qty,
-                    price=round(best_bid + 0.02, price_decimals),
-                    timeInForce=TimeInForce.GTC
-                )
+            # --- Cancel stale orders first ---
+            response.cancel_all_orders(book_id=book_id)
+
+            # --- Dynamic spread: widen in high vol, tighten in low vol ---
+            spread_multiplier = max(1.0, vol * 500)
+            half_spread = round(max(self.min_spread, raw_spread * spread_multiplier) / 2,
+                                price_decimals)
+
+            # --- Inventory skew: skew quotes to mean-revert position ---
+            skew = (base_ratio - self.target_inventory) * mid * 0.5
+            bid_price = round(mid - half_spread - skew, price_decimals)
+            ask_price = round(mid + half_spread - skew, price_decimals)
+
+            # --- Trend filter: lean directionally when trend is strong ---
+            trend_threshold = 0.0003
+            base_qty = round(
+                min(0.6, max(0.1, portfolio_value * 0.01 / mid)),
+                vol_decimals
+            )
+
+            if trend > trend_threshold:
+                # Bullish: place more aggressive buy, wider ask
+                response.limit_order(book_id=book_id,
+                                     direction=OrderDirection.BUY,
+                                     quantity=round(base_qty * 1.5, vol_decimals),
+                                     price=bid_price,
+                                     timeInForce=TimeInForce.GTC)
+                response.limit_order(book_id=book_id,
+                                     direction=OrderDirection.SELL,
+                                     quantity=base_qty,
+                                     price=ask_price,
+                                     timeInForce=TimeInForce.GTC)
+
+            elif trend < -trend_threshold:
+                # Bearish: place more aggressive sell
+                response.limit_order(book_id=book_id,
+                                     direction=OrderDirection.BUY,
+                                     quantity=base_qty,
+                                     price=bid_price,
+                                     timeInForce=TimeInForce.GTC)
+                response.limit_order(book_id=book_id,
+                                     direction=OrderDirection.SELL,
+                                     quantity=round(base_qty * 1.5, vol_decimals),
+                                     price=ask_price,
+                                     timeInForce=TimeInForce.GTC)
             else:
-                pass
+                # Neutral: symmetric market making
+                response.limit_order(book_id=book_id,
+                                     direction=OrderDirection.BUY,
+                                     quantity=base_qty,
+                                     price=bid_price,
+                                     timeInForce=TimeInForce.GTC)
+                response.limit_order(book_id=book_id,
+                                     direction=OrderDirection.SELL,
+                                     quantity=base_qty,
+                                     price=ask_price,
+                                     timeInForce=TimeInForce.GTC)
+
+            # --- Hard inventory guard (replaces the crude market dump) ---
+            if base_ratio > self.max_position_pct:
+                excess = own_base - (self.max_position_pct * portfolio_value / mid)
+                response.market_order(book_id=book_id,
+                                      direction=OrderDirection.SELL,
+                                      quantity=round(excess * 0.5, vol_decimals))
 
         return response
-
+    
 if __name__ == "__main__":
     from taos.common.agents import launch
-    launch(OCO)
+    launch(MinerAgent)
