@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+set -e
+
+CONFIG=""
+VENV=""
+SESSION="proxy_test"
+TRAIN=0
+SIM_XML=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --config)   CONFIG="$2"; shift 2 ;;
+        --venv)     VENV="$2"; shift 2 ;;
+        --session)  SESSION="$2"; shift 2 ;;
+        --train)    TRAIN=1; shift ;;
+        --sim-xml)  SIM_XML="$2"; shift 2 ;;
+        *) echo "Unknown arg: $1"; exit 1 ;;
+    esac
+done
+
+[[ -z "$CONFIG" ]] && { echo "ERROR: --config required"; exit 1; }
+CONFIG="$(realpath "$CONFIG")"
+[[ -f "$CONFIG" ]] || { echo "ERROR: config not found: $CONFIG"; exit 1; }
+
+SCRIPT_DIR=$(dirname "$(realpath "$0")")
+REPO_ROOT=$(realpath "$SCRIPT_DIR/../..")
+PROXY_PATH="$SCRIPT_DIR"
+
+_cfg() { python3 -c "import json,sys; c=json.load(open(sys.argv[1])); $1" "$CONFIG"; }
+_resolve() {
+    case "$1" in
+        /*)             echo "$1" ;;
+        ..|../*|./*)    realpath -m "$SCRIPT_DIR/$1" ;;
+        *)              echo "$REPO_ROOT/$1" ;;
+    esac
+}
+
+[[ -z "$SIM_XML" ]] && SIM_XML=$(_cfg "print(c['proxy']['simulation_xml'])")
+SIM_XML=$(_resolve "$SIM_XML")
+[[ -f "$SIM_XML" ]] || { echo "ERROR: simulation XML not found: $SIM_XML"; exit 1; }
+
+TAOSIM_BIN=$(_cfg "print(c.get('taosim',{}).get('bin','taosim'))")
+SIM_DELAY=$(_cfg  "print(c.get('taosim',{}).get('delay',5))")
+
+VENV_A=""
+[[ -n "$VENV" ]] && VENV_A="source $VENV &&"
+
+S3=""
+if [[ "$TRAIN" = "1" ]]; then
+    for k in \
+        GENTRX_CHAIN_ENDPOINT_OVERRIDE \
+        GENTRX_VALIDATOR_S3_ENDPOINT_URL GENTRX_VALIDATOR_S3_BUCKET \
+        GENTRX_VALIDATOR_S3_READ_ACCESS_KEY GENTRX_VALIDATOR_S3_READ_SECRET_KEY \
+        GENTRX_VALIDATOR_S3_WRITE_ACCESS_KEY GENTRX_VALIDATOR_S3_WRITE_SECRET_KEY \
+        GENTRX_AGGREGATOR_S3_ENDPOINT_URL GENTRX_AGGREGATOR_S3_BUCKET \
+        GENTRX_AGGREGATOR_S3_READ_ACCESS_KEY GENTRX_AGGREGATOR_S3_READ_SECRET_KEY \
+        GENTRX_MINER_BUCKETS GENTRX_N_AGENTS; do
+        [[ -n "${!k}" ]] && S3="$S3 export $k=${!k} &&"
+    done
+fi
+
+AGENT_S3_ENDPOINT="${GENTRX_CHAIN_ENDPOINT_OVERRIDE:-http://localhost:9000}"
+AGENT_S3_ACCESS="${GENTRX_ACCESS_KEY:-minioadmin}"
+AGENT_S3_SECRET="${GENTRX_SECRET_KEY:-minioadmin}"
+
+CMD_PROXY="$VENV_A $S3 cd $PROXY_PATH && python proxy.py --config $CONFIG"
+CMD_SIM="sleep $SIM_DELAY && $TAOSIM_BIN -f $SIM_XML"
+
+if [[ "$TRAIN" = "1" ]]; then
+    HAS_TRAINING=$(_cfg "print(1 if 'training' in c and 'gradient_server' in c.get('training',{}) else 0)")
+    if [[ "$HAS_TRAINING" != "1" ]]; then
+        echo "ERROR: --train requires a 'training.gradient_server' block in $CONFIG." >&2
+        echo "  Use agents/proxy/config.train.example.json as a template." >&2
+        exit 1
+    fi
+    GS_PORT=$(_cfg  "print(c['training']['gradient_server']['port'])")
+    GS_CKPT=$(_resolve "$(_cfg "print(c['training']['gradient_server']['checkpoint'])")")
+    GS_VAL=$(_resolve  "$(_cfg "print(c['training']['gradient_server']['val_data'])")")
+    GS_OUT=$(_resolve  "$(_cfg "print(c['training']['gradient_server']['output'])")")
+    GS_INT=$(_cfg   "print(c['training']['gradient_server'].get('interval',60))")
+    GS_MIN=$(_cfg   "print(c['training']['gradient_server'].get('min_score',-0.1))")
+    GS_MODE=$(_cfg  "print(c['training']['gradient_server'].get('mode','simulation'))")
+    GS_MBKT="${GENTRX_MINER_BUCKETS:-}"
+
+    CMD_GRAD="$VENV_A $S3 cd $REPO_ROOT && python -m GenTRX.src.gradient_server \
+        --checkpoint $GS_CKPT \
+        --val-data $GS_VAL \
+        --output $GS_OUT \
+        --port $GS_PORT \
+        --interval $GS_INT \
+        --min-score $GS_MIN \
+        --mode $GS_MODE"
+    [[ -n "$GS_MBKT" ]] && CMD_GRAD="$CMD_GRAD --miner-buckets $GS_MBKT"
+fi
+
+mapfile -t AGENT_CMDS < <(python3 -c "
+import json, os, sys
+c = json.load(open(sys.argv[1]))
+script_dir = sys.argv[6]
+agents = c.get('agents', {})
+agents_dir = agents.get('path', '..')
+if not os.path.isabs(agents_dir):
+    agents_dir = os.path.realpath(os.path.join(script_dir, agents_dir))
+port = agents.get('start_port', 8888)
+agent_id = 0
+train = int(sys.argv[2])
+endpoint, access, secret = sys.argv[3], sys.argv[4], sys.argv[5]
+for cls, cfgs in agents.items():
+    if cls in ('start_port', 'path'): continue
+    for cfg in cfgs:
+        for _ in range(cfg.get('count', 1)):
+            params = ' '.join(str(k)+'='+str(v) for k, v in cfg['params'].items())
+            if train:
+                env = (
+                    f'export GENTRX_AGENT_S3_BUCKET=agent-{agent_id} && '
+                    f'export GENTRX_AGENT_S3_ENDPOINT_URL={endpoint} && '
+                    f'export GENTRX_AGENT_S3_ACCESS_KEY={access} && '
+                    f'export GENTRX_AGENT_S3_SECRET_KEY={secret} && '
+                    f'export GENTRX_AGENT_S3_READ_ACCESS_KEY={access} && '
+                    f'export GENTRX_AGENT_S3_READ_SECRET_KEY={secret} && '
+                    f'export GENTRX_AGENT_S3_REGION=us-east-1 &&'
+                )
+            else:
+                env = ''
+            cmd = f'python {agents_dir}/{cls}.py --port {port} --agent_id {agent_id} --params {params}'
+            print(f'{env} {cmd}')
+            port += 1
+            agent_id += 1
+" "$CONFIG" "$TRAIN" "$AGENT_S3_ENDPOINT" "$AGENT_S3_ACCESS" "$AGENT_S3_SECRET" "$SCRIPT_DIR")
+
+tmux kill-session -t "$SESSION" 2>/dev/null || true
+
+MINIO_CONTAINER="${MINIO_CONTAINER:-gentrx_minio}"
+
+if [[ "$TRAIN" = "1" ]]; then
+    tmux new-session -d -s "$SESSION" -n "minio"
+    if [[ -n "${MINIO_LOG_FILE:-}" ]]; then
+        tmux send-keys -t "$SESSION:minio" "tail -F $MINIO_LOG_FILE" Enter
+    else
+        tmux send-keys -t "$SESSION:minio" "docker logs -f $MINIO_CONTAINER" Enter
+    fi
+
+    tmux new-window   -t "$SESSION" -n "proxy-sim"
+    tmux send-keys    -t "$SESSION:proxy-sim" "$CMD_PROXY" Enter
+    tmux split-window -h -t "$SESSION:proxy-sim"
+    tmux send-keys    -t "$SESSION:proxy-sim" "$CMD_SIM" Enter
+
+    tmux new-window -t "$SESSION" -n "grad-agents"
+    tmux send-keys  -t "$SESSION:grad-agents" "$CMD_GRAD" Enter
+    for agent_cmd in "${AGENT_CMDS[@]}"; do
+        tmux split-window -v -t "$SESSION:grad-agents"
+        tmux send-keys    -t "$SESSION:grad-agents" "$VENV_A $S3 $agent_cmd" Enter
+    done
+    tmux select-pane -t "$SESSION:grad-agents.0"
+else
+    tmux new-session -d -s "$SESSION" -n "proxy-sim"
+    tmux send-keys    -t "$SESSION:proxy-sim" "$CMD_PROXY" Enter
+    tmux split-window -h -t "$SESSION:proxy-sim"
+    tmux send-keys    -t "$SESSION:proxy-sim" "$CMD_SIM" Enter
+
+    tmux new-window -t "$SESSION" -n "agents"
+    first=1
+    for agent_cmd in "${AGENT_CMDS[@]}"; do
+        if [[ "$first" = "1" ]]; then
+            tmux send-keys -t "$SESSION:agents" "$VENV_A $agent_cmd" Enter
+            first=0
+        else
+            tmux split-window -v -t "$SESSION:agents"
+            tmux send-keys    -t "$SESSION:agents" "$VENV_A $agent_cmd" Enter
+        fi
+    done
+    [[ "${#AGENT_CMDS[@]}" -gt 0 ]] && tmux select-pane -t "$SESSION:agents.0"
+fi
+
+echo ""
+echo "Session '$SESSION' ($( [[ "$TRAIN" = "1" ]] && echo training || echo trading) mode):"
+tmux list-windows -t "$SESSION" -F "  #I: #W"
+echo ""
+if [[ "$TRAIN" = "1" ]]; then
+    echo "Validator:  ${GENTRX_VALIDATOR_S3_ENDPOINT_URL:-?}/${GENTRX_VALIDATOR_S3_BUCKET:-?}"
+    echo "Agents:     $AGENT_S3_ENDPOINT  (agent-0..agent-N)"
+    echo "MinIO UI:   http://localhost:${MINIO_CONSOLE:-9091}"
+fi
+echo ""
+
+for i in 3 2 1; do
+    printf "\rAttaching in %s" "$i"
+    sleep 1
+done
+echo ""
+
+exec tmux attach -t "$SESSION"

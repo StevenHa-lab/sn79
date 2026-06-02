@@ -19,11 +19,15 @@
 # DEALINGS IN THE SOFTWARE.
 
 import os
+
+os.environ.setdefault("BT_NO_PARSE_CLI_ARGS", "false")
+
 import argparse
 import bittensor as bt
 from loguru import logger
 
 from taos.common.utils.prometheus import prometheus
+
 
 class ParseKwargs(argparse.Action):
     "Handles parsing of arbitrary agent parameters"

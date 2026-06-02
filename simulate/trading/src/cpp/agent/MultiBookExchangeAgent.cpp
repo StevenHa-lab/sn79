@@ -240,6 +240,13 @@ void MultiBookExchangeAgent::configure(const pugi::xml_node& node)
     Agent::configure(node);
 
     m_config.configure(node);
+    if (simulation()->blockIdx() == 0) {
+        const auto& p = m_config.parameters();
+        fmt::println(
+            "Exchange precision: price={} volume={} base={} quote={} decimals",
+            p.priceIncrementDecimals, p.volumeIncrementDecimals,
+            p.baseIncrementDecimals, p.quoteIncrementDecimals);
+    }
 
     // TODO: This monstrosity should be split up somehow.
     try {
@@ -251,7 +258,10 @@ void MultiBookExchangeAgent::configure(const pugi::xml_node& node)
         const size_t detailedDepth = booksNode.attribute("detailedDepth").as_ullong(5);
 
         m_bookProcessManager = taosim::book::BookProcessManager::fromXML(
-            booksNode, const_cast<Simulation*>(simulation()), &m_config2);
+            booksNode,
+            const_cast<Simulation*>(simulation()),
+            &m_config2,
+            simulation()->sharedResources());
 
         if (std::string(node.child("FeePolicy").attribute("type").as_string()) == "dynamic"){
             simulation()->logDebug("DYNAMIC FEE POLICY");

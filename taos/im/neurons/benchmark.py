@@ -17,6 +17,10 @@
 # THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 # DEALINGS IN THE SOFTWARE.
+"""
+Benchmark miner neuron: runs a deterministic reference agent with a fixed
+validator-assigned UID (>= 256), bypassing on-chain registration.
+"""
 
 if __name__ != "__mp_main__":
     import time
@@ -93,7 +97,20 @@ if __name__ != "__mp_main__":
                 name=self.config.wallet.name,
                 hotkey=self.config.wallet.hotkey
             )
-            self.subtensor = bt.Subtensor(self.config.subtensor.chain_endpoint)
+            # When chain_endpoint is set, pass it positionally — bt.Subtensor's
+            # `network` arg accepts URLs and uses them directly. Using
+            # `config=self.config` instead lets `config.subtensor.network` (often
+            # default 'finney' or a non-matching alias) override chain_endpoint
+            # with the alias's hardcoded URL, breaking custom-endpoint deploys.
+            # GenTRX network detection has its own netuid-based fallback in
+            # agents/gentrx.py for the "subtensor.network unknown" case.
+            _chain_ep = (
+                getattr(self.config.subtensor, "chain_endpoint", None) or ""
+            )
+            if _chain_ep:
+                self.subtensor = bt.Subtensor(network=_chain_ep)
+            else:
+                self.subtensor = bt.Subtensor(config=self.config)
 
             self.metagraph = self.subtensor.metagraph(self.config.netuid)
 
@@ -137,6 +154,19 @@ if __name__ != "__mp_main__":
                 blacklist_fn=self.blacklist_update,
                 priority_fn=self.priority_update,
             )
+            # Attach GenTRX assignment handler (inherited from Miner).
+            # Benchmark miners participate in GenTRX training when
+            # GENTRX_AGENT_S3_* env vars are set; handler is a no-op otherwise.
+            try:
+                from taos.im.protocol.gentrx import GenTRXAssignment
+                self.axon.attach(
+                    forward_fn=self.forward_gentrx_assignment,
+                    blacklist_fn=self.blacklist_gentrx_assignment,
+                    priority_fn=self.priority_gentrx_assignment,
+                )
+                bt.logging.info("GenTRX assignment handler attached to benchmark axon.")
+            except ImportError:
+                bt.logging.debug("GenTRX not installed — skipping assignment handler.")
             bt.logging.info(f"Axon created: {self.axon}")
 
             # Instantiate runners
@@ -150,7 +180,18 @@ if __name__ != "__mp_main__":
             module_spec.loader.exec_module(agent_module)
             agent_class = getattr(agent_module, self.config.agent.name)
             self.agent = agent_class(self.uid, self.config.agent.params, self.config.neuron.full_path)
-        
+
+            # Wire chain access onto the agent for GenTRX chain discovery.
+            self.agent.subtensor = self.subtensor
+            self.agent.metagraph = self.metagraph
+            self.agent.config.netuid = self.config.netuid
+
+            # Re-run model bootstrap now that chain is available.
+            # initialize() already attempted this but subtensor wasn't wired yet.
+            _gtx = getattr(self.agent, "_gtx", None)
+            if _gtx is not None and _gtx.model is None:
+                self.agent._ensure_model_version()
+
         def check_registered(self):
             """
             Override registration check - benchmark miners don't need registration.

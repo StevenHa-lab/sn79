@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+set -e
+
+SCRIPT_DIR=$(dirname "$(realpath "$0")")
+G=$(realpath "$SCRIPT_DIR/../..")
+
+TRAIN=0
+NO_TMUX=0
+CONFIG="$SCRIPT_DIR/config.json"
+SIM_XML=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --train)   TRAIN=1; shift ;;
+        --no-tmux) NO_TMUX=1; shift ;;
+        --config)  CONFIG="$2"; shift 2 ;;
+        --sim-xml) SIM_XML="$2"; shift 2 ;;
+        -h|--help)
+            cat <<EOF
+Usage: $0 [--train] [--no-tmux] [--config <path>] [--sim-xml <path>]
+
+  --train       trading + GenTRX: + MinIO + gradient server + S3 env
+  --no-tmux     headless single-process runner (delegates to launcher.py)
+  --config      path to config.json (default: agents/proxy/config.json)
+  --sim-xml     override proxy.simulation_xml from the config
+
+Stop:
+  tmux kill-session -t proxy_test
+EOF
+            exit 0 ;;
+        *) echo "Unknown arg: $1 (try --help)"; exit 1 ;;
+    esac
+done
+
+CONFIG="$(realpath "$CONFIG")"
+[[ -f "$CONFIG" ]] || { echo "ERROR: config not found: $CONFIG"; exit 1; }
+
+if command -v taosim &>/dev/null; then
+    :
+elif [[ -n "$TAOS_BUILD" && -x "$TAOS_BUILD/src/cpp/taosim" ]]; then
+    export PATH="$TAOS_BUILD/src/cpp:$PATH"
+elif [[ -x "$G/simulate/trading/build/src/cpp/taosim" ]]; then
+    export PATH="$G/simulate/trading/build/src/cpp:$PATH"
+else
+    echo "ERROR: 'taosim' not found."
+    echo "  Build it with: bash $G/install_simulator.sh"
+    echo "  Or set TAOS_BUILD=/path/to/simulate/trading/build so \$TAOS_BUILD/src/cpp/taosim exists."
+    exit 1
+fi
+
+if [[ -n "$VIRTUAL_ENV" ]]; then
+    VENV="$VIRTUAL_ENV/bin/activate"
+elif [[ -n "$TAOS_VENV" && -d "$TAOS_VENV" ]]; then
+    VENV="$TAOS_VENV/bin/activate"
+else
+    VENV=""
+fi
+
+if [[ "$NO_TMUX" = "0" ]]; then
+    command -v tmux &>/dev/null || { echo "ERROR: tmux not found (use --no-tmux for headless)"; exit 1; }
+fi
+
+if [[ "$TRAIN" = "1" ]]; then
+    HAS_TRAINING=$(python3 -c "import json; c=json.load(open('$CONFIG')); print(1 if 'training' in c and 'gradient_server' in c.get('training',{}) else 0)")
+    if [[ "$HAS_TRAINING" != "1" ]]; then
+        echo "ERROR: --train requires a 'training.gradient_server' block in $CONFIG."
+        echo "  Use agents/proxy/config.train.example.json as a template, or run without --train for trading-only."
+        exit 1
+    fi
+    N_AGENTS=$(python3 -c "import json; c=json.load(open('$CONFIG')); print(c.get('training',{}).get('n_agents',2))")
+    export GENTRX_N_AGENTS="$N_AGENTS"
+    VAL_DATA=$(python3 -c "
+import json, os
+c = json.load(open('$CONFIG'))
+v = c.get('training',{}).get('gradient_server',{}).get('val_data','')
+if v:
+    if not os.path.isabs(v):
+        anchor = '$SCRIPT_DIR' if v.startswith('..') or v.startswith('./') else '$G'
+        v = os.path.realpath(os.path.join(anchor, v))
+    print(v)
+")
+    [[ -n "$VAL_DATA" ]] && mkdir -p "$VAL_DATA"
+    source "$SCRIPT_DIR/setup_minio"
+    source "$SCRIPT_DIR/wipe_bucket"
+fi
+
+TRAIN_FLAG=""
+[[ "$TRAIN" = "1" ]] && TRAIN_FLAG="--train"
+
+SIM_XML_ARGS=()
+[[ -n "$SIM_XML" ]] && SIM_XML_ARGS=(--sim-xml "$(realpath "$SIM_XML")")
+
+if [[ "$NO_TMUX" = "1" ]]; then
+    PY="${VIRTUAL_ENV:+$VIRTUAL_ENV/bin/python}"
+    PY="${PY:-python3}"
+    exec "$PY" "$SCRIPT_DIR/launcher.py" --config "$CONFIG" $TRAIN_FLAG "${SIM_XML_ARGS[@]}"
+else
+    VENV_ARGS=()
+    [[ -n "$VENV" ]] && VENV_ARGS=(--venv "$VENV")
+    exec "$SCRIPT_DIR/launcher" --config "$CONFIG" $TRAIN_FLAG "${VENV_ARGS[@]}" "${SIM_XML_ARGS[@]}"
+fi

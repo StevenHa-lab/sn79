@@ -5,18 +5,21 @@
 # Copyright © 2025 Rayleigh Research
 
 # Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
-# documentation files (the “Software”), to deal in the Software without restriction, including without limitation
+# documentation files (the "Software"), to deal in the Software without restriction, including without limitation
 # the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software,
 # and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
 
 # The above copyright notice and this permission notice shall be included in all copies or substantial portions of
 # the Software.
 
-# THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
 # THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
 # THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 # DEALINGS IN THE SOFTWARE.
+"""
+Validator forward pass: IPC-based query dispatch and miner notification helpers.
+"""
 
 import os
 import time
@@ -89,6 +92,8 @@ def update_stats(self : Validator, synapses : dict[int, MarketSimulationStateUpd
         None
     """
     for uid, synapse in synapses.items():
+        if uid not in self.miner_stats:
+            self.miner_stats[uid] = {'requests': 0, 'timeouts': 0, 'failures': 0, 'rejections': 0, 'call_time': []}
         self.miner_stats[uid]['requests'] += 1
         if synapse.is_timeout:
             self.miner_stats[uid]['timeouts'] += 1
@@ -189,6 +194,22 @@ async def forward(self, synapse: MarketSimulationStateUpdate) -> List[FinanceAge
             except (posix_ipc.BusyError, asyncio.TimeoutError):
                 pass
             bt.logging.info(f"Drained Query Response Queue ({time.time()-query_start:.4f}s).")
+            
+            # Drain stale completion bytes from the notification pipe. The query service
+            # can finish a cycle before the validator loops back around; the b'1' sits in
+            # the pipe and would be read as an instant (false) completion on the next send.
+            drained_pipe = 0
+            try:
+                while True:
+                    data = os.read(self.query_notify_read, 1)
+                    if data:
+                        drained_pipe += 1
+                    else:
+                        break
+            except (BlockingIOError, OSError):
+                pass
+            if drained_pipe > 0:
+                bt.logging.warning(f"Drained {drained_pipe} stale pipe notification(s) before query")
 
             write_start = time.time()
             data_bytes = pickle.dumps(request_data, protocol=5)
@@ -298,6 +319,117 @@ async def forward(self, synapse: MarketSimulationStateUpdate) -> List[FinanceAge
         bt.logging.debug("Query flag cleared")
 
     return responses
+
+async def deliver_gentrx(self: Validator, deliveries: list) -> None:
+    """Deliver GenTRX assignment synapses to miners via the query service IPC.
+
+    Serializes delivery requests into shared memory, sends a 'deliver_gentrx'
+    command to the query service, and waits for the b'G' pipe notification.
+    Uses the same IPC channel as forward() so queries and deliveries are
+    naturally serialized by the single request queue — they cannot overlap.
+
+    Args:
+        self (Validator): The validator instance.
+        deliveries: List of (uid, axon, GenTRXAssignment) tuples.
+    """
+    from GenTRX.src.bt_log import gtx_log
+
+    if not deliveries:
+        return
+
+    round_id = deliveries[0][2].round if deliveries else "?"
+
+    request_data = {
+        'round': round_id,
+        'deliveries': [
+            {
+                'uid': uid,
+                'axon_data': {
+                    'hotkey': axon.hotkey,
+                    'coldkey': axon.coldkey,
+                    'ip': axon.ip,
+                    'port': axon.port,
+                    'ip_type': axon.ip_type,
+                    'protocol': axon.protocol,
+                },
+                'assignment': {
+                    'round': synapse.round,
+                    'model_version': synapse.model_version,
+                    'books': synapse.books,
+                    'ts_start': synapse.ts_start,
+                    'ts_end': synapse.ts_end,
+                    'data': synapse.data,
+                    'data_source': synapse.data_source,
+                    'data_endpoint': synapse.data_endpoint,
+                    'data_bucket': synapse.data_bucket,
+                    'data_access_key': synapse.data_access_key,
+                    'data_secret_key': synapse.data_secret_key,
+                    'validator_uid': synapse.validator_uid,
+                },
+            }
+            for uid, axon, synapse in deliveries
+        ],
+    }
+
+    try:
+        data_bytes = pickle.dumps(request_data, protocol=5)
+        gtx_log.info(
+            f"[GTX] deliver_gentrx IPC: round={round_id} "
+            f"n={len(deliveries)} bytes={len(data_bytes)}"
+        )
+
+        self.response_mem.seek(0)
+        self.response_mem.write(struct.pack('Q', 0))
+
+        self.request_mem.seek(0)
+        self.request_mem.write(struct.pack('Q', len(data_bytes)))
+        self.request_mem.write(data_bytes)
+
+        self.request_queue.send(b'deliver_gentrx')
+        gtx_log.info("[GTX] Sent deliver_gentrx command, waiting for notification...")
+
+        max_wait = 60.0
+        loop = asyncio.get_event_loop()
+        future: asyncio.Future = loop.create_future()
+
+        def pipe_readable():
+            loop.remove_reader(self.query_notify_read)
+            try:
+                data = os.read(self.query_notify_read, 1)
+                future.set_result(data)
+            except Exception as e:
+                future.set_exception(e)
+
+        loop.add_reader(self.query_notify_read, pipe_readable)
+        try:
+            notify_result = await asyncio.wait_for(future, timeout=max_wait)
+        except asyncio.TimeoutError:
+            loop.remove_reader(self.query_notify_read)
+            gtx_log.error(f"[GTX] deliver_gentrx notification timeout after {max_wait}s")
+            return
+        except Exception as e:
+            gtx_log.error(f"[GTX] deliver_gentrx notification error: {e}")
+            return
+
+        if notify_result != b'G':
+            gtx_log.warning(f"[GTX] Unexpected notification byte for deliver_gentrx: {notify_result}")
+            return
+
+        self.response_mem.seek(0)
+        size_bytes = self.response_mem.read(8)
+        data_size = struct.unpack('Q', size_bytes)[0]
+        if data_size == 0:
+            gtx_log.error("[GTX] deliver_gentrx: response size is 0")
+            return
+        result_bytes = self.response_mem.read(data_size)
+        result = pickle.loads(result_bytes)
+        gtx_log.info(
+            f"[GTX] deliver_gentrx complete: ok={result.get('ok')} fail={result.get('fail')}"
+        )
+
+    except Exception as e:
+        gtx_log.error(f"[GTX] deliver_gentrx IPC error: {e}\n{traceback.format_exc()}")
+
 
 async def notify(self : Validator, notices : List[FinanceEventNotification]) -> None:
     """

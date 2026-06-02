@@ -30,11 +30,36 @@
 #include <taosim/simulation/SimulationState.hpp>
 #include <taosim/util/serialization/SubscriptionRegistry.hpp>
 
+#include <fmt/format.h>
+
+#include <cstdio>
 #include <latch>
 
 //-------------------------------------------------------------------------
 
 namespace fs = std::filesystem;
+
+//-------------------------------------------------------------------------
+
+namespace
+{
+
+void printProgress(size_t cur, size_t tot, std::string_view label)
+{
+    constexpr int W = 30;
+    const int filled = tot > 0 ? static_cast<int>(W * cur / tot) : 0;
+    const std::string bar =
+        std::string(filled > 0 ? filled - 1 : 0, '=')
+        + (filled > 0 ? ">" : "")
+        + std::string(W - filled, ' ');
+    fmt::print(
+        "\r  {:<20} [{}] {:>3}%  {}/{}",
+        label, bar, tot > 0 ? 100 * cur / tot : 0, cur, tot);
+    std::fflush(stdout);
+    if (cur == tot) fmt::println("");
+}
+
+}  // namespace
 
 //-------------------------------------------------------------------------
 
@@ -225,6 +250,21 @@ static void setupExchange(const msgpack::object& o, Simulation& simu, size_t blo
         }
     };
 
+    auto setupSignals = [&](const msgpack::object& o) {
+        if (o.type != msgpack::type::MAP) {
+            throw taosim::checkpoint::CheckpointError{std::to_string(blockIdx)};
+        }
+        auto& signalsMap = simu.exchange()->signals();
+        for (uint32_t i = 0; i < o.via.map.size; ++i) {
+            BookId bookId;
+            o.via.map.ptr[i].key.convert(bookId);
+            const auto it = signalsMap.find(bookId);
+            if (it != signalsMap.end() && it->second) {
+                o.via.map.ptr[i].val.convert(*it->second);
+            }
+        }
+    };
+
     for (const auto& [k, val] : o.via.map) {
         auto key = k.as<std::string_view>();
 
@@ -235,7 +275,7 @@ static void setupExchange(const msgpack::object& o, Simulation& simu, size_t blo
             setupBooks(val);
         }
         else if (key == "signals") {
-            val.convert(simu.exchange()->signals());
+            setupSignals(val);
         }
         else if (key == "bookProcessManager") {
             val.convert(simu.exchange()->bookProcessManager());
@@ -299,7 +339,9 @@ static void setupBlocks(
 {
     using taosim::serialization::msgpackMapKeysToString;
 
+    const size_t nBlocks = blockObjHandles.size();
     for (auto&& [blockIdx, oh] : views::enumerate(blockObjHandles)) {
+
         const msgpack::object obj = oh.get();
 
         if (obj.type != msgpack::type::MAP) {
@@ -331,6 +373,7 @@ static void setupBlocks(
             )};
         }
         setupMessageQueue(*messageQueueObj, simu);
+        printProgress(blockIdx + 1, nBlocks, "Restoring blocks");
     }
 }
 

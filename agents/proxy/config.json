@@ -1,23 +1,36 @@
 {
-    "proxy" : {
-        "port" : 8000,
-        "simulation_xml" : "../../simulate/trading/run/config/simulation_0.xml",
-        "timeout" : 3
+    "proxy": {
+        "port": 8000,
+        "simulation_xml": "../../simulate/trading/run/config/simulation_0.xml",
+        "timeout": 5
     },
-    "agents" : {
-        "path" : "..",
-        "start_port" : 8888,
-        "RandomMakerAgent" : [
+    "agents": {
+        "path": "..",
+        "start_port": 8888,
+        "RandomMakerAgent": [
             {
-                "params" : {"min_quantity" : 1.0, "max_quantity" : 2.0, "expiry_period" : 200000000000, "lazy_load" : 1},
-                "count" : 8
+                "params": {
+                    "min_quantity": 1.0,
+                    "max_quantity": 2.0,
+                    "expiry_period": 200000000000,
+                    "lazy_load": 1
+                },
+                "count": 8
             }
         ],
-        "RandomTakerAgent" :[
+        "RandomTakerAgent": [
             {
-                "params" : {"min_quantity" : 1.0, "max_quantity" : 2.0, "lazy_load" : 1},
-                "count" : 8
+                "params": {
+                    "min_quantity": 1.0,
+                    "max_quantity": 2.0,
+                    "lazy_load": 1
+                },
+                "count": 8
             }
         ]
+    },
+    "taosim": {
+        "bin": "taosim",
+        "delay": 5
     }
 }
