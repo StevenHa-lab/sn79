@@ -3550,18 +3550,30 @@ if __name__ != "__mp_main__":
                 elapsed = 0
                 message = None
                 poll_count = 0
+                loop = asyncio.get_event_loop()
                 while elapsed < max_wait:
                     poll_count += 1
                     try:
-                        message, _ = self.reporting_response_queue.receive(timeout=0.1)
+                        # Offload the blocking queue receive to the reporting IPC
+                        # executor so the main event loop stays free while the
+                        # (separate) reporting process applies its metric updates.
+                        # A synchronous receive() on the loop blocks every other
+                        # coroutine — including handle_state for incoming simulator
+                        # ticks — for the full 30-60s a report takes, inflating
+                        # "State update handled" time and causing miner-query
+                        # timeouts. The prior form yielded only ~0.001s every 10
+                        # polls, leaving the loop ~99% starved for the report's
+                        # duration.
+                        message, _ = await loop.run_in_executor(
+                            self.reporting_ipc_executor,
+                            lambda: self.reporting_response_queue.receive(timeout=0.5)
+                        )
                         bt.logging.info(f"Received reporting response after {poll_count} polls ({time.time()-receive_start:.4f}s)")
                         break
                     except posix_ipc.BusyError:
                         elapsed = time.time() - receive_start
-                        if poll_count % 10 == 0:
-                            await asyncio.sleep(0.001)
+                        if poll_count % 20 == 0:
                             bt.logging.debug(f"Still polling for reporting response ({elapsed:.1f}s, {poll_count} polls)")
-
                         continue
                 else:
                     self.pagerduty_alert(f"Reporting response timeout after {max_wait}s")

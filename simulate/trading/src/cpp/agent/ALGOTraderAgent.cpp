@@ -13,6 +13,9 @@
 #include <boost/accumulators/statistics/variance.hpp>
 #include <boost/math/statistics/linear_regression.hpp>
 
+#include <algorithm>
+#include <cmath>
+
 //-------------------------------------------------------------------------
 
 namespace taosim::agent
@@ -127,72 +130,159 @@ void ALGOTraderVolumeStats::push(const Trade& trade)
 
 //-------------------------------------------------------------------------
 
+double ALGOTraderVolumeStats::bucketPriceDouble(const VolBucket& b) const noexcept
+{
+    if (b.sumVol == decimal_t{}) [[unlikely]] {
+        return 0.0;
+    }
+    return util::decimal2double(b.sumPriceVol / b.sumVol);
+}
+
+//-------------------------------------------------------------------------
+
+double ALGOTraderVolumeStats::logretBetween(
+    const VolBucket& prev, const VolBucket& cur) const noexcept
+{
+    const double prevPrice = bucketPriceDouble(prev);
+    const double curPrice = bucketPriceDouble(cur);
+    // Match original: only emit a log-return when the previous price is non-zero.
+    if (prevPrice != 0.0) {
+        return std::log(curPrice / prevPrice);
+    }
+    return 0.0;
+}
+
+//-------------------------------------------------------------------------
+
+void ALGOTraderVolumeStats::addTradeIncremental(const TimestampedVolume& tv)
+{
+    const decimal_t priceVol = tv.price * tv.volume;
+
+    if (!m_buckets.empty() && m_buckets.back().ts == tv.timestamp) {
+        // Same-timestamp trade: fold into the last VWAP bucket. Its price moves,
+        // so the most recent log-return (if any) must be recomputed.
+        const std::size_t n = m_buckets.size();
+        const bool hasLogret = n >= 2;
+        const double oldLogret =
+            hasLogret ? logretBetween(m_buckets[n - 2], m_buckets[n - 1]) : 0.0;
+
+        VolBucket& back = m_buckets.back();
+        back.sumVol += tv.volume;
+        back.sumPriceVol += priceVol;
+
+        if (hasLogret) {
+            const double newLogret = logretBetween(m_buckets[n - 2], m_buckets[n - 1]);
+            m_logRetSum += newLogret - oldLogret;
+            m_logRetSumSq += newLogret * newLogret - oldLogret * oldLogret;
+        }
+    } else {
+        // New distinct timestamp: append a bucket and (if there is a predecessor)
+        // add exactly one new log-return.
+        const bool hasPrev = !m_buckets.empty();
+        const VolBucket prev = hasPrev ? m_buckets.back() : VolBucket{};
+        m_buckets.push_back(VolBucket{tv.timestamp, tv.volume, priceVol});
+        if (hasPrev) {
+            const double logret = logretBetween(prev, m_buckets.back());
+            m_logRetSum += logret;
+            m_logRetSumSq += logret * logret;
+        }
+    }
+}
+
+//-------------------------------------------------------------------------
+
+void ALGOTraderVolumeStats::rebuildIncremental()
+{
+    m_buckets.clear();
+    m_logRetSum = 0.0;
+    m_logRetSumSq = 0.0;
+
+    // m_queue is a heap; iterate its trades in ascending-timestamp order. This
+    // O(n log n) pass runs once (on first push, incl. after a checkpoint restore).
+    std::vector<TimestampedVolume> ordered{m_queue.underlying()};
+    std::sort(ordered.begin(), ordered.end(),
+        [](const TimestampedVolume& a, const TimestampedVolume& b) noexcept {
+            return a.timestamp < b.timestamp;
+        });
+    for (const TimestampedVolume& tv : ordered) {
+        addTradeIncremental(tv);
+    }
+    m_incBuilt = true;
+}
+
+//-------------------------------------------------------------------------
+
+void ALGOTraderVolumeStats::recomputeVariance() noexcept
+{
+    // One log-return per adjacent pair of distinct-timestamp buckets.
+    const std::size_t k = m_buckets.size() > 0 ? m_buckets.size() - 1 : 0;
+    if (k == 0) {
+        m_variance = 0.0;
+        return;
+    }
+    const double n = static_cast<double>(k);
+    const double mean = m_logRetSum / n;
+    double populationVariance = m_logRetSumSq / n - mean * mean;
+    if (populationVariance < 0.0) {  // guard tiny negative from fp cancellation
+        populationVariance = 0.0;
+    }
+    // Original applied a (count-1)/count factor to the population variance; keep
+    // that shape but with the *true* log-return count — the old code used the
+    // windowLogRets vector's .capacity() here, the bug being fixed.
+    m_variance = populationVariance * (n - 1.0) / n;
+}
+
+//-------------------------------------------------------------------------
+
 void ALGOTraderVolumeStats::push(TimestampedVolume timestampedVolume)
 {
-    auto acc = [&] {
-        m_queue.push(timestampedVolume);
-        m_rollingSum += timestampedVolume.volume;
+    // Build (or, after a checkpoint restore, rebuild) the incremental window state
+    // from m_queue before the first incremental update.
+    if (!m_incBuilt) [[unlikely]] {
+        rebuildIncremental();
+    }
 
-        auto temp = m_queue;
-        std::vector<double> windowLogRets;
-        if (!temp.empty()) {
-            TimestampedVolume prev = temp.top(); temp.pop();
-            while (!temp.empty()) {
-                TimestampedVolume cur = temp.top(); temp.pop();
-                if (cur.timestamp == prev.timestamp) {
-                    decimal_t totalVol = cur.volume + prev.volume;
-                    cur.price = (cur.price * cur.volume + prev.price * prev.volume)/ totalVol; 
-                } else if (prev.price != decimal_t{}) {  // avoid division by zero, just in case
-                    double logret = std::log(util::decimal2double(cur.price) / util::decimal2double(prev.price));
-                    windowLogRets.push_back(logret);
-                } else {
-                    windowLogRets.push_back(0.0);
-                }
+    const bool wasEmpty = m_queue.empty();
+    const bool outOfOrder =
+        !wasEmpty && timestampedVolume.timestamp < m_queue.top().timestamp;
 
-                Timestamp period_seqnum = cur.timestamp / m_period;
-                m_priceHistory[period_seqnum] = util::decimal2double(cur.price);
-                // Update the log returns
-                if (period_seqnum == 0) {
-                    m_logRets[period_seqnum] = std::log(m_initPrice / m_priceHistory[period_seqnum]);
+    // Window pruning (mirrors the original): only when the new (newest) trade
+    // pushes the oldest out of the m_period window. Evaluated against the queue
+    // *before* inserting the new trade. Skipped for out-of-order arrivals.
+    if (!wasEmpty && !outOfOrder) {
+        const bool withinQueueWindow =
+            timestampedVolume.timestamp - m_queue.top().timestamp < m_period;
+        if (!withinQueueWindow) {
+            const Timestamp cutoff = timestampedVolume.timestamp - m_period;
+            while (!m_queue.empty() && m_queue.top().timestamp <= cutoff) {
+                m_rollingSum -= m_queue.top().volume;
+                m_queue.pop();
+            }
+            // Prune the incremental buckets by the same cutoff, dropping the
+            // log-return that bridged each removed front bucket to its successor.
+            while (!m_buckets.empty() && m_buckets.front().ts <= cutoff) {
+                if (m_buckets.size() >= 2) {
+                    const double logret = logretBetween(m_buckets[0], m_buckets[1]);
+                    m_logRetSum -= logret;
+                    m_logRetSumSq -= logret * logret;
                 }
-                else if (m_priceHistory.find(period_seqnum - 1) != m_priceHistory.end()) {
-                    m_logRets[period_seqnum] = std::log(m_priceHistory[period_seqnum] / m_priceHistory[period_seqnum - 1]);
-                }
-                prev = cur;
+                m_buckets.pop_front();
             }
         }
-        
-        m_variance = [&] {
-            namespace bacc = boost::accumulators;
-            bacc::accumulator_set<double, bacc::stats<bacc::tag::lazy_variance>> accum;
-            const auto n = windowLogRets.capacity();
-            for (auto logRet : windowLogRets) {
-                accum(logRet);
-            }
-            return bacc::variance(accum) * (n - 1) / n;
-        }();
-    };
-
-    if (m_queue.empty()) [[unlikely]] {
-        return acc();
     }
 
-    if (timestampedVolume.timestamp < m_queue.top().timestamp) [[unlikely]] {
-        // TODO add error recovery?
+    m_queue.push(timestampedVolume);
+    m_rollingSum += timestampedVolume.volume;
+
+    if (outOfOrder) [[unlikely]] {
+        // The bucket model assumes monotonically non-decreasing timestamps; an
+        // out-of-order arrival breaks the incremental invariants, so rebuild.
+        rebuildIncremental();
+    } else {
+        addTradeIncremental(timestampedVolume);
     }
 
-    const bool withinQueueWindow =
-        timestampedVolume.timestamp - m_queue.top().timestamp < m_period;
-    
-    if (!withinQueueWindow) {
-        const auto cutoff = timestampedVolume.timestamp - m_period;
-        do {
-            m_rollingSum -= m_queue.top().volume;
-            m_queue.pop();
-        } while (!m_queue.empty() && m_queue.top().timestamp <= cutoff);
-    }
-    
-    acc();
+    recomputeVariance();
 }
 
 //-------------------------------------------------------------------------

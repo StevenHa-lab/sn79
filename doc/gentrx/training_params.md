@@ -70,13 +70,14 @@ Training agents are triggered by an assignment arriving via dendrite. The assign
 
 | Param | Default | Notes |
 |---|---|---|
-| `gtx_train_steps` | 50 | Steps per training window |
-| `gtx_train_batch_size` | 16 | Bounded by GPU memory (shared with inference). Localnet / proxy launchers override to 8 for smaller GPUs. |
+| `gtx_train_steps` | 500 on cuda, 100 on cpu | Steps per training window. CPU default is 5× lower because CPU is roughly 50× slower per step; full 500 steps would push the cycle past the gradient-server's window. |
+| `gtx_train_batch_size` | 16 on cuda, 4 on cpu | Bounded by device memory (attention is quadratic in seq×batch). Localnet / proxy launchers override to 8 for smaller GPUs. |
 | `gtx_train_seq_len` | 256 | Shorter than pretrain; per-window speed matters more than long context. |
 | `gtx_train_lr` | 1e-4 | Same as pretrain |
-| `gtx_top_k_frac` | 0.01 | 1% retention, ~100× compression, ~500 KB gradient |
+| `gtx_top_k_frac` | 0.05 | 5% retention, ~20× compression |
+| `gtx_device` | `auto` | Device override. `auto` picks cuda if available else cpu. Set to `cpu` to force CPU even on GPU hosts (debugging, shared-host scenarios, memory analysis). The defaults above adjust based on the resolved device. |
 
-**Key trade-off.** `gtx_train_steps` controls how much each miner overfits per window. Shorter windows (50 steps) with more frequent aggregation generalise better than long windows (200+ steps) with fewer aggregations.
+**Key trade-off.** `gtx_train_steps` controls how much each miner overfits per window. Fewer steps per window with more frequent aggregation generalise better; more steps per window extract more from each round's data at the risk of overfitting before the next aggregation.
 
 ## Gradient server (aggregation)
 

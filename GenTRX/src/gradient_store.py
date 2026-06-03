@@ -286,8 +286,18 @@ class GradientStore:
     # Checkpoints
     # ------------------------------------------------------------------
 
-    def put_checkpoint(self, validator_uid: int | str, version: int, data: bytes) -> str:
-        """Upload a checkpoint and update this validator's latest pointer."""
+    def put_checkpoint(
+        self,
+        validator_uid: int | str,
+        version: int,
+        data: bytes,
+        meta: dict | None = None,
+    ) -> str:
+        """Upload a checkpoint and update this validator's latest pointer.
+
+        `meta` (e.g. train/spec version stamps) is merged into latest.json so
+        compatibility can be checked without downloading the full checkpoint.
+        """
         import json
 
         key = self._key(_CKPT_KEY, uid=validator_uid, version=version)
@@ -296,11 +306,28 @@ class GradientStore:
             "Uploaded checkpoint v%d (%d MB)", version, len(data) // (1024 * 1024)
         )
 
-        latest = json.dumps({"version": version, "key": key}).encode()
+        latest = json.dumps({"version": version, "key": key, **(meta or {})}).encode()
         latest_key = self._key(_LATEST_KEY, uid=validator_uid)
         self._put_with_retry(latest_key, latest)
 
         return key
+
+    def get_latest_meta(self, validator_uid: int | str) -> dict:
+        """Return the parsed latest.json pointer (version + any stamps). {} if none."""
+        import json
+
+        client = self._get_sync_client()
+        try:
+            resp = client.get_object(
+                Bucket=self.bucket,
+                Key=self._key(_LATEST_KEY, uid=validator_uid),
+            )
+            return json.loads(resp["Body"].read())
+        except client.exceptions.NoSuchKey:
+            return {}
+        except Exception as exc:
+            logger.debug("Failed to read latest.json meta: %s", exc)
+            return {}
 
     def get_latest_version(self, validator_uid: int | str) -> int:
         """Poll for the latest checkpoint version under <validator_uid>. Returns 0 if none."""
@@ -354,7 +381,14 @@ class GradientStore:
         latest = self.get_latest_version(validator_uid)
         if latest != best:
             ckpt_key = self._key(_CKPT_KEY, uid=validator_uid, version=best)
-            payload = json.dumps({"version": best, "key": ckpt_key}).encode()
+            # Preserve any version stamps already in latest.json; only the
+            # pointer is stale, not the regime the checkpoints were saved under.
+            meta = {
+                k: v
+                for k, v in self.get_latest_meta(validator_uid).items()
+                if k not in ("version", "key")
+            }
+            payload = json.dumps({"version": best, "key": ckpt_key, **meta}).encode()
             self._put_with_retry(self._key(_LATEST_KEY, uid=validator_uid), payload)
             logger.info("Repaired stale latest.json: %d → %d", latest, best)
         return best

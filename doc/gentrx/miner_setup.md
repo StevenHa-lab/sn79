@@ -356,11 +356,12 @@ Same five steps; training-only path, no order placement.
 | Param | Default | Description |
 |---|---|---|
 | `gtx_training_enabled` | `true` | Training is **on by default**. Set to `false` to opt out. |
-| `gtx_train_steps` | `50` | Iterations per training window. |
-| `gtx_train_batch_size` | `16` | Sequences per batch. Drop to `8` on tight VRAM (localnet launchers use `8`). |
+| `gtx_train_steps` | `500` (cuda), `100` (cpu) | Iterations per training window. CPU default is 5× lower because CPU is ~50× slower per step; full 500 would push the cycle past the gradient-server's window. |
+| `gtx_train_batch_size` | `16` (cuda), `4` (cpu) | Sequences per batch. Attention is quadratic in seq×batch, so smaller batch cuts CPU memory + per-step cost. Drop further to `8` on tight VRAM (localnet launchers use `8`). |
 | `gtx_train_seq_len` | `256` | Tokens per sequence (also min observations for inference). |
 | `gtx_train_lr` | `1e-4` | Learning rate per training window. |
-| `gtx_top_k_frac` | `0.01` | Gradient sparsification (1% retention ≈ 100× compression). |
+| `gtx_top_k_frac` | `0.05` | Gradient sparsification (5% retention ≈ 20× compression). |
+| `gtx_device` | `auto` | Device override. `auto` picks cuda if available else cpu. Set to `cpu` to force CPU on a GPU host (debugging / shared-host / memory analysis). Drives the `gtx_train_steps` and `gtx_train_batch_size` defaults above. |
 | `gtx_keep_gradients` | `50` | Hot-bucket retention. `gradients/<own-uid>/{round_id:08d}.grad` older than the newest N are deleted after every upload. `0` disables - recommend pairing with cold-storage mirror. |
 | `gtx_aggregator_uid` | `0` | UID of the canonical-checkpoint aggregator. Mainnet leaves this default; localnet uses `1`. |
 | `gtx_mode` | `simulation` | Bucket-prefix shard. Combined with the connected subtensor network (finney → `mainnet`, else `testnet`) to produce `gentrx/<network>/<mode>/`. Leave at `simulation` unless instructed otherwise; `exchange` reserves the prefix for future exchange-data training. |
@@ -373,7 +374,9 @@ Same five steps; training-only path, no order placement.
 |---|---|---|
 | `gtx_collect_data` | `true` | Write parquets locally. Launch examples pass `false`; set true only for offline analysis. See note below. |
 | `gtx_output_dir` | `agents/data/<uid>` | Local cache + log + (optional) parquet root. `<uid>` is your on-chain UID, set automatically by `run_miner.sh`. |
-| `gtx_flush_interval_ns` | `3_600_000_000_000` | Sim-time interval per parquet file (1h default). |
+| `gtx_flush_interval_ns` | `300_000_000_000` | Sim-time interval per parquet file (5 min default, matches the gradient server window). |
+| `gtx_max_pending_rows_per_book` | `50_000` | Row cap that forces an early partial-interval flush, bounding live memory under load. `0` disables the cap (time-only flush). |
+| `gtx_chunk_size` | `10_000` | Rows per in-memory columnar chunk before the live dicts are sealed to a batch. Lowers resident memory; does not change parquet output. |
 | `gtx_gradient_dir` | `<gtx_output_dir>/gradients` | Where local gradient pending dir + train.log live. |
 
 ### Inference (optional, experimental)
@@ -398,7 +401,7 @@ These belong to the trading strategy, not GenTRX:
 
 `gtx_collect_data` defaults to `true` in code, but the launch commands above pass `false`. For standard S3 training you do not need local collection: the miner receives training parquets from the validator bucket each round and uploads gradients to its own bucket. Enabling local collection costs CPU per tick (event replay through an internal matching engine) and disk (local parquet writes) with no effect on scoring.
 
-Set `gtx_collect_data=true` only if you want your miner's exposure written to disk as parquet for offline analysis, backfill, or audit. Output lands in `<gtx_output_dir>/<book_id>/<ddHHMMSS>-<ddHHMMSS>.parquet`, schema-compatible with the S3 parquets consumed by training. When enabled, training is triggered every `train_after_flushes` local flushes (default `3`) instead of on assignment arrival, so the cadence decouples from the validator.
+Set `gtx_collect_data=true` only if you want your miner's exposure written to disk as parquet for offline analysis, backfill, or audit. Output lands in `<gtx_output_dir>/<book_id>/intervals/<ddHHMMSS>-<ddHHMMSS>.parquet`, schema-compatible with the S3 parquets consumed by training. Collection runs in parallel with training and never changes the training cadence: training is always assignment-driven off the validator's rounds. The live buffer is memory-bounded by `gtx_chunk_size` and `gtx_max_pending_rows_per_book`, so collection stays flat under sustained load.
 
 ---
 

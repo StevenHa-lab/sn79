@@ -41,6 +41,7 @@ from typing import Any
 from fastapi import APIRouter, Request
 
 from GenTRX.src.gradient_store import GradientStore
+from GenTRX.src.version import TRAIN_REGIME_VERSION, checkpoint_stamp
 
 logger = logging.getLogger("GenTRX.src.gradient_server")
 
@@ -189,6 +190,7 @@ class GradientAggregator:
         min_score: float = -0.1,
         warmup_rounds: int = 5,
         rollback: bool = True,
+        label_smooth_sigma: float = 1.0,
         interval: float = 30.0,
         max_val_batches: int = 10,
         beta_alpha: float = 2.0,
@@ -246,6 +248,7 @@ class GradientAggregator:
         self.min_score = min_score
         self.warmup_rounds = warmup_rounds
         self.rollback = rollback
+        self.label_smooth_sigma = label_smooth_sigma
         self.interval = interval
         self.max_val_batches = max_val_batches
         self.beta_alpha = beta_alpha
@@ -1322,6 +1325,18 @@ class GradientAggregator:
                 return False
             if version <= self._version:
                 return False  # already current
+            try:
+                uid0_meta = store.get_latest_meta(0)
+                if int(uid0_meta.get("train_regime_version", 0)) < TRAIN_REGIME_VERSION:
+                    logger.warning(
+                        "uid-0 checkpoint v%d predates train regime %d — "
+                        "not syncing onto a newer-regime sibling",
+                        version,
+                        TRAIN_REGIME_VERSION,
+                    )
+                    return False
+            except Exception as exc:
+                logger.warning("Could not read uid-0 regime stamp: %s", exc)
 
             logger.info(
                 "Syncing from uid-0 checkpoint v%d → v%d at %s/%s",
@@ -1382,6 +1397,7 @@ class GradientAggregator:
                         "epoch": 0,
                         "step": 0,
                         "loss": float("inf"),
+                        **checkpoint_stamp(self.label_smooth_sigma),
                     },
                     self.checkpoint_path,
                 )
@@ -1404,19 +1420,39 @@ class GradientAggregator:
                     self._validator_uid
                 )
                 if existing_version > 0:
-                    # Bucket already has checkpoints — resume from the highest.
-                    # get_latest_existing_version() also repairs latest.json if stale.
+                    # Bucket already has checkpoints — resume from the highest,
+                    # unless its training regime predates ours. A regime bump
+                    # (e.g. strict→soft CE) makes the old model's scores
+                    # incomparable, so we keep its weights as init but force
+                    # warmup and drop the data/ collected under the old regime.
                     self._version = existing_version
-                    logger.info(
-                        "Resumed from existing checkpoint v%d in aggregator bucket",
-                        self._version,
-                    )
+                    if self._regime_incompatible():
+                        self._fresh_start = True
+                        self._data_cleanup_pending = True
+                        # Drop in-memory + local staging so the restores below
+                        # don't re-adopt data collected under the old regime;
+                        # the S3 data/ delete runs on the first loop tick.
+                        self._reset_sim_buffers()
+                        logger.warning(
+                            "Existing checkpoint v%d predates train regime %d — "
+                            "keeping weights as init, forcing %d warmup round(s) "
+                            "and queueing data/ cleanup",
+                            self._version,
+                            TRAIN_REGIME_VERSION,
+                            self.warmup_rounds,
+                        )
+                    else:
+                        logger.info(
+                            "Resumed from existing checkpoint v%d in aggregator bucket",
+                            self._version,
+                        )
                 else:
                     # Fresh bucket — upload local checkpoint as v1.
                     data = self.checkpoint_path.read_bytes()
                     self._version = 1
                     self.validator_store.put_checkpoint(
-                        self._validator_uid, self._version, data
+                        self._validator_uid, self._version, data,
+                        meta=checkpoint_stamp(self.label_smooth_sigma),
                     )
                     logger.info(
                         "Initial checkpoint uploaded to aggregator (v%d, %.1f MB)",
@@ -1429,11 +1465,13 @@ class GradientAggregator:
 
         # Restore in-progress parquet buffer from local staging file so a
         # restart continues filling the current window, not a fresh one.
-        self._restore_pending_rows()
-        # Restore written-parquet registry from S3 so a restart doesn't
-        # force a full 5-min re-accumulation before assignments can be created.
-        if self.validator_store is not None:
-            self._restore_written_parquets()
+        # Skipped on a regime change — that data is being discarded.
+        if not self._data_cleanup_pending:
+            self._restore_pending_rows()
+            # Restore written-parquet registry from S3 so a restart doesn't
+            # force a full 5-min re-accumulation before assignments can be created.
+            if self.validator_store is not None:
+                self._restore_written_parquets()
 
         self._running = True
         self._thread = threading.Thread(target=self._aggregation_loop, daemon=True)
@@ -2409,7 +2447,8 @@ class GradientAggregator:
 
             t_own_start = time.time()
             score_own = evaluate_gradient(
-                model, comp, miner_loader, device, self.max_val_batches
+                model, comp, miner_loader, device, self.max_val_batches,
+                self.label_smooth_sigma,
             )
             t_own = time.time() - t_own_start
 
@@ -2428,7 +2467,8 @@ class GradientAggregator:
             if held_loader is not None:
                 t_held_start = time.time()
                 score_held = evaluate_gradient(
-                    model, comp, held_loader, device, self.max_val_batches
+                    model, comp, held_loader, device, self.max_val_batches,
+                    self.label_smooth_sigma,
                 )
                 t_held = time.time() - t_held_start
                 overfitting = score_own > score_held * self.overfit_ratio
@@ -2735,7 +2775,8 @@ class GradientAggregator:
         if val_loader is not None:
             original_state = {k: v.clone() for k, v in model.state_dict().items()}
             baseline_loss, per_field_before = _eval_loss_per_field(
-                model, val_loader, device, self.max_val_batches
+                model, val_loader, device, self.max_val_batches,
+                self.label_smooth_sigma,
             )
 
             if self.is_aggregator:
@@ -2776,7 +2817,10 @@ class GradientAggregator:
                     model.load_state_dict(original_state)
                     delta = decompress(comp)
                     apply_gradient(model, delta)
-                    loss = _eval_loss(model, val_loader, device, self.max_val_batches)
+                    loss = _eval_loss(
+                        model, val_loader, device, self.max_val_batches,
+                        self.label_smooth_sigma,
+                    )
                     logger.info(
                         "  Proposal %s: val loss %.4f (baseline %.4f)",
                         label,
@@ -2798,7 +2842,8 @@ class GradientAggregator:
             apply_gradient(model, best_delta)
             if self.is_aggregator:
                 new_loss, per_field_after = _eval_loss_per_field(
-                    model, val_loader, device, self.max_val_batches
+                    model, val_loader, device, self.max_val_batches,
+                    self.label_smooth_sigma,
                 )
             else:
                 new_loss = best_loss
@@ -2876,6 +2921,7 @@ class GradientAggregator:
                 "step": self._version + 1,
                 "loss": new_loss,
                 "epoch": 0,
+                **checkpoint_stamp(self.label_smooth_sigma),
             }
             tmp_path = self.output_path.with_suffix(".tmp")
             torch.save(ckpt_dict, tmp_path)
@@ -2893,7 +2939,8 @@ class GradientAggregator:
                     torch.save(ckpt_dict, buf)
                     ckpt_bytes = len(buf.getvalue())
                     self.validator_store.put_checkpoint(
-                        self._validator_uid, self._version, buf.getvalue()
+                        self._validator_uid, self._version, buf.getvalue(),
+                        meta=checkpoint_stamp(self.label_smooth_sigma),
                     )
                     t_s3_put = time.time() - t_s3_start
                     self._prune_checkpoints()
@@ -3292,6 +3339,23 @@ class GradientAggregator:
         except Exception as exc:
             logger.debug("checkpoint prune failed: %s", exc)
 
+    def _regime_incompatible(self) -> bool:
+        """True when the bucket's latest checkpoint predates our train regime.
+
+        Reads only latest.json (no full checkpoint download). Missing stamp
+        reads as regime 0, below any current regime. Defaults to compatible
+        when the store or pointer is unreadable, so a transient read error
+        never forces a spurious warmup.
+        """
+        if self.validator_store is None:
+            return False
+        try:
+            meta = self.validator_store.get_latest_meta(self._validator_uid)
+        except Exception as exc:
+            logger.warning("Could not read checkpoint regime stamp: %s", exc)
+            return False
+        return int(meta.get("train_regime_version", 0)) < TRAIN_REGIME_VERSION
+
     def _read_bucket_sim_marker(self) -> str | None:
         if self.validator_store is None:
             return None
@@ -3412,7 +3476,14 @@ class GradientAggregator:
         timestamp decreases are ignored as states may arrive out of order.
         """
         from GenTRX.src.orderbook import MatchingEngine
-        from GenTRX.src.util.schema import ASK, BID, CANCEL, LOB_DEPTH
+        from GenTRX.src.util.schema import (
+            ASK,
+            BID,
+            CANCEL,
+            DEFAULT_PRICE_DECIMALS,
+            DEFAULT_VOLUME_DECIMALS,
+            LOB_DEPTH,
+        )
 
         # Sim lifecycle markers from state.notices. 'ESE' flags a sim end:
         # clear in-memory buffers so no sim-A tail contaminates sim-B ticks,
@@ -3508,11 +3579,24 @@ class GradientAggregator:
             return list(values[:depth]) + [0] * (depth - len(values))
 
         if self._price_scale is None:
-            cfg = tick.get("config", {}) or {}
-            pd = cfg.get("priceDecimals", 8)
-            vd = cfg.get("volumeDecimals", 8)
+            cfg = tick.get("config") or {}
+            pd = cfg.get("priceDecimals")
+            vd = cfg.get("volumeDecimals")
+            if pd is None or vd is None:
+                pd = DEFAULT_PRICE_DECIMALS
+                vd = DEFAULT_VOLUME_DECIMALS
+                logger.warning(
+                    "[GTX] state tick carried no decimals; falling back to "
+                    "canonical sim defaults pd=%d vd=%d. Scaling is wrong if "
+                    "the live sim differs.",
+                    pd,
+                    vd,
+                )
             self._price_scale = 10**pd
             self._vol_scale = 10**vd
+            logger.info(
+                "[GTX] bound price_scale=10^%d vol_scale=10^%d", pd, vd
+            )
 
         # Bind sim_id from any packet that carries one.
         new_sim_id = incoming_sim_id
@@ -3632,8 +3716,8 @@ class GradientAggregator:
                     ),
                 }
                 for i in range(LOB_DEPTH):
-                    row[f"lob_ask_vol_{i + 1}"] = float(ask_vols[i]) / self._price_scale
-                    row[f"lob_bid_vol_{i + 1}"] = float(bid_vols[i]) / self._price_scale
+                    row[f"lob_ask_vol_{i + 1}"] = float(ask_vols[i]) / self._vol_scale
+                    row[f"lob_bid_vol_{i + 1}"] = float(bid_vols[i]) / self._vol_scale
 
                 self._pending_rows[book_id].append(row)
                 engine.process_order(order_type, price_ticks, vol_ticks, is_buy)
@@ -4294,6 +4378,14 @@ if __name__ == "__main__":
     )
     parser.add_argument("--min-score", type=float, default=-0.1)
     parser.add_argument(
+        "--label-smooth-sigma",
+        type=float,
+        default=1.0,
+        help="Ordinal-aware soft-CE width in bins used for scoring (0 = strict "
+        "CE). MUST match the miners' --gtx-label-smooth-sigma, or gradient "
+        "scores compare losses the miners never trained against.",
+    )
+    parser.add_argument(
         "--warmup-rounds",
         type=int,
         default=5,
@@ -4588,6 +4680,7 @@ if __name__ == "__main__":
         interval=args.interval,
         min_score=args.min_score,
         warmup_rounds=args.warmup_rounds,
+        label_smooth_sigma=args.label_smooth_sigma,
         max_val_batches=args.max_val_batches,
         books_per_miner=args.books_per_miner,
         val_fraction=args.val_fraction,

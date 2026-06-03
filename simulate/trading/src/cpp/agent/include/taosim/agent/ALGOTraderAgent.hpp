@@ -12,6 +12,7 @@
 #include "Order.hpp"
 #include "Trade.hpp"
 
+#include <deque>
 #include <memory>
 #include <queue>
 #include <random>
@@ -78,8 +79,6 @@ public:
     // TODO: Wrap state into a struct and provide a single access point here.
     [[nodiscard]] auto&& queue(this auto&& self) noexcept { return self.m_queue; }
     [[nodiscard]] auto&& rollingSum(this auto&& self) noexcept { return self.m_rollingSum; }
-    [[nodiscard]] auto&& priceHistory(this auto&& self) noexcept { return self.m_priceHistory; }
-    [[nodiscard]] auto&& logRets(this auto&& self) noexcept { return self.m_logRets; }
     [[nodiscard]] auto&& priceLast(this auto&& self) noexcept { return self.m_priceLast; }
     [[nodiscard]] auto&& variance(this auto&& self) noexcept { return self.m_variance; }
     [[nodiscard]] auto&& estimatedVol(this auto&& self) noexcept { return self.m_estimatedVol; }
@@ -94,6 +93,22 @@ private:
     [[nodiscard]] double volumeSum(std::span<const BookLevel> side, size_t depth = 5);
     [[nodiscard]] const BookStat& lastSlopes() const { return m_bookSlopes.at(m_lastSeq); }
     [[nodiscard]] const BookStat& lastVolume() const { return m_bookVolumes.at(m_lastSeq); }
+
+    // Incremental volume-window state for the log-return variance. A VWAP bucket
+    // per distinct timestamp in the m_period window; the variance is maintained
+    // from running Σlogret / Σlogret² instead of rescanning the whole window on
+    // every push. See ALGOTraderAgent.cpp.
+    struct VolBucket
+    {
+        Timestamp ts;
+        decimal_t sumVol;       // Σ volume at this exact timestamp
+        decimal_t sumPriceVol;  // Σ price*volume at this timestamp (VWAP numerator)
+    };
+    [[nodiscard]] double bucketPriceDouble(const VolBucket& b) const noexcept;
+    [[nodiscard]] double logretBetween(const VolBucket& prev, const VolBucket& cur) const noexcept;
+    void addTradeIncremental(const TimestampedVolume& tv);
+    void rebuildIncremental();
+    void recomputeVariance() noexcept;
 
     // Parameters, injections.
     Timestamp m_period;
@@ -110,11 +125,15 @@ private:
         std::vector<TimestampedVolume>,
         std::greater<TimestampedVolume>> m_queue;
     decimal_t m_rollingSum{};
-    std::map<Timestamp, double> m_priceHistory;  // Timestamped price history, close price (VWAP per exact timestamp)
-    std::map<Timestamp, double> m_logRets; 
     double m_priceLast;
-    double m_variance;
+    double m_variance{0.0};
     double m_estimatedVol;
+    // Incremental window state (NOT checkpoint-serialized; rebuilt lazily from
+    // m_queue on the first push, including after a checkpoint restore).
+    std::deque<VolBucket> m_buckets;
+    double m_logRetSum{0.0};
+    double m_logRetSumSq{0.0};
+    bool m_incBuilt{false};
     Timestamp m_lastSeq;
     std::map<Timestamp, BookStat> m_bookSlopes; 
     std::map<Timestamp, BookStat> m_bookVolumes;

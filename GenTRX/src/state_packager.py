@@ -36,9 +36,64 @@ as a separate process — single-machine deployments use a loopback URL.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, TypedDict
 
 logger = logging.getLogger(__name__)
+
+
+class OrderEvent(TypedDict):
+    y: str  # "o"
+    s: int
+    i: int
+    p: float
+    q: float
+    t: int
+
+
+class TradeEvent(TypedDict):
+    y: str  # "t"
+    Ti: int
+    Mi: int
+    p: float
+    q: float
+    t: int
+    s: int
+
+
+class CancelEvent(TypedDict):
+    y: str  # "c"
+    s: int
+    i: int
+    p: float
+    q: float
+    t: int
+
+
+Event = OrderEvent | TradeEvent | CancelEvent
+
+
+class BookPacket(TypedDict):
+    bids: list[list[float]]
+    asks: list[list[float]]
+    events: list[Event]
+
+
+class ConfigPacket(TypedDict, total=False):
+    priceDecimals: int
+    volumeDecimals: int
+    simulation_id: str | None
+
+
+class _TickBase(TypedDict):
+    step: int
+    ts: int
+    books: dict[int, BookPacket]
+
+
+class TickPacket(_TickBase, total=False):
+    sim_events: list[str]
+    config: ConfigPacket
+    sim_id: str
 
 
 def _val(obj: Any, key: str, default: Any = None) -> Any:
@@ -108,17 +163,20 @@ _SIM_EVENT_CODES = {"ESS", "ESE"}
 def _extract_sim_events(state: Any) -> list[str]:
     """Return abbreviated sim-lifecycle event codes present on this tick.
 
-    Walks `state.notices` (or the raw dict equivalent) and returns any
-    'ESS' (SimulationStartEvent) or 'ESE' (SimulationEndEvent) codes
-    found. Empty list when neither is present, which is the vast majority
-    of ticks.
+    `state.notices` is `dict[uid] -> list[event]` (ESS/ESE carry no agentId
+    so the protocol broadcasts them into every uid's list); a flat list is
+    tolerated too. Returns any 'ESS' (SimulationStartEvent) or 'ESE'
+    (SimulationEndEvent) codes found, deduped. Empty on the vast majority of
+    ticks.
     """
-    notices = _val(state, "notices", []) or []
+    notices = _val(state, "notices", None) or {}
+    groups = notices.values() if isinstance(notices, dict) else [notices]
     out: list[str] = []
-    for n in notices:
-        code = _val(n, "y") or _val(n, "type")
-        if code in _SIM_EVENT_CODES and code not in out:
-            out.append(code)
+    for group in groups:
+        for n in group or []:
+            code = _val(n, "y") or _val(n, "type")
+            if code in _SIM_EVENT_CODES and code not in out:
+                out.append(code)
     return out
 
 
@@ -134,10 +192,10 @@ class StatePackager:
         self._config_saved: bool = False
         self._current_sim_id: str | None = None
 
-    def extract_state(self, state: Any) -> dict:
-        """Extract books + events + timestamp from state into a tick dict."""
+    def extract_state(self, state: Any) -> TickPacket:
+        """Extract books + events + timestamp from state into a tick packet."""
         books = _val(state, "books") or {}
-        packed_books = {}
+        packed_books: dict[int, BookPacket] = {}
 
         for book_id, book in books.items():
             bids = [
@@ -155,9 +213,9 @@ class StatePackager:
                 "events": events,
             }
 
-        packet = {
+        packet: TickPacket = {
             "step": self._step,
-            "ts": _get(state, "timestamp", 0),
+            "ts": int(_get(state, "timestamp", 0)),
             "books": packed_books,
         }
 
@@ -175,19 +233,16 @@ class StatePackager:
                 self._current_sim_id = None
 
         if not self._config_saved:
-            config = _val(state, "config", {})
-            sim_id = _get(config, "simulation_id", None)
-            packet["config"] = {
-                "priceDecimals": _get(config, "priceDecimals", 8),
-                "volumeDecimals": _get(config, "volumeDecimals", 8),
-                "simulation_id": sim_id,
-            }
-            if sim_id is not None:
-                self._config_saved = True
-                self._current_sim_id = sim_id
+            config = self._extract_config(state)
+            if config is not None:
+                packet["config"] = config
+                sim_id = config.get("simulation_id")
+                if sim_id is not None:
+                    self._config_saved = True
+                    self._current_sim_id = sim_id
 
         if self._current_sim_id is None:
-            cur = _get(_val(state, "config", {}), "simulation_id", None)
+            cur = _get(_val(state, "config", None), "simulation_id", None)
             if cur is not None:
                 self._current_sim_id = cur
 
@@ -197,7 +252,38 @@ class StatePackager:
         self._step += 1
         return packet
 
-    def _extract_events(self, book: Any) -> list[dict]:
+    def _extract_config(self, state: Any) -> ConfigPacket | None:
+        """Build the config block from state, or None when state has no config.
+
+        Never fabricates decimal precision. The simulator's config carries
+        priceDecimals/volumeDecimals as required fields, so a tick missing them
+        is a real misconfiguration: those keys are omitted (not defaulted) and
+        logged, leaving the gradient server to decide rather than silently
+        binding a wrong price/volume scale.
+        """
+        config = _val(state, "config", None)
+        if config is None:
+            return None
+
+        out: ConfigPacket = {}
+        pd = _get(config, "priceDecimals", None)
+        vd = _get(config, "volumeDecimals", None)
+        sim_id = _get(config, "simulation_id", None)
+        if pd is not None:
+            out["priceDecimals"] = int(pd)
+        if vd is not None:
+            out["volumeDecimals"] = int(vd)
+        if pd is None or vd is None:
+            logger.warning(
+                "state config present but missing decimals "
+                "(priceDecimals=%s, volumeDecimals=%s); omitting from packet",
+                pd,
+                vd,
+            )
+        out["simulation_id"] = sim_id
+        return out
+
+    def _extract_events(self, book: Any) -> list[Event]:
         """Extract raw event dicts from book (no matching engine).
 
         Includes trade events (y="t") so the gradient server can reconstruct
@@ -205,7 +291,7 @@ class StatePackager:
         so we need Trade.taker_id + Trade.quantity to recover the full volume.
         """
         events = _get(book, "events") or []
-        out = []
+        out: list[Event] = []
         for e in events:
             if _is_trade(e):
                 out.append(

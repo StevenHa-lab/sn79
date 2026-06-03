@@ -103,6 +103,10 @@ class FinanceSimulationAgent(SimulationAgent):
             None
         """
         self.history = []
+        # State snapshots kept for handlers that read self.history (e.g. last
+        # bid/ask). 0 keeps none — set it on agents that never read history to
+        # avoid retaining full state copies.
+        self.history_len = int(getattr(config, "history_len", 10))
         self.accounts = {}
         self.event_history : dict[str, AgentEventHistory | None] = {}
         if not hasattr(config, "lazy_load"):
@@ -351,8 +355,11 @@ class FinanceSimulationAgent(SimulationAgent):
         Returns:
             None
         """
-        self.history.append(state.model_copy())
-        self.history = self.history[-10:]
+        if self.history_len:
+            self.history.append(state.model_copy())
+            self.history = self.history[-self.history_len:]
+        else:
+            self.history = []
         self.simulation_config = state.config
         self.accounts = state.accounts[self.uid]
         self.events = state.notices[self.uid]

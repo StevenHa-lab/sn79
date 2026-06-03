@@ -144,14 +144,6 @@ struct convert<taosim::agent::ALGOTraderVolumeStats>
             else if (key == "rollingSum") {
                 v.rollingSum() = val.as<taosim::decimal_t>();
             }
-            else if (key == "priceHistory") {
-                using T = std::remove_cvref_t<decltype(v.priceHistory())>;
-                v.priceHistory() = val.as<T>();
-            }
-            else if (key == "logRets") {
-                using T = std::remove_cvref_t<decltype(v.logRets())>;
-                v.logRets() = val.as<T>();
-            }
             else if (key == "priceLast") {
                 v.priceLast() = val.as<double>();
             }
@@ -185,19 +177,13 @@ struct pack<taosim::agent::ALGOTraderVolumeStats>
     msgpack::packer<Stream>& operator()(
         msgpack::packer<Stream>& o, const taosim::agent::ALGOTraderVolumeStats& v) const
     {
-        o.pack_map(10);
+        o.pack_map(8);
 
         o.pack("queue");
         o.pack(v.queue());
 
         o.pack("rollingSum");
         o.pack(v.rollingSum());
-
-        o.pack("priceHistory");
-        o.pack(v.priceHistory());
-
-        o.pack("logRets");
-        o.pack(v.logRets());
 
         o.pack("priceLast");
         o.pack(v.priceLast());

@@ -14,7 +14,7 @@ Usage:
     delta = train_window(model, dataloader, WindowConfig(n_steps=100), device)
 
     # Compress and share
-    compressed = compress(delta, top_k_frac=0.01)
+    compressed = compress(delta, top_k_frac=0.05)
     data = serialize(compressed)  # → bytes for upload
 
     # Validator side: score a gradient
@@ -57,6 +57,7 @@ class WindowConfig:
     window_id: int = 0
     miner_uid: int = 0
     model_version: int = 0
+    label_smooth_sigma: float = 0.0
 
 
 def train_window(
@@ -102,7 +103,7 @@ def train_window(
             batch = next(data_iter)
 
         logits, labels = _forward_batch(model, batch, device)
-        loss, _ = compute_loss(logits, labels)
+        loss, _ = compute_loss(logits, labels, label_smooth_sigma=config.label_smooth_sigma)
 
         if not math.isfinite(loss.item()):
             logger.error("NaN/Inf loss at window step %d — stopping window", step)
@@ -134,6 +135,13 @@ def train_window(
 
     delta = extract_delta(theta_before, theta_after, metadata)
 
+    # Three full state-dict copies (theta_before, theta_after, delta) plus
+    # the optimizer's Adam state buffers (2× model params) all live
+    # simultaneously here. Drop the two snapshots and the optimizer before
+    # returning so the caller's compress() works against a lower
+    # high-water mark.
+    del theta_before, theta_after, optimizer
+
     logger.info(
         "Window %d (miner %d): %d steps in %.1fs, loss %.4f → %.4f, Δnorm=%.4f",
         config.window_id,
@@ -154,11 +162,14 @@ def evaluate_gradient(
     val_loader: DataLoader,
     device: str = "cpu",
     max_batches: int = 50,
+    label_smooth_sigma: float = 0.0,
 ) -> float:
     """Score a gradient by the loss improvement it produces.
 
     Computes loss_before on the current model, applies the gradient,
     computes loss_after, then **rolls back** the model to its original state.
+    `label_smooth_sigma` must match what the miner trained under, or the
+    before/after comparison is across two different losses.
 
     Returns:
         score = loss_before - loss_after (positive = improvement)
@@ -166,13 +177,13 @@ def evaluate_gradient(
     # Snapshot current state for rollback
     original_state = {k: v.clone() for k, v in model.state_dict().items()}
 
-    loss_before = _eval_loss(model, val_loader, device, max_batches)
+    loss_before = _eval_loss(model, val_loader, device, max_batches, label_smooth_sigma)
 
     # Apply gradient
     delta = decompress(gradient)
     apply_gradient(model, delta)
 
-    loss_after = _eval_loss(model, val_loader, device, max_batches)
+    loss_after = _eval_loss(model, val_loader, device, max_batches, label_smooth_sigma)
 
     # Rollback
     model.load_state_dict(original_state)
@@ -194,6 +205,7 @@ def _eval_loss(
     loader: DataLoader,
     device: str,
     max_batches: int,
+    label_smooth_sigma: float = 0.0,
 ) -> float:
     """Compute average loss over up to max_batches."""
     model.eval()
@@ -204,7 +216,7 @@ def _eval_loss(
             if i >= max_batches:
                 break
             logits, labels = _forward_batch(model, batch, device)
-            loss, _ = compute_loss(logits, labels)
+            loss, _ = compute_loss(logits, labels, label_smooth_sigma=label_smooth_sigma)
             total += loss.item()
             n += 1
     model.train()
@@ -216,6 +228,7 @@ def _eval_loss_per_field(
     loader: DataLoader,
     device: str,
     max_batches: int,
+    label_smooth_sigma: float = 0.0,
 ) -> tuple[float, dict[str, float]]:
     """Like `_eval_loss` but also returns the per-field CE breakdown."""
     model.eval()
@@ -227,7 +240,7 @@ def _eval_loss_per_field(
             if i >= max_batches:
                 break
             logits, labels = _forward_batch(model, batch, device)
-            loss, details = compute_loss(logits, labels)
+            loss, details = compute_loss(logits, labels, label_smooth_sigma=label_smooth_sigma)
             total += loss.item()
             for name, val in details.items():
                 per_field_sum[name] = per_field_sum.get(name, 0.0) + val

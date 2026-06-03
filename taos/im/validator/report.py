@@ -173,6 +173,19 @@ class ReportingService:
             'gentrx': self.registry_gentrx,
         }
 
+        # Child-handle / last-value cache for the persistent gauge families
+        # (agent_gauges, miner_gauges, book_gauges, simulation_gauges). Keyed by
+        # (id(gauge), label_tuple) -> [child, last_value]. The apply loop resolves
+        # the Prometheus child once and skips the lock+tuple-normalize that
+        # gauge.labels() pays on every call, and skips the .set() entirely when
+        # the value is unchanged from the prior cycle. This is the hot path at
+        # full cardinality (~1.6M agent_gauges updates/cycle on mainnet's
+        # 128 books x ~256 miners). Cleared families (trades/books/miner_trades)
+        # are NOT cached — their children are destroyed each cycle. Entries are
+        # evicted via _remove_and_evict on every .remove(), and the whole cache
+        # is reset on simulation changeover (clear_all_metrics).
+        self._child_cache = {}
+
         self.prometheus_counters = Counter('counters', 'Counter summaries for the running validator.', ['wallet', 'netuid', 'sim_id', 'timestamp', 'counter_name'], registry=self.registry_validator)
         self.prometheus_simulation_gauges = Gauge('simulation_gauges', 'Gauge summaries for global simulation metrics.', ['wallet', 'netuid', 'sim_id', 'simulation_gauge_name'], registry=self.registry_simulation)
         self.prometheus_validator_gauges = Gauge('validator_gauges', 'Gauge summaries for validator-related metrics.', ['wallet', 'netuid', 'sim_id', 'validator_gauge_name'], registry=self.registry_validator)
@@ -242,7 +255,10 @@ class ReportingService:
             self.prometheus_miner_trades.clear()
             self.prometheus_books.clear()
             self.prometheus_miners.clear()
-            self.prometheus_info.clear()            
+            self.prometheus_info.clear()
+            # Cached children now point at removed series — drop the cache so the
+            # next cycle re-resolves fresh handles.
+            self._child_cache.clear()
             bt.logging.success(f"All metrics cleared ({time.time()-start:.4f}s)")
         except Exception as e:
             bt.logging.error(f"Error clearing metrics: {e}")
@@ -655,12 +671,54 @@ def _set_if_changed(gauge, value, *labels):
     Returns:
         None
     """
+    # gauge.labels() is the dominant cost of the apply loop (acquires the
+    # collector lock, normalizes the label tuple, dict-lookup/create the child)
+    # and runs ~1.8M times per reporting cycle. Resolve the child ONCE and reuse
+    # it for both the read and the write: the previous form called labels()
+    # twice on every changed series, roughly doubling the per-update cost.
+    # labels() creates the child if absent, so the old KeyError branch is moot.
+    child = gauge.labels(*labels)
+    if child._value.get() != value:
+        child.set(value)
+
+def _set_cached(cache, gauge, value, labels):
+    """Set a gauge value via a persistent child-handle / last-value cache.
+
+    For the persistent gauge families this is the hot path. On a cache hit the
+    only work is a dict lookup and a float comparison; gauge.labels() (lock +
+    label-tuple normalization + dict lookup) and a locked _value.get() are paid
+    only on first sight of a series. Unchanged values short-circuit with no
+    Prometheus interaction at all.
+
+    Args:
+        cache: dict keyed by (id(gauge), labels) -> [child, last_value].
+        gauge: Prometheus gauge object.
+        value: New value to set.
+        labels: Tuple of positional label values.
+    """
+    ck = (id(gauge), labels)
+    entry = cache.get(ck)
+    if entry is None:
+        child = gauge.labels(*labels)
+        child.set(value)
+        cache[ck] = [child, value]
+        return
+    if entry[1] != value:
+        entry[0].set(value)
+        entry[1] = value
+
+def _remove_and_evict(cache, gauge, *labels):
+    """Remove a gauge series and evict any cached handle for it.
+
+    Eviction is required so that if the series reappears with the same value it
+    was last set to, _set_cached re-creates it rather than short-circuiting on a
+    stale last-value entry and leaving the series absent from the registry.
+    """
     try:
-        current = gauge.labels(*labels)._value.get()
-        if current != value:
-            gauge.labels(*labels).set(value)
+        gauge.remove(*labels)
     except KeyError:
-        gauge.labels(*labels).set(value)
+        pass
+    cache.pop((id(gauge), labels), None)
 
 def _set_if_changed_metric(gauge, value, **labels):
     """
@@ -674,12 +732,10 @@ def _set_if_changed_metric(gauge, value, **labels):
     Returns:
         None
     """
-    try:
-        current = gauge.labels(**labels)._value.get()
-    except KeyError:
-        current = None
-    if current != value:
-        gauge.labels(**labels).set(value)
+    # Single labels() lookup reused for read + write (see _set_if_changed).
+    child = gauge.labels(**labels)
+    if child._value.get() != value:
+        child.set(value)
 
 def report_worker(validator_data: Dict, state_data: Dict) -> Dict:
     """
@@ -1012,10 +1068,8 @@ async def report(self: ReportingService) -> None:
                                 self.fundamental_price[bookId],
                                 wallet_addr, netuid, simid, bookId, 0, "fundamental_price"))
                         else:
-                            try:
-                                book_gauges.remove(wallet_addr, netuid, simid, bookId, 0, "fundamental_price")
-                            except KeyError:
-                                pass
+                            _remove_and_evict(self._child_cache, book_gauges,
+                                wallet_addr, netuid, simid, bookId, 0, "fundamental_price")
 
                     updates.append((book_gauges, last_trade['p'],
                         wallet_addr, netuid, simid, bookId, 0, "trade_price"))
@@ -1206,22 +1260,13 @@ async def report(self: ReportingService) -> None:
                     if kappas['books'][bookId] is not None:
                         updates.append((agent_gauges, kappas['books'][bookId], wallet_addr, netuid, simid, bookId, agentId, "kappa"))
                     else:
-                        try:
-                            agent_gauges.remove(wallet_addr, netuid, simid, bookId, agentId, "kappa")
-                        except KeyError:
-                            pass
+                        _remove_and_evict(self._child_cache, agent_gauges, wallet_addr, netuid, simid, bookId, agentId, "kappa")
                     if 'books_weighted' in kappas and kappas['books_weighted'][bookId] is not None:
                         updates.append((agent_gauges, kappas['books_weighted'][bookId], wallet_addr, netuid, simid, bookId, agentId, "weighted_kappa"))
                     else:
-                        try:
-                            agent_gauges.remove(wallet_addr, netuid, simid, bookId, agentId, "weighted_kappa")
-                        except KeyError:
-                            pass
+                        _remove_and_evict(self._child_cache, agent_gauges, wallet_addr, netuid, simid, bookId, agentId, "weighted_kappa")
                 else:
-                    try:
-                        agent_gauges.remove(wallet_addr, netuid, simid, bookId, agentId, "kappa")
-                    except KeyError:
-                        pass       
+                    _remove_and_evict(self._child_cache, agent_gauges, wallet_addr, netuid, simid, bookId, agentId, "kappa")
         bt.logging.debug(f"Agent book metrics collected ({time.time()-start:.4f}s).")
 
         bt.logging.debug(f"Collecting miner trade metrics...")
@@ -1316,22 +1361,13 @@ async def report(self: ReportingService) -> None:
                 if m['pnl_score'] is not None:
                     updates.append((miner_gauges, m['pnl_score'], wallet_addr, netuid, simid, agentId, "pnl_score"))
                 else:
-                    try:
-                        miner_gauges.remove(wallet_addr, netuid, simid, agentId, "pnl_score")
-                    except KeyError:
-                        pass
+                    _remove_and_evict(self._child_cache, miner_gauges, wallet_addr, netuid, simid, agentId, "pnl_score")
                 if m['combined_score'] is not None:
                     updates.append((miner_gauges, m['combined_score'], wallet_addr, netuid, simid, agentId, "combined_score"))
                 else:
-                    try:
-                        miner_gauges.remove(wallet_addr, netuid, simid, agentId, "combined_score")
-                    except KeyError:
-                        pass
+                    _remove_and_evict(self._child_cache, miner_gauges, wallet_addr, netuid, simid, agentId, "combined_score")
             else:
-                try:
-                    miner_gauges.remove(wallet_addr, netuid, simid, agentId, "kappa")
-                except KeyError:
-                    pass
+                _remove_and_evict(self._child_cache, miner_gauges, wallet_addr, netuid, simid, agentId, "kappa")
 
             updates.append((miner_gauges, m['unnormalized_score'], wallet_addr, netuid, simid, agentId, "unnormalized_score"))
             updates.append((miner_gauges, m['score'], wallet_addr, netuid, simid, agentId, "score"))
@@ -1398,12 +1434,18 @@ async def report(self: ReportingService) -> None:
         apply_start = time.time()
         GAUGES_TO_CLEAR = {self.prometheus_trades, self.prometheus_books, self.prometheus_miner_trades}
         cleared_metrics = set()
+        cache = self._child_cache
         for update in updates:
-            gauge = update[0]            
-            if gauge in GAUGES_TO_CLEAR and gauge not in cleared_metrics:
-                gauge.clear()
-                cleared_metrics.add(gauge)            
-            _set_if_changed(*update)
+            gauge = update[0]
+            if gauge in GAUGES_TO_CLEAR:
+                # Cleared families are rebuilt every cycle (rolling slot buffers);
+                # their children don't survive the clear, so they bypass the cache.
+                if gauge not in cleared_metrics:
+                    gauge.clear()
+                    cleared_metrics.add(gauge)
+                _set_if_changed(*update)
+            else:
+                _set_cached(cache, gauge, update[1], update[2:])
         bt.logging.info(f"Applied {len(updates)} updates in {time.time()-apply_start:.4f}s")
         
         bt.logging.info(f"Metrics Published for Step {report_step} ({time.time()-report_start}s).")

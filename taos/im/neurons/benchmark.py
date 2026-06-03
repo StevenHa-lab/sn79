@@ -22,6 +22,17 @@ Benchmark miner neuron: runs a deterministic reference agent with a fixed
 validator-assigned UID (>= 256), bypassing on-chain registration.
 """
 
+# Cap glibc malloc arenas to bound RSS growth. Each training-cycle thread
+# otherwise gets its own arena (default 8×CPU) and arenas are never returned
+# to the OS, so per-cycle thread creation leaks ~1.2 GB of anonymous CPU
+# memory per round. Re-exec once with MALLOC_ARENA_MAX set so glibc sees it
+# before allocating any arenas. Only triggers on direct script execution.
+if __name__ == "__main__":
+    import os, sys
+    if os.environ.get("MALLOC_ARENA_MAX") is None:
+        os.environ["MALLOC_ARENA_MAX"] = "2"
+        os.execvp(sys.executable, [sys.executable] + sys.argv)
+
 if __name__ != "__mp_main__":
     import time
     import copy

@@ -40,7 +40,14 @@ Data collection params:
                                     In-memory event processing still runs (needed
                                     for inference buffer). Default: true
     gtx_flush_interval_ns  (int):   Nanoseconds of sim time per parquet file.
-                                    Default: 3_600_000_000_000 (1 hour)
+                                    Default: 300_000_000_000 (5 min, matches the
+                                    gradient server interval and training window)
+    gtx_chunk_size         (int):   Rows per in-memory columnar chunk. Bounds
+                                    the live list[dict] footprint. Default: 10_000
+    gtx_max_pending_rows_per_book (int): Row cap that triggers an early
+                                    partial-interval flush. 0 = time-only
+                                    (no row cap). Default: 50_000 (matches the
+                                    gradient server)
 
 Inference params:
     gtx_checkpoint        (str):   Path to GenTRX .pt checkpoint.
@@ -52,11 +59,23 @@ Inference params:
 
 Training params:
     gtx_training_enabled  (bool):  Enable assignment-driven training. Default: true
-    gtx_train_steps       (int):   Steps per training window. Default: 50
-    gtx_train_batch_size  (int):   Batch size. Default: 16
+    gtx_train_steps       (int):   Steps per training window. Default:
+                                   500 on cuda, 100 on cpu (CPU is much slower
+                                   per step; 5× fewer steps keeps cycle wall-
+                                   time reasonable).
+    gtx_train_batch_size  (int):   Batch size. Default: 16 on cuda, 4 on cpu
+                                   (attention is quadratic in seq×batch;
+                                   smaller batch cuts CPU memory + per-step
+                                   cost without changing data semantics).
     gtx_train_seq_len     (int):   Sequence length (also min observations). Default: 256
     gtx_train_lr          (float): Learning rate. Default: 1e-4
-    gtx_top_k_frac        (float): Gradient compression ratio. Default: 0.01
+    gtx_top_k_frac        (float): Gradient compression ratio. Default: 0.05
+    gtx_label_smooth_sigma (float): Soft-CE width in bins (0 = strict). Must
+                                    match the gradient server. Default: 1.0
+    gtx_device            (str):   Device override ("cpu", "cuda", "cuda:0", or
+                                   "auto"). Default: "auto" (cuda if available
+                                   else cpu). Force cpu to bypass GPU for
+                                   debugging or shared-host scenarios.
     gtx_gradient_dir      (str):   Where to save gradients. Default: <gtx_output_dir>/gradients/
     gtx_aggregator_uid    (int):   UID of the canonical-checkpoint aggregator. Default: 0.
     gtx_mode              (str):   Training mode shard for bucket keys ("simulation"
@@ -121,10 +140,17 @@ class BookBuffer:
     # order_id → is_buy: needed to route Cancellations to the correct side.
     # Entries removed on cancel or full fill; only resting limit orders remain.
     order_sides: dict[int, bool] = field(default_factory=dict)
+    # Live dict chunk: bounded to chunk_size rows under collection. Sealed
+    # chunks move to batches as columnar RecordBatches (~10× smaller).
     events: list[dict[str, Any]] = field(default_factory=list)
+    batches: list[pa.RecordBatch] = field(default_factory=list)
     last_ts: int = 0
     session_open_mid: int | None = None
     current_interval_start: int = 0
+    # Flushes already written for current_interval_start; >0 only when a row
+    # cap forces multiple partials in one interval. Resets when the interval
+    # advances. Names the `_NNNN` suffix without touching the filesystem.
+    flush_seq: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +175,8 @@ class _GenTRXState:
     output_dir: Path
     flush_interval_ns: int
     collect_data: bool
+    chunk_size: int
+    max_pending_rows_per_book: int
 
     # ---- Inference config ----
     n_trajectories: int
@@ -168,6 +196,7 @@ class _GenTRXState:
     top_k_frac: float
     keep_gradients: int
     train_lr: float
+    label_smooth_sigma: float
     gradient_dir: Path
 
     # ---- Model state ----
@@ -231,14 +260,23 @@ class GenTRXAgent(FinanceSimulationAgent):
             getattr(self.config, "gtx_output_dir", "")
             or default_output_dir(self.uid)
         )
-        # Interval-aligned flush: 1 hour default, 10 min for local test
+        # Interval-aligned flush: 5 min sim time, matching the gradient server's
+        # parquet_interval_ns (and the training window).
         g.flush_interval_ns = int(
-            getattr(self.config, "gtx_flush_interval_ns", 3_600_000_000_000)
+            getattr(self.config, "gtx_flush_interval_ns", 300_000_000_000)
         )
         # Set gtx_collect_data=false on pure training agents that read data from
         # S3. In-memory event processing still runs to keep the inference buffer
         # live.
         g.collect_data = _cfg_bool(self.config, "gtx_collect_data", True)
+        # Live dicts are sealed into columnar batches every chunk_size rows so
+        # the in-memory list[dict] cost stays bounded to one chunk.
+        g.chunk_size = max(1, int(getattr(self.config, "gtx_chunk_size", 10_000)))
+        # Row cap that forces an early partial-interval flush, matching the
+        # gradient server default. 0 disables the cap (time-only flush).
+        g.max_pending_rows_per_book = max(
+            0, int(getattr(self.config, "gtx_max_pending_rows_per_book", 50_000))
+        )
 
         # ---- Inference config ----
         g.n_trajectories = int(getattr(self.config, "gtx_n_trajectories", 0))
@@ -250,6 +288,23 @@ class GenTRXAgent(FinanceSimulationAgent):
         # training (GPU contention, memory pressure).
         g.inference_enabled = g.n_trajectories > 0
 
+        # ---- Device selection (set once; _load_model picks it up later) ----
+        # Override precedence:
+        #   1. gtx_device agent param (explicit: "cpu", "cuda", "cuda:0", "auto")
+        #   2. "auto" or unset → torch.cuda.is_available() ? "cuda" : "cpu"
+        # Resolved here (before the training-config block) because several
+        # training defaults below depend on whether we're on GPU or CPU.
+        _device_cfg = str(getattr(self.config, "gtx_device", "auto") or "auto").strip().lower()
+        if _device_cfg in ("", "auto"):
+            try:
+                import torch as _torch
+                g.device = "cuda" if _torch.cuda.is_available() else "cpu"
+            except Exception:
+                g.device = "cpu"
+        else:
+            g.device = _device_cfg
+        _is_cuda = g.device.startswith("cuda")
+
         # ---- Training config ----
         g.training_enabled = _cfg_bool(self.config, "gtx_training_enabled", True)
         # When set, the agent forwards each /gentrx/assignment payload to a
@@ -259,15 +314,23 @@ class GenTRXAgent(FinanceSimulationAgent):
             getattr(self.config, "gtx_training_api_key", "")
             or os.environ.get("GENTRX_MINER_API_KEY", "")
         )
-        g.train_steps = int(getattr(self.config, "gtx_train_steps", 50))
-        g.train_batch_size = int(getattr(self.config, "gtx_train_batch_size", 16))
+        # Device-dependent training defaults: CPU is 5–50× slower per step than
+        # a modern GPU, and quadratic-attention memory at batch_size=16/seq=256
+        # is uncomfortable on CPU. Cut steps and batch size 5× and 4× to keep
+        # per-cycle wall-time and RAM tractable. Operators can still override
+        # via explicit gtx_train_steps / gtx_train_batch_size.
+        g.train_steps = int(getattr(self.config, "gtx_train_steps", 500 if _is_cuda else 100))
+        g.train_batch_size = int(getattr(self.config, "gtx_train_batch_size", 16 if _is_cuda else 4))
         g.train_seq_len = int(getattr(self.config, "gtx_train_seq_len", 256))
-        g.top_k_frac = float(getattr(self.config, "gtx_top_k_frac", 0.01))
+        g.top_k_frac = float(getattr(self.config, "gtx_top_k_frac", 0.05))
         # Retention on the per-miner write bucket. 0 disables pruning entirely
         # (gradients accumulate; operator handles cleanup). Default 50 ≈ ~4h
         # of history at the standard round cadence.
         g.keep_gradients = int(getattr(self.config, "gtx_keep_gradients", 50))
         g.train_lr = float(getattr(self.config, "gtx_train_lr", 1e-4))
+        g.label_smooth_sigma = float(
+            getattr(self.config, "gtx_label_smooth_sigma", 1.0)
+        )
         _gdir = getattr(self.config, "gtx_gradient_dir", None)
         g.gradient_dir = Path(_gdir) if _gdir else g.output_dir / "gradients"
 
@@ -349,15 +412,20 @@ class GenTRXAgent(FinanceSimulationAgent):
             pass
 
         # ---- Training logger ----
+        # logging.getLogger returns the same module-global Logger by name on
+        # every initialize() call. Guard against duplicate FileHandlers if
+        # this method ever re-runs in the same process — without the check,
+        # each call would silently double the log fanout and open another fd.
         g.tlog = logging.getLogger(f"GenTRX.train.{self.uid}")
         g.tlog.setLevel(logging.INFO)
         g.tlog.propagate = False
         g.gradient_dir.mkdir(parents=True, exist_ok=True)
-        _fh = logging.FileHandler(g.gradient_dir / "train.log")
-        _fh.setFormatter(
-            logging.Formatter("%(asctime)s %(message)s", datefmt="%H:%M:%S")
-        )
-        g.tlog.addHandler(_fh)
+        if not g.tlog.handlers:
+            _fh = logging.FileHandler(g.gradient_dir / "train.log")
+            _fh.setFormatter(
+                logging.Formatter("%(asctime)s %(message)s", datefmt="%H:%M:%S")
+            )
+            g.tlog.addHandler(_fh)
         g.tlog.info("Training logger initialized (uid=%d)", self.uid)
 
         # ---- Per-book state ----
@@ -382,7 +450,9 @@ class GenTRXAgent(FinanceSimulationAgent):
         g.tokenizer = None
         g.model_cfg = None
         g.tokenizer_cfg = None
-        g.device = "cpu"
+        # g.device was set above (before the training-config block) so the
+        # device-dependent training defaults could reference it. _load_model
+        # picks up g.device when a checkpoint actually loads.
         checkpoint = getattr(self.config, "gtx_checkpoint", None)
         if checkpoint and Path(checkpoint).exists():
             try:
@@ -469,13 +539,22 @@ class GenTRXAgent(FinanceSimulationAgent):
                 if self._gtx.collect_data:
                     # Parquet flush gated by collect_data.
                     buf = self._gtx.books[book_id]
-                    if buf.last_ts > 0:
+                    pending = sum(b.num_rows for b in buf.batches) + len(buf.events)
+                    cap = self._gtx.max_pending_rows_per_book
+                    if buf.last_ts > 0 and pending:
                         event_interval = buf.last_ts // self._gtx.flush_interval_ns
                         buf_interval = (
                             buf.current_interval_start // self._gtx.flush_interval_ns
                         )
-                        if event_interval > buf_interval and buf.events:
+                        if event_interval > buf_interval or (cap and pending >= cap):
                             self._flush_book(book_id)
+                    # Safety cap: the interval-boundary check above never
+                    # fires if sim-time stalls inside one flush window
+                    # (e.g. transition gaps), so events can accumulate
+                    # unbounded. Force a flush past a hard cap to keep
+                    # per-book RAM bounded.
+                    if len(buf.events) > 50000:
+                        self._flush_book(book_id)
 
                 if self._gtx.model is not None and self._gtx.inference_enabled:
                     signal = self._infer(book_id, book)
@@ -486,9 +565,11 @@ class GenTRXAgent(FinanceSimulationAgent):
                     # Keep the inference context window; clear entirely if inference is off.
                     buf = self._gtx.books[book_id]
                     if self._gtx.inference_enabled and self._gtx.model is not None:
+                        cap = self._gtx.max_pending_rows_per_book
                         ctx = self._gtx.model.config.max_seq_len
-                        if len(buf.events) > ctx:
-                            buf.events = buf.events[-ctx:]
+                        keep = min(ctx, cap) if cap else ctx
+                        if len(buf.events) > keep:
+                            buf.events = buf.events[-keep:]
                     else:
                         buf.events.clear()
 
@@ -747,6 +828,9 @@ class GenTRXAgent(FinanceSimulationAgent):
         )
         if row is not None:
             buf.events.append(row)
+            if self._gtx.collect_data and len(buf.events) >= self._gtx.chunk_size:
+                buf.batches.append(_events_to_batch(buf.events))
+                buf.events = []
 
     def collect_row(
         self,
@@ -816,11 +900,15 @@ class GenTRXAgent(FinanceSimulationAgent):
 
     def _flush_book(self, book_id: int) -> None:
         buf = self._gtx.books[book_id]
-        if not buf.events:
+        if not buf.events and not buf.batches:
             return
 
-        events, buf.events = buf.events, []
-        n = len(events)
+        batches, buf.batches = buf.batches, []
+        if buf.events:
+            batches.append(_events_to_batch(buf.events))
+            buf.events = []
+        table = pa.Table.from_batches(batches, schema=order_stream_schema())
+        n = table.num_rows
 
         out_dir = self._gtx.output_dir / str(book_id) / "intervals"
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -830,39 +918,27 @@ class GenTRXAgent(FinanceSimulationAgent):
         interval_end = interval_start + self._gtx.flush_interval_ns
         tag_start = _ts_to_tag(interval_start)
         tag_end = _ts_to_tag(interval_end)
-        out_path = out_dir / f"{tag_start}-{tag_end}.parquet"
+        # Row-cap early flushes write multiple partials per interval; the seq
+        # suffix keeps each unique. First flush of an interval has no suffix.
+        # Mirrors gradient-server's 0b474676 disambiguation — the validator's
+        # _tag_to_ns strips `_NNNN` when parsing timestamps, and dataset
+        # readers glob *.parquet without parsing filenames, so downstream
+        # paths are unaffected.
+        suffix = f"_{buf.flush_seq:04d}" if buf.flush_seq else ""
+        out_path = out_dir / f"{tag_start}-{tag_end}{suffix}.parquet"
 
-        # Advance interval pointer
+        # Advance interval pointer (resets the partial counter for the next
+        # interval); otherwise this interval saw another partial.
         if buf.last_ts >= interval_end:
             buf.current_interval_start = (
                 buf.last_ts // self._gtx.flush_interval_ns
             ) * self._gtx.flush_interval_ns
+            buf.flush_seq = 0
+        else:
+            buf.flush_seq += 1
         self._gtx.flush_counts[book_id] = self._gtx.flush_counts.get(book_id, 0) + 1
 
-        columns: dict[str, Any] = {
-            "timestamp": pa.array(
-                [e["timestamp"] for e in events], type=pa.timestamp("ns")
-            ),
-            "order_type": np.array([e["order_type"] for e in events], dtype=np.int8),
-            "rel_price": np.array([e["rel_price"] for e in events], dtype=np.int32),
-            "volume_int": np.array([e["volume_int"] for e in events], dtype=np.int32),
-            "volume_dec": np.array([e["volume_dec"] for e in events], dtype=np.float32),
-            "interval_ns": np.array([e["interval_ns"] for e in events], dtype=np.int64),
-            "mid_price": np.array([e["mid_price"] for e in events], dtype=np.int64),
-            "time_of_day_s": np.array(
-                [e["time_of_day_s"] for e in events], dtype=np.int32
-            ),
-            "mid_price_delta": np.array(
-                [e["mid_price_delta"] for e in events], dtype=np.int32
-            ),
-        }
-        for i in range(LOB_DEPTH):
-            k_ask = f"lob_ask_vol_{i + 1}"
-            k_bid = f"lob_bid_vol_{i + 1}"
-            columns[k_ask] = np.array([e[k_ask] for e in events], dtype=np.float64)
-            columns[k_bid] = np.array([e[k_bid] for e in events], dtype=np.float64)
-
-        pq.write_table(pa.table(columns, schema=order_stream_schema()), out_path)
+        pq.write_table(table, out_path)
 
         manifest_path = out_dir.parent / "manifest.json"
         existing = (
@@ -1138,7 +1214,7 @@ class GenTRXAgent(FinanceSimulationAgent):
         if self._gtx.training_in_progress:
             now = time.time()
             if now - getattr(self._gtx, "_last_progress_log_ts", 0) > 30:
-                gtx_log.info("[GTX] training in progress...")
+                gtx_log.info("training in progress...")
                 self._gtx._last_progress_log_ts = now
             return
 
@@ -1206,6 +1282,7 @@ class GenTRXAgent(FinanceSimulationAgent):
         The foreground _maybe_train returned before this function started,
         unblocking the state-update handler. All network I/O lives here.
         """
+        train_model = None
         try:
             # Bootstrap the model if we don't have one yet (first run or
             # previous download failed). Cheaper than putting this in the
@@ -1311,6 +1388,12 @@ class GenTRXAgent(FinanceSimulationAgent):
             gtx_log.info("[GTX] training thread finished")
             self._gtx.tlog.info("thread finished")
             self._clear_s3_cache()
+            del train_model
+            import gc
+            gc.collect()
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     def _train_background(
         self, parquet_files: list[Path], train_model, assignment: dict | None = None
@@ -1398,6 +1481,7 @@ class GenTRXAgent(FinanceSimulationAgent):
             window_id=self._gtx.train_window_id,
             miner_uid=self.uid,
             model_version=int((assignment or {}).get("model_version", 0) or 0),
+            label_smooth_sigma=self._gtx.label_smooth_sigma,
         )
         delta = train_window(train_model, loader, win_cfg, self._gtx.device)
         self._gtx.tlog.info(
@@ -1518,6 +1602,7 @@ class GenTRXAgent(FinanceSimulationAgent):
             stage_dir.mkdir(parents=True, exist_ok=True)
             tmp = stage_dir / f"gentrx_ckpt_{self.uid}.pt"
             tmp.write_bytes(ckpt_bytes)
+            del ckpt_bytes
             self._load_model(str(tmp))
             self._gtx.model_version = target
             gtx_log.info(f"Model loaded: v{target}")
@@ -1582,6 +1667,7 @@ class GenTRXAgent(FinanceSimulationAgent):
     # ------------------------------------------------------------------
 
     def _load_model(self, checkpoint: str) -> None:
+        import gc
         import torch
         from GenTRX.src.gradient import load_checkpoint_safely, validate_state_dict
         from GenTRX.src.model import OrderModel, ModelConfig
@@ -1589,7 +1675,7 @@ class GenTRXAgent(FinanceSimulationAgent):
 
         ckpt = load_checkpoint_safely(checkpoint)
         raw_cfg = ckpt.get("model_config", ckpt.get("config", {}))
-        self._gtx.model_cfg = ModelConfig(
+        new_cfg = ModelConfig(
             **{
                 k: v
                 for k, v in raw_cfg.items()
@@ -1600,13 +1686,38 @@ class GenTRXAgent(FinanceSimulationAgent):
         self._gtx.tokenizer_cfg = (
             TokenizerConfig.from_dict(tok_dict) if tok_dict else TokenizerConfig()
         )
-        self._gtx.model = OrderModel(self._gtx.model_cfg)
+        # Reuse the existing nn.Module when config is unchanged — every
+        # rollover otherwise allocates a fresh OrderModel plus transient
+        # CPU weights before .to(cuda), inflating per-cycle peak RSS.
+        # When config DOES change, drop the prior model first so the swap
+        # doesn't transiently hold two full models resident.
+        if self._gtx.model is None or new_cfg != getattr(self._gtx, "model_cfg", None):
+            if self._gtx.model is not None:
+                self._gtx.model = None
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            self._gtx.model = OrderModel(new_cfg)
+        self._gtx.model_cfg = new_cfg
         validate_state_dict(ckpt["model_state_dict"], self._gtx.model.state_dict())
         self._gtx.model.load_state_dict(ckpt["model_state_dict"])
         self._gtx.model.eval()
         self._gtx.tokenizer = OrderTokenizer(self._gtx.tokenizer_cfg)
-        self._gtx.device = "cuda" if torch.cuda.is_available() else "cpu"
+        # self._gtx.device is set in initialize() (respects gtx_device override).
+        # Don't reassign here — would silently override an operator's explicit
+        # "cpu" choice on hosts where cuda is available.
         self._gtx.model.to(self._gtx.device)
+
+        # Drop the source state_dict explicitly so PyTorch releases the
+        # CPU tensor buffers before this function returns; then trim the
+        # glibc arena to give back what we can.
+        del ckpt
+        gc.collect()
+        try:
+            import ctypes
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:
+            pass
 
         gtx_log.info(f"GenTRX model loaded from {checkpoint} on {self._gtx.device}")
 
@@ -1774,6 +1885,33 @@ def _is_cancellation(event: Any) -> bool:
 
 def _pad(values: list[int], depth: int) -> list[int]:
     return list(values[:depth]) + [0] * (depth - len(values))
+
+
+def _events_to_batch(events: list[dict[str, Any]]) -> pa.RecordBatch:
+    """Convert a list of collect_row() dicts to a columnar RecordBatch."""
+    columns: dict[str, Any] = {
+        "timestamp": pa.array(
+            [e["timestamp"] for e in events], type=pa.timestamp("ns")
+        ),
+        "order_type": np.array([e["order_type"] for e in events], dtype=np.int8),
+        "rel_price": np.array([e["rel_price"] for e in events], dtype=np.int32),
+        "volume_int": np.array([e["volume_int"] for e in events], dtype=np.int32),
+        "volume_dec": np.array([e["volume_dec"] for e in events], dtype=np.float32),
+        "interval_ns": np.array([e["interval_ns"] for e in events], dtype=np.int64),
+        "mid_price": np.array([e["mid_price"] for e in events], dtype=np.int64),
+        "time_of_day_s": np.array(
+            [e["time_of_day_s"] for e in events], dtype=np.int32
+        ),
+        "mid_price_delta": np.array(
+            [e["mid_price_delta"] for e in events], dtype=np.int32
+        ),
+    }
+    for i in range(LOB_DEPTH):
+        k_ask = f"lob_ask_vol_{i + 1}"
+        k_bid = f"lob_bid_vol_{i + 1}"
+        columns[k_ask] = np.array([e[k_ask] for e in events], dtype=np.float64)
+        columns[k_bid] = np.array([e[k_bid] for e in events], dtype=np.float64)
+    return pa.RecordBatch.from_pydict(columns, schema=order_stream_schema())
 
 
 # ---------------------------------------------------------------------------
