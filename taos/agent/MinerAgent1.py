@@ -150,7 +150,7 @@ class PriceArray:
             self.prices = self.prices[idx:]
 
 
-class MinerAgent(FinanceSimulationAgent):
+class MinerAgent1(FinanceSimulationAgent):
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -329,4 +329,4 @@ class MinerAgent(FinanceSimulationAgent):
 
 if __name__ == "__main__":
     from taos.common.agents import launch
-    launch(MinerAgent)
+    launch(MinerAgent1)
