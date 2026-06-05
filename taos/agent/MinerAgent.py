@@ -74,10 +74,10 @@ class MinerAgent(FinanceSimulationAgent):
         # Need at least window+1 prices to compute window returns
         if len(prices) <4:
             return "neutral"
-        if bids[-2] == max(bids) and bids[-1] < bids[-2] and bids[-1] > bids[0] + 0.2:
+        if bids[-2] == max(bids) and bids[-1] < bids[-2] and bids[-1] > bids[0] + 0.15:
             self.trime_price(validator_hotkey, book_id)
             return "sell"
-        elif asks[-2] == min(asks) and asks[-1] > asks[-2] and asks[-1] < asks[0] - 0.2:
+        elif asks[-2] == min(asks) and asks[-1] > asks[-2] and asks[-1] < asks[0] - 0.15:
             self.trime_price(validator_hotkey, book_id)
             return "buy"
         else:

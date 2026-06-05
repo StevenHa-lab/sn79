@@ -97,7 +97,10 @@ class PriceArray:
         
         prev = self.prices[-1]
         self.prices.append(price)
-
+        
+        if len(self.prices) < 500:
+            return "warming_up"
+            
         # ── New maximum ────────────────────────────────────────────────
         if price > self.max_price:
             old_min = self.min_price
@@ -147,7 +150,7 @@ class PriceArray:
             self.prices = self.prices[idx:]
 
 
-class MinerAgent1(FinanceSimulationAgent):
+class MinerAgent(FinanceSimulationAgent):
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -161,7 +164,7 @@ class MinerAgent1(FinanceSimulationAgent):
         self.min_qty      = 0.1
         self.max_qty      = 2.0
         self.base_rate    = 0.01     # fraction of initial_volume used as base_qty
-        self.price_offset = 0.01     # ticks inside spread for aggressive fill
+        self.price_offset = 0.02     # ticks inside spread for aggressive fill
 
     # ------------------------------------------------------------------
     # Entry point
@@ -194,7 +197,7 @@ class MinerAgent1(FinanceSimulationAgent):
             movement = pa.push(mid)
 
             # Need at least 2 prices to trade
-            if movement in ("init",):
+            if movement in ("init", "warming_up"):
                 continue
 
             avg = pa.avg  # guaranteed non-None after first push
@@ -259,17 +262,17 @@ class MinerAgent1(FinanceSimulationAgent):
 
         # Priority 1 – new session maximum
         if movement == "new_max":
-            if price_range > 3:
+            if price_range > 2.5:
                 return "SKIP", 0.0
             # Narrow range → genuine breakout → BUY
-            return "BUY", 3 - price_range
+            return "BUY", 2.5 - price_range
 
         # Priority 2 – new session minimum
         if movement == "new_min":
-            if price_range > 3:
+            if price_range > 2.5:
                 return "SKIP", 0.0
             # Narrow range → genuine breakdown → SELL
-            return "SELL", 3 - price_range
+            return "SELL", 2.5 - price_range
 
         # Priority 3 – price rising (not a new extreme)
         if movement == "rising":
@@ -326,4 +329,4 @@ class MinerAgent1(FinanceSimulationAgent):
 
 if __name__ == "__main__":
     from taos.common.agents import launch
-    launch(MinerAgent1)
+    launch(MinerAgent)
