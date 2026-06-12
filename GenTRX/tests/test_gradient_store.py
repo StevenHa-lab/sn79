@@ -240,3 +240,49 @@ def test_create_validator_store_from_env_with_vars():
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint version stamps in latest.json
+# ---------------------------------------------------------------------------
+
+
+def test_put_checkpoint_stamps_meta_in_latest(store):
+    s, _ = store
+    s.put_checkpoint(
+        validator_uid=0, version=1, data=b"v1",
+        meta={"train_regime_version": 2, "taos_spec_version": 44},
+    )
+    meta = s.get_latest_meta(validator_uid=0)
+    assert meta["version"] == 1
+    assert meta["train_regime_version"] == 2
+    assert meta["taos_spec_version"] == 44
+
+
+def test_get_latest_meta_empty(store):
+    s, _ = store
+    assert s.get_latest_meta(validator_uid=0) == {}
+
+
+def test_put_checkpoint_without_meta_has_no_stamp(store):
+    s, _ = store
+    s.put_checkpoint(validator_uid=0, version=1, data=b"v1")
+    meta = s.get_latest_meta(validator_uid=0)
+    assert meta["version"] == 1
+    assert "train_regime_version" not in meta
+
+
+def test_repair_preserves_version_stamp(store):
+    s, fake = store
+    # v1 written with a stamp; latest.json points at v1.
+    s.put_checkpoint(
+        validator_uid=0, version=1, data=b"v1",
+        meta={"train_regime_version": 2},
+    )
+    # An orphan v2.pt appears on disk without updating latest.json.
+    fake._objects["test-bucket/checkpoints/0/v00002.pt"] = b"v2"
+    best = s.get_latest_existing_version(validator_uid=0)
+    assert best == 2
+    meta = s.get_latest_meta(validator_uid=0)
+    assert meta["version"] == 2
+    assert meta["train_regime_version"] == 2

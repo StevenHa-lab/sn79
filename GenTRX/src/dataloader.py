@@ -213,8 +213,18 @@ class OrderDataset(Dataset):
             return self._cache[file_idx]
 
         self._cache_misses += 1
-        df = pl.read_parquet(self._files[file_idx])
-        encoded = self.tokenizer.encode(df)
+        # Read via pyarrow (system malloc, no caching pool) and convert
+        # columns to numpy upfront. Using polars's pl.read_parquet retains
+        # buffers in its bundled mimalloc pool and leaks ~600 MB per cycle
+        # in the miner training loop.
+        table = pq.read_table(self._files[file_idx])
+        cols: dict[str, np.ndarray] = {
+            name: table.column(name).to_numpy(zero_copy_only=False)
+            for name in table.column_names
+        }
+        del table
+        encoded = self.tokenizer.encode_columns(cols)
+        del cols
 
         # Evict oldest if cache is full
         while len(self._cache) >= self._max_cached:
@@ -267,22 +277,28 @@ class OrderDataset(Dataset):
 
         batch: dict[str, torch.Tensor] = {}
 
+        # .copy() each slice before torch.as_tensor so the resulting
+        # tensor owns its own buffer instead of viewing into the cached
+        # chunk. Without this, evicting a chunk from self._cache leaves
+        # its underlying ndarray alive as long as any in-flight tensor
+        # holds a view of it — defeating the max_cached bound.
+
         # Input fields: positions [0 .. seq_len-1]
         for k in PRED_FIELDS:
-            batch[k] = torch.as_tensor(window[k][:sl], dtype=torch.long)
+            arr = window[k][:sl].copy()
+            batch[k] = torch.as_tensor(arr, dtype=torch.long)
 
         # Conditioning: positions [0 .. seq_len-1]
         for k in COND_FIELDS:
-            arr = window[k][:sl]
+            arr = window[k][:sl].copy()
             batch[k] = torch.as_tensor(
                 arr, dtype=torch.float32 if arr.ndim > 1 else torch.long
             )
 
         # Labels: positions [1 .. seq_len] (next-step prediction)
         for k in PRED_FIELDS:
-            batch[f"label_{LABEL_KEYS[k]}"] = torch.as_tensor(
-                window[k][1 : sl + 1], dtype=torch.long
-            )
+            arr = window[k][1 : sl + 1].copy()
+            batch[f"label_{LABEL_KEYS[k]}"] = torch.as_tensor(arr, dtype=torch.long)
 
         return batch
 

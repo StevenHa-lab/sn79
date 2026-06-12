@@ -71,8 +71,9 @@ def main():
         "gtx_train_steps": args.train_steps,
         "gtx_train_batch_size": args.train_batch_size,
         "gtx_train_seq_len": args.train_seq_len,
-        "gtx_top_k_frac": 0.01,
+        "gtx_top_k_frac": 0.05,
         "gtx_train_lr": 1e-4,
+        "gtx_label_smooth_sigma": 1.0,
     }
 
     # Trading params for mixed mode

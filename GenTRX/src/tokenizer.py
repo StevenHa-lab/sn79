@@ -155,27 +155,43 @@ class OrderTokenizer:
     def encode(self, df: pl.DataFrame) -> dict[str, np.ndarray]:
         """Encode a parquet DataFrame into per-field bin arrays + conditioning arrays.
 
+        Thin wrapper over ``encode_columns``: materialises the polars columns
+        to numpy first, then delegates. Prefer ``encode_columns`` from hot
+        paths to avoid the polars allocator entirely.
+
         Returns dict with:
             Per-field bins (model input + label targets):
                 order_types, price_bins, vol_int_bins, vol_dec_bins, interval_bins
             Conditioning (embedding inputs, not predicted):
                 lob_volumes, time_of_day, mid_deltas
         """
+        cols: dict[str, np.ndarray] = {
+            name: df.get_column(name).to_numpy() for name in df.columns
+        }
+        return self.encode_columns(cols)
+
+    def encode_columns(self, cols: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+        """Encode pre-materialised numpy columns into per-field bin arrays.
+
+        Equivalent output to ``encode(df)`` but reads from a dict of numpy
+        arrays — letting callers source the columns via pyarrow (system
+        malloc, no caching pool) instead of polars (mimalloc, retains pool).
+        """
         c = self.config
 
         # Per-field bins
-        order_types = df.get_column("order_type").to_numpy().astype(np.int32)
+        order_types = cols["order_type"].astype(np.int32)
         price_bins = c.price.digitize(
-            df.get_column("rel_price").to_numpy().astype(np.float64)
+            cols["rel_price"].astype(np.float64)
         ).astype(np.int32)
 
         # Volume split — handle both old (single "volume") and new (int+dec) schemas
-        if "volume_int" in df.columns:
-            vol_int_raw = df.get_column("volume_int").to_numpy().astype(np.float64)
-            vol_dec_raw = df.get_column("volume_dec").to_numpy().astype(np.float64)
-        elif "volume" in df.columns:
+        if "volume_int" in cols:
+            vol_int_raw = cols["volume_int"].astype(np.float64)
+            vol_dec_raw = cols["volume_dec"].astype(np.float64)
+        elif "volume" in cols:
             # Legacy: single integer-scaled volume. Approximate split.
-            vol_raw = df.get_column("volume").to_numpy().astype(np.float64)
+            vol_raw = cols["volume"].astype(np.float64)
             vol_int_raw = np.floor(vol_raw).astype(np.float64)
             vol_dec_raw = vol_raw - vol_int_raw
         else:
@@ -186,19 +202,19 @@ class OrderTokenizer:
         vol_int_bins = c.vol_int.digitize(vol_int_raw).astype(np.int32)
         vol_dec_bins = c.vol_dec.digitize(vol_dec_raw).astype(np.int32)
         interval_bins = c.interval.digitize(
-            df.get_column("interval_ns").to_numpy().astype(np.float64)
+            cols["interval_ns"].astype(np.float64)
         ).astype(np.int32)
 
         # LOB volumes
         lob_cols = []
         for side in ("ask", "bid"):
             for i in range(1, c.lob_depth + 1):
-                lob_cols.append(df.get_column(f"lob_{side}_vol_{i}").to_numpy())
+                lob_cols.append(cols[f"lob_{side}_vol_{i}"])
         lob_volumes = np.column_stack(lob_cols).astype(np.float32)
 
         # Conditioning: time_of_day, mid_delta
-        time_of_day = self._compute_time_of_day(df)
-        mid_deltas = self._compute_mid_delta(df)
+        time_of_day = self._compute_time_of_day_cols(cols)
+        mid_deltas = self._compute_mid_delta_cols(cols)
 
         return {
             "order_types": order_types,
@@ -226,12 +242,37 @@ class OrderTokenizer:
             tod_s // c.time_bin_seconds, 0, c.time_of_day_buckets - 1
         ).astype(np.int32)
 
+    def _compute_time_of_day_cols(self, cols: dict[str, np.ndarray]) -> np.ndarray:
+        c = self.config
+        if "time_of_day_s" in cols:
+            tod_s = cols["time_of_day_s"].astype(np.int64)
+        else:
+            # pyarrow's to_numpy() on a timestamp column yields datetime64[ns]
+            ts = cols["timestamp"]
+            ts_ns = ts.astype("datetime64[ns]").view(np.int64)
+            tod_s = (ts_ns % (86400 * 10**9)) // 10**9
+        return np.clip(
+            tod_s // c.time_bin_seconds, 0, c.time_of_day_buckets - 1
+        ).astype(np.int32)
+
     def _compute_mid_delta(self, df: pl.DataFrame) -> np.ndarray:
         c = self.config
         if "mid_price_delta" in df.columns:
             delta = df.get_column("mid_price_delta").to_numpy().astype(np.int64)
         else:
             mid = df.get_column("mid_price").to_numpy().astype(np.int64)
+            valid = mid[mid > 0]
+            ref = int(valid[0]) if len(valid) > 0 else 0
+            delta = mid - ref
+        clipped = np.clip(delta, -c.max_mid_delta, c.max_mid_delta)
+        return (clipped + c.max_mid_delta).astype(np.int32)
+
+    def _compute_mid_delta_cols(self, cols: dict[str, np.ndarray]) -> np.ndarray:
+        c = self.config
+        if "mid_price_delta" in cols:
+            delta = cols["mid_price_delta"].astype(np.int64)
+        else:
+            mid = cols["mid_price"].astype(np.int64)
             valid = mid[mid > 0]
             ref = int(valid[0]) if len(valid) > 0 else 0
             delta = mid - ref

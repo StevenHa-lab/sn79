@@ -14,7 +14,7 @@ Usage:
     delta = extract_delta(theta_before, theta_after, metadata)
 
     # Compress for transmission
-    compressed = compress(delta, top_k_frac=0.01)
+    compressed = compress(delta, top_k_frac=0.05)
 
     # Decompress and apply
     apply_gradient(model, decompress(compressed))
@@ -120,11 +120,11 @@ def extract_delta(
 # ---------------------------------------------------------------------------
 
 
-def compress(delta: GradientDelta, top_k_frac: float = 0.01) -> CompressedGradient:
+def compress(delta: GradientDelta, top_k_frac: float = 0.05) -> CompressedGradient:
     """Top-k compress a gradient delta.
 
     Keeps the top_k_frac fraction of values (by absolute magnitude) per tensor.
-    E.g., top_k_frac=0.01 keeps 1% of values.
+    E.g., top_k_frac=0.05 keeps 5% of values.
     """
     sparse = {}
     for name, tensor in delta.delta.items():
@@ -132,10 +132,15 @@ def compress(delta: GradientDelta, top_k_frac: float = 0.01) -> CompressedGradie
         k = max(1, int(flat.numel() * top_k_frac))
         k = min(k, flat.numel())
 
-        _, top_indices = torch.topk(flat.abs(), k)
+        abs_flat = flat.abs()
+        _, top_indices = torch.topk(abs_flat, k)
         top_values = flat[top_indices]
 
         sparse[name] = (top_indices, top_values, tensor.shape)
+        # flat.abs() allocates a full copy per parameter; explicit
+        # release keeps the per-loop peak from stacking against the
+        # next iteration's allocation.
+        del flat, abs_flat
 
     comp = CompressedGradient(sparse=sparse, metadata=delta.metadata)
     logger.debug(

@@ -61,6 +61,11 @@ class TrainConfig:
     max_steps: int | None = None  # stop after N steps (for quick test runs)
     patience: int | None = None  # early stop after N val checks with no improvement
     num_workers: int = 4  # DataLoader parallel workers
+    # Ordinal-aware label smoothing (bins) for price/interval/volume heads;
+    # order_type stays strict CE. 0.0 disables it (strict CE). Default matches
+    # the live training regime so offline-pretrained bootstrap checkpoints are
+    # in-regime. See `model.compute_loss`.
+    label_smooth_sigma: float = 1.0
 
 
 def _forward_batch(
@@ -100,6 +105,7 @@ def save_checkpoint(
     step: int,
     loss: float,
     data_dir: str | None = None,
+    label_smooth_sigma: float = 0.0,
 ) -> None:
     """Save checkpoint in standardized format.
 
@@ -112,6 +118,8 @@ def save_checkpoint(
         data_dir           — provenance: which data produced this checkpoint
     """
     tok_dict = asdict(tokenizer_cfg)
+    from GenTRX.src.version import checkpoint_stamp
+
     torch.save(
         {
             "model_state_dict": model.state_dict(),
@@ -122,6 +130,7 @@ def save_checkpoint(
             "step": step,
             "loss": loss,
             "data_dir": data_dir,
+            **checkpoint_stamp(label_smooth_sigma),
         },
         path,
     )
@@ -282,7 +291,10 @@ def train(
 
         for batch in train_loader:
             logits, labels = _forward_batch(model, batch, device)
-            loss, field_losses = compute_loss(logits, labels)
+            loss, field_losses = compute_loss(
+                logits, labels,
+                label_smooth_sigma=train_cfg.label_smooth_sigma,
+            )
 
             # NaN guard
             if not math.isfinite(loss.item()):
@@ -342,7 +354,7 @@ def train(
                 )
 
             if global_step % train_cfg.val_interval == 0:
-                vl, vl_fields, vm = _validate(model, val_loader, device)
+                vl, vl_fields, vm = _validate(model, val_loader, device, label_smooth_sigma=train_cfg.label_smooth_sigma)
                 val_losses.append(vl)
                 field_str = " ".join(f"{k}={v:.3f}" for k, v in vl_fields.items())
                 logger.info(
@@ -365,6 +377,7 @@ def train(
                         global_step,
                         vl,
                         data_dir=train_cfg.data_dir,
+                    label_smooth_sigma=train_cfg.label_smooth_sigma,
                     )
                 else:
                     patience_counter += 1
@@ -389,6 +402,7 @@ def train(
                     global_step,
                     vl,
                     data_dir=train_cfg.data_dir,
+                    label_smooth_sigma=train_cfg.label_smooth_sigma,
                 )
                 model.train()
 
@@ -409,7 +423,7 @@ def train(
 
         avg_train = epoch_loss / max(epoch_steps, 1)
         train_losses.append(avg_train)
-        vl, vl_fields, val_metrics = _validate(model, val_loader, device)
+        vl, vl_fields, val_metrics = _validate(model, val_loader, device, label_smooth_sigma=train_cfg.label_smooth_sigma)
         val_losses.append(vl)
         if vl < best_val:
             best_val = vl
@@ -423,6 +437,7 @@ def train(
                 global_step,
                 vl,
                 data_dir=train_cfg.data_dir,
+                    label_smooth_sigma=train_cfg.label_smooth_sigma,
             )
 
         field_str = " ".join(f"{k}={v:.3f}" for k, v in vl_fields.items())
@@ -447,6 +462,7 @@ def train(
         global_step,
         best_val,
         data_dir=train_cfg.data_dir,
+                    label_smooth_sigma=train_cfg.label_smooth_sigma,
     )
 
     return model, train_losses, val_losses
@@ -457,6 +473,7 @@ def _validate(
     loader: DataLoader,
     device: str,
     max_batches: int = 200,
+    label_smooth_sigma: float = 0.0,
 ) -> tuple[float, dict[str, float], StepMetrics]:
     """Returns (total_loss, per_field_avg_losses, accuracy_metrics)."""
     model.eval()
@@ -469,7 +486,9 @@ def _validate(
             if i >= max_batches:
                 break
             logits, labels = _forward_batch(model, batch, device)
-            loss, field_losses = compute_loss(logits, labels)
+            loss, field_losses = compute_loss(
+                logits, labels, label_smooth_sigma=label_smooth_sigma
+            )
             total += loss.item()
             for k, v in field_losses.items():
                 field_totals[k] = field_totals.get(k, 0.0) + v

@@ -691,6 +691,13 @@ if __name__ != "__mp_main__":
             self.maintaining = False
             self.compressing = False
             self.querying = False
+            # Mutual exclusion between the miner state-update query (forward)
+            # and GTX assignment delivery (deliver_gentrx): they share the IPC
+            # request queue/notify pipe and the miner network, so they must
+            # never run concurrently. asyncio.Lock — both run on the Listen loop.
+            self.miner_net_lock = asyncio.Lock()
+            # Background GTX round-check/delivery task (single-flight).
+            self._gentrx_task = None
             self._receiving_state = False
             self._rewarding = False
             self._pending_reward_tasks = 0
@@ -1980,13 +1987,30 @@ if __name__ != "__mp_main__":
                         if os.path.exists(state_file):
                             backup = f"{state_file}.{sim_id}.{save_timestamp}"
                             try:
-                                async with aiofiles.open(state_file, 'rb') as src:
-                                    content = await src.read()
-                                async with aiofiles.open(backup, 'wb') as dst:
-                                    await dst.write(content)
-                                bt.logging.debug(f"Created backup: {backup}")
-                            except Exception as ex:
-                                bt.logging.warning(f"Failed to create backup {backup}: {ex}")
+                                # Hardlink instead of a byte copy: saves never
+                                # modify the state file in place (tmp + os.replace
+                                # → fresh inode each save), so a linked backup
+                                # keeps the old bytes immutably. Metadata-only
+                                # syscall; avoids re-reading + re-writing the full
+                                # state (~2x file size of I/O) after every save.
+                                os.link(state_file, backup)
+                                bt.logging.debug(f"Created backup (hardlink): {backup}")
+                            except FileExistsError:
+                                bt.logging.debug(f"Backup already exists: {backup}")
+                            except OSError as ex:
+                                # Filesystem without hardlink support — fall back
+                                # to a full copy so backups never silently stop.
+                                bt.logging.warning(
+                                    f"Hardlink backup failed ({ex}); falling back to copy")
+                                try:
+                                    async with aiofiles.open(state_file, 'rb') as src:
+                                        content = await src.read()
+                                    async with aiofiles.open(backup, 'wb') as dst:
+                                        await dst.write(content)
+                                    bt.logging.debug(f"Created backup (copy): {backup}")
+                                except Exception as ex2:
+                                    bt.logging.warning(
+                                        f"Failed to create backup {backup}: {ex2}")
                             state_path = Path(state_file)
                             try:
                                 all_backups = []
@@ -3221,7 +3245,11 @@ if __name__ != "__mp_main__":
 
                 round_id = next(iter(assignments.values())).get("round", "?")
                 gtx_log.info(f"round={round_id}: delivering to uids={[u for u,_,_ in deliveries]}")
-                await deliver_gentrx(self, deliveries)
+                # One atomic send to ALL miners (never chunked), but never
+                # overlapping a state-update query: the lock is held by
+                # forward() for its query window and by us for the delivery.
+                async with self.miner_net_lock:
+                    await deliver_gentrx(self, deliveries)
             except Exception as exc:
                 gtx_log.error(f"delivery failed: {exc}")
                 import traceback
@@ -3550,18 +3578,30 @@ if __name__ != "__mp_main__":
                 elapsed = 0
                 message = None
                 poll_count = 0
+                loop = asyncio.get_event_loop()
                 while elapsed < max_wait:
                     poll_count += 1
                     try:
-                        message, _ = self.reporting_response_queue.receive(timeout=0.1)
+                        # Offload the blocking queue receive to the reporting IPC
+                        # executor so the main event loop stays free while the
+                        # (separate) reporting process applies its metric updates.
+                        # A synchronous receive() on the loop blocks every other
+                        # coroutine — including handle_state for incoming simulator
+                        # ticks — for the full 30-60s a report takes, inflating
+                        # "State update handled" time and causing miner-query
+                        # timeouts. The prior form yielded only ~0.001s every 10
+                        # polls, leaving the loop ~99% starved for the report's
+                        # duration.
+                        message, _ = await loop.run_in_executor(
+                            self.reporting_ipc_executor,
+                            lambda: self.reporting_response_queue.receive(timeout=0.5)
+                        )
                         bt.logging.info(f"Received reporting response after {poll_count} polls ({time.time()-receive_start:.4f}s)")
                         break
                     except posix_ipc.BusyError:
                         elapsed = time.time() - receive_start
-                        if poll_count % 10 == 0:
-                            await asyncio.sleep(0.001)
+                        if poll_count % 20 == 0:
                             bt.logging.debug(f"Still polling for reporting response ({elapsed:.1f}s, {poll_count} polls)")
-
                         continue
                 else:
                     self.pagerduty_alert(f"Reporting response timeout after {max_wait}s")
@@ -4246,12 +4286,27 @@ if __name__ != "__mp_main__":
             # generous (internal HTTP calls are already 5s-bounded) so it only
             # trips on a genuine hang, not on a working-but-slow cycle.
             if self._gentrx is not None:
-                try:
-                    await asyncio.wait_for(self._gentrx.poll_and_deliver(), timeout=30.0)
-                except asyncio.TimeoutError:
-                    gtx_log.warning("handle_state poll_and_deliver exceeded 30s — skipping this cycle")
-                except Exception as _gex:
-                    gtx_log.warning(f"handle_state poll_and_deliver error: {_gex}")
+                if self._gentrx_task is not None and not self._gentrx_task.done():
+                    # Single-flight: one deliver (~4-6s) per ~5-min round means a
+                    # previous task still running at the NEXT state update is a
+                    # sign something is genuinely stuck — surface it loudly.
+                    gtx_log.warning(
+                        "previous poll_and_deliver still running at next state "
+                        "update — skipping this cycle (investigate if recurring)")
+                else:
+                    async def _run_gtx_background():
+                        try:
+                            # Generous hard bound purely as a stuck-task backstop;
+                            # nothing in the round awaits this.
+                            await asyncio.wait_for(
+                                self._gentrx.poll_and_deliver(), timeout=120.0)
+                        except asyncio.TimeoutError:
+                            gtx_log.warning(
+                                "background poll_and_deliver exceeded 120s — abandoned")
+                        except Exception as _gex:
+                            bt.logging.warning(
+                                f"[GTX] background poll_and_deliver error: {_gex}")
+                    self._gentrx_task = asyncio.create_task(_run_gtx_background())
             # Log response data, start state serialization and reporting threads, and return miner instructions to the simulator
             if len(response['responses']) > 0:
                 bt.logging.trace(f"RESPONSE : {response}")

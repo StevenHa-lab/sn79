@@ -52,11 +52,12 @@ class MinerTrainingConfig:
     uid: int
     output_dir: Path = field(default_factory=default_output_dir)
     gradient_dir: Path | None = None  # defaults to output_dir / "gradients"
-    train_steps: int = 50
+    train_steps: int = 500
     train_batch_size: int = 16
     train_seq_len: int = 256
     train_lr: float = 1e-4
-    top_k_frac: float = 0.01
+    top_k_frac: float = 0.05
+    label_smooth_sigma: float = 1.0
     aggregator_uid: int = 0
     # Training mode shard: "simulation" (default) or "exchange". Combined
     # with the connected subtensor network to form the gentrx/<network>/<mode>/
@@ -552,6 +553,12 @@ class MinerTrainingService:
                 lr=self.cfg.train_lr,
                 window_id=self.state.train_window_id,
                 miner_uid=self.cfg.uid,
+                # Tag with the version actually loaded so the aggregator's
+                # version-mismatch filter can drop stale-regime gradients.
+                # Without this the metadata defaults to 0 and the filter
+                # silently passes everything through (trained_v=0 is falsy).
+                model_version=int(self.state.model_version or 0),
+                label_smooth_sigma=self.cfg.label_smooth_sigma,
             )
             delta = train_window(train_model, loader, win_cfg, self.device)
             self._tlog.info(

@@ -3,8 +3,8 @@
     {
       "uid": 256,
       "name": "benchmark_0",
-      "ip": "13.59.11.82",
-      "port": 8200,
+      "ip": "23.227.184.236",
+      "port": 41645,
       "hotkey": "5ECK3B8TenJ5eYc5CFLxhYotwn4eRL7ZtNxeKTHrnCZh9HEH",
       "gentrx_bucket": {
         "endpoint_url": "https://54c1e398b79fefb42485bef8060eb909.r2.cloudflarestorage.com",

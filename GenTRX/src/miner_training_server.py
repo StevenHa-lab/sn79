@@ -15,7 +15,7 @@ Run standalone:
         --uid 7 \\
         --port 8200 \\
         --bind 127.0.0.1 \\
-        --gtx-train-steps 50 --gtx-train-batch-size 8 --gtx-train-seq-len 256 \\
+        --gtx-train-steps 500 --gtx-train-batch-size 8 --gtx-train-seq-len 256 \\
         --gtx-aggregator-uid 0 \\
         --subtensor-network finney --netuid 79
 
@@ -100,11 +100,17 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "or $GENTRX_AGENT_OUTPUT_DIR if set.",
     )
     parser.add_argument("--gtx-gradient-dir", default=None, type=Path)
-    parser.add_argument("--gtx-train-steps", type=int, default=50)
+    parser.add_argument("--gtx-train-steps", type=int, default=500)
     parser.add_argument("--gtx-train-batch-size", type=int, default=16)
     parser.add_argument("--gtx-train-seq-len", type=int, default=256)
     parser.add_argument("--gtx-train-lr", type=float, default=1e-4)
-    parser.add_argument("--gtx-top-k-frac", type=float, default=0.01)
+    parser.add_argument("--gtx-top-k-frac", type=float, default=0.05)
+    parser.add_argument(
+        "--gtx-label-smooth-sigma", type=float, default=1.0,
+        help="Ordinal-aware soft-CE width in bins (0 = strict CE). Must match "
+             "the gradient server's --label-smooth-sigma so scoring compares "
+             "like-for-like.",
+    )
     parser.add_argument("--gtx-aggregator-uid", type=int, default=0)
     parser.add_argument("--gtx-checkpoint", default=None, type=Path,
                         help="Optional local .pt to bootstrap from before chain discovery.")
@@ -146,6 +152,7 @@ def _build_service(args: argparse.Namespace) -> MinerTrainingService:
         train_seq_len=args.gtx_train_seq_len,
         train_lr=args.gtx_train_lr,
         top_k_frac=args.gtx_top_k_frac,
+        label_smooth_sigma=args.gtx_label_smooth_sigma,
         aggregator_uid=args.gtx_aggregator_uid,
         mode=args.gtx_mode,
         network_override=args.gtx_network,

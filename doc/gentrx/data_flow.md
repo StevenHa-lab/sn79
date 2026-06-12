@@ -249,7 +249,7 @@ Binary format via `GenTRX/src/gradient.py`:
 }
 ```
 
-**Compression**: top-k sparsification (default 1%, `gtx_top_k_frac=0.01`) **Typical size**: ~500 KB  -  2 MB per gradient
+**Compression**: top-k sparsification (default 5%, `gtx_top_k_frac=0.05`) **Typical size**: ~2 - 4 MB per gradient
 
 ### Round Scores (JSON)
 

@@ -435,28 +435,89 @@ _FIELD_WEIGHTS = {
 }
 
 
+# Ordinal fields: bins are ordered, so a "close" prediction should cost
+# strictly less than a "far" one. Strict CE treats them all equally.
+# Smoothing is opt-in via label_smooth_sigma in compute_loss; default
+# 0.0 keeps the original behaviour bit-exactly.
+_ORDINAL_FIELDS = ("price", "vol_int", "vol_dec", "interval")
+
+
+def _soft_ordinal_targets(labels: torch.Tensor, n_bins: int, sigma: float) -> torch.Tensor:
+    """Build a (flat_n, n_bins) soft-target distribution by spreading
+    each label across bins with a Gaussian-in-bin-distance kernel.
+    `sigma` is in bin units. Probability mass falls off with distance
+    so adjacent-bin predictions get partial credit."""
+    device = labels.device
+    bins = torch.arange(n_bins, device=device, dtype=torch.float32)
+    dist = bins.unsqueeze(0) - labels.reshape(-1, 1).float()
+    return torch.softmax(-(dist ** 2) / (2.0 * sigma * sigma), dim=-1)
+
+
+def _finite_rows_loss(name, flat_logits, flat_labels, label_smooth_sigma):
+    """Per-field loss over only the rows whose loss is finite (drops degenerate
+    positions). Returns nan if every row is non-finite. Mirrors compute_loss's
+    reductions, including F.cross_entropy's weighted-mean normalisation."""
+    device = flat_logits.device
+    if name == "order_type":
+        weight = _ORDER_TYPE_WEIGHTS.to(device)
+        per_row = F.cross_entropy(flat_logits, flat_labels, weight=weight, reduction="none")
+        finite = torch.isfinite(per_row)
+        if not bool(finite.any()):
+            return per_row.new_tensor(float("nan"))
+        return per_row[finite].sum() / weight[flat_labels][finite].sum()
+    if label_smooth_sigma > 0 and name in _ORDINAL_FIELDS:
+        n_bins = flat_logits.size(-1)
+        soft_targets = _soft_ordinal_targets(flat_labels, n_bins, label_smooth_sigma)
+        log_probs = F.log_softmax(flat_logits, dim=-1)
+        per_row = -(soft_targets * log_probs).sum(dim=-1)
+    else:
+        per_row = F.cross_entropy(flat_logits, flat_labels, reduction="none")
+    finite = torch.isfinite(per_row)
+    return per_row[finite].mean() if bool(finite.any()) else per_row.new_tensor(float("nan"))
+
+
 def compute_loss(
     logits: dict[str, torch.Tensor],
     labels: dict[str, torch.Tensor],
+    label_smooth_sigma: float = 0.0,
+    mask_nonfinite_rows: bool = False,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    """Weighted sum of per-field CE losses. Returns (total_loss, per_field_losses)."""
+    """Weighted sum of per-field CE losses. Returns (total_loss, per_field_losses).
+
+    When `label_smooth_sigma > 0`, the ordinal fields (price, vol_int,
+    vol_dec, interval) use a distance-weighted soft cross-entropy: the
+    target distribution for bin t is `softmax(-(i - t)^2 / (2*sigma^2))`
+    across bins i, so predicting an adjacent bin costs less than
+    predicting a far bin. `order_type` stays strict CE with the existing
+    class-weight tensor (it's categorical, not ordinal).
+
+    `sigma=0.0` (default) reproduces the original strict-CE behaviour
+    bit-exactly. Typical non-zero values are 0.5-2.0 bins; pick by
+    empirical sweep, not intuition.
+    """
     device = next(iter(logits.values())).device
     total = torch.tensor(0.0, device=device)
     details = {}
     for name, field_logits in logits.items():
         field_labels = labels[name]
+        flat_logits = field_logits.reshape(-1, field_logits.size(-1))
+        flat_labels = field_labels.reshape(-1)
         if name == "order_type":
             weight = _ORDER_TYPE_WEIGHTS.to(device)
-            loss = F.cross_entropy(
-                field_logits.reshape(-1, field_logits.size(-1)),
-                field_labels.reshape(-1),
-                weight=weight,
-            )
+            loss = F.cross_entropy(flat_logits, flat_labels, weight=weight)
+        elif label_smooth_sigma > 0 and name in _ORDINAL_FIELDS:
+            n_bins = flat_logits.size(-1)
+            soft_targets = _soft_ordinal_targets(flat_labels, n_bins, label_smooth_sigma)
+            log_probs = F.log_softmax(flat_logits, dim=-1)
+            loss = -(soft_targets * log_probs).sum(dim=-1).mean()
         else:
-            loss = F.cross_entropy(
-                field_logits.reshape(-1, field_logits.size(-1)),
-                field_labels.reshape(-1),
-            )
+            loss = F.cross_entropy(flat_logits, flat_labels)
+        # Validators pass mask_nonfinite_rows=True: if a field's reduced loss is
+        # non-finite, recompute over only the finite rows so a few degenerate
+        # positions don't void the whole batch. Clean batches never enter here,
+        # so training stays bit-exact.
+        if mask_nonfinite_rows and not bool(torch.isfinite(loss)):
+            loss = _finite_rows_loss(name, flat_logits, flat_labels, label_smooth_sigma)
         field_weight = _FIELD_WEIGHTS.get(name, 1.0)
         total = total + loss * field_weight
         details[name] = loss.item()

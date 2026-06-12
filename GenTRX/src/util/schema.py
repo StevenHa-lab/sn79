@@ -14,6 +14,13 @@ CANCEL = 2
 # LOB depth: number of price levels tracked per side
 LOB_DEPTH = 10
 
+# Canonical simulator decimal precision (simulation_0.xml). Used only as a
+# last-resort fallback when a state tick reaches the gradient server with no
+# config block; the live sim's own priceDecimals/volumeDecimals always take
+# precedence when present.
+DEFAULT_PRICE_DECIMALS = 2
+DEFAULT_VOLUME_DECIMALS = 4
+
 
 def order_stream_schema() -> pa.Schema:
     """Parquet schema for order stream files.
