@@ -108,7 +108,7 @@ echo "GENTRX_PARAMS:   ${GENTRX_PARAMS:-(defaults)}"
 
 cd "$REPO_ROOT"
 git pull || { echo "WARNING: git pull failed (no tracking branch?). Continue without updating? [y/N]"; read -r _yn; [ "$_yn" = "y" ] || exit 1; }
-pip install -e .
+# pip install -e .
 cd "$REPO_ROOT/taos/im/neurons"
 
 # ══════════════════════════════════════════════════════════════════════════════
