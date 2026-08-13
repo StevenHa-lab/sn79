@@ -428,9 +428,9 @@ print(m.group(1) if m else '')
     tmux select-pane -t miner:miner.0
     tmux attach-session -t miner
 else
-    pm2 delete miner 2>/dev/null || true
+    pm2 delete miner1 2>/dev/null || true
     pm2 start miner.py \
-        --name=miner \
+        --name=miner1 \
         --interpreter python \
         --cwd "$REPO_ROOT/taos/im/neurons" \
         -- \
@@ -446,5 +446,5 @@ else
         --agent.params "${_agent_params[@]}"
     pm2 save || true
     pm2 startup || true
-    pm2 logs miner
+    pm2 logs miner1
 fi
