@@ -77,73 +77,72 @@ def _none(reason):
     return {"kind": "none", "qty": 0.0, "role": None, "reason": reason,
             "aggressive": False}
 
-def decide_exit(cfg, stats, best_asks, bought_price, fees):
+def decide_exit(cfg, stats, best_bids, sold_price, fees):
 
     best_bid = stats["best_bid"]
     best_ask = stats["best_ask"]
     idle_period = stats["idle_period"]
-    n = len(best_asks)
+    n = len(best_bids)
     if n == 0:
         return _none("no_signal")
-    mean = sum(best_asks) / n
-    maker_fee, taker_fee = round_trip_fee_offset(cfg, fees, best_ask)
+    mean = sum(best_bids) / n
+    maker_fee, taker_fee = round_trip_fee_offset(cfg, fees, best_bid)
 
-    if bought_price and (best_bid - bought_price - taker_fee) > 0.3:
-        return _act("sell", 0.25, "should_exit", "exit_sell", True)
-    if bought_price and (best_ask - bought_price - maker_fee) > 0.3:
-        return _act("sell", 0.25, "exit", "exit_sell", False)
-    if bought_price and (best_ask - bought_price - maker_fee) > 0.1:
-        return _act("sell", 0.25, "low_exit", "exit_sell", False)
+    if sold_price and (sold_price - best_ask - taker_fee) > 0.3:
+        return _act("buy", 0.25, "should_exit", "exit_sell", True)
+    if sold_price and (sold_price - best_bid - maker_fee) > 0.3:
+        return _act("buy", 0.25, "exit", "exit_sell", False)
+    if sold_price and (sold_price - best_bid - maker_fee) > 0.1:
+        return _act("buy", 0.25, "low_exit", "exit_sell", False)
     return _none("no_signal")
 
-def decide(cfg, stats, bought_price, base_qty, fees, best_bids):
+def decide(cfg, stats, sold_price, base_qty, fees, best_asks):
 
-    best_bid = stats["best_bid"]
+    best_ask = stats["best_ask"]
     previous = stats["previous"]
-    median_bid = np.median(list(best_bids))
-    mean_bid = stats["mean"]
-    max_bid = max(list(best_bids))
-    min_bid = min(list(best_bids))
-    delta_bid = max_bid - min_bid
-    if abs(best_bid - min_bid) < 0.01:
-        return _act("buy", base_qty, "entry", "entry_buy", False)    
+    median_ask = np.median(list(best_asks))
+    mean_ask = stats["mean"]
+    max_ask = max(list(best_asks))
+    min_ask = min(list(best_asks))
+    delta_ask = max_ask - min_ask
+    if abs(best_ask - min_ask) < 0.01:
+        return _act("sell", base_qty, "entry", "entry_sell", False)    
     return _none("no_signal")
 
 
-def evaluate_exit_book(cfg, best_bid, best_ask, best_asks, idle_period, time_started, bought_price, fees, vh):
+def evaluate_exit_book(cfg, best_bid, best_ask, best_bids, idle_period, time_started, sold_price, fees, vh):
     """
     Single source of truth for agent + tests: compute stats from the rolling
     """
 
-    if time_started < 5200:
+    if time_started < 5100:
         return _none("no_enough_time")
 
     stats = {"best_bid": best_bid, "best_ask": best_ask, "idle_period": idle_period}
-    action = decide_exit(cfg, stats, best_asks, bought_price, fees)
+    action = decide_exit(cfg, stats, best_bids, sold_price, fees)
 
     return action
 
-def evaluate_book(cfg, best_bid, previous, best_bids, time_started, bought_price, base_qty, fees, vh):
+def evaluate_book(cfg, best_ask, previous, best_asks, time_started, sold_price, base_qty, fees, vh):
     """
     Single source of truth for agent + tests: compute stats from the rolling
     """
-    if time_started < 1000:
+    if time_started < 2500:
         return _none("no_enough_time")
-    n = len(best_bids)
+    n = len(best_asks)
     if n < cfg["min_samples"]:
         return _none("warmup")
-    mean, std = mean_std(best_bids)
-    stats = {"best_bid": best_bid, "previous": previous, "mean": mean}
-    action = decide(cfg, stats, bought_price, base_qty, fees, best_bids)
+    mean, std = mean_std(best_asks)
+    stats = {"best_ask": best_ask, "previous": previous, "mean": mean}
+    action = decide(cfg, stats, sold_price, base_qty, fees, best_asks)
 
     return action
-
 
 # --------------------------------------------------------------------------- #
 # Agent
 # --------------------------------------------------------------------------- #
 
-class MinerAgent_V3(FinanceSimulationAgent):
+class MinerAgent_V4(FinanceSimulationAgent):
     def initialize(self):
         self.cfg = {
             
@@ -357,7 +356,7 @@ class MinerAgent_V3(FinanceSimulationAgent):
                 self.sold_prices[key].clear()
                 a = int((net_inv + 29.8) / base_qty)
                 last_traded_price = self.last_traded_price.get(key, best_ask)
-                if net_inv > 85:
+                if base_balance.total < 3:
                     self.c_trade[key] = False
                     self.idle_ticks[key] = current_time
                 if len(bought_prices) < a:
@@ -368,7 +367,7 @@ class MinerAgent_V3(FinanceSimulationAgent):
                 self.bought_prices[key].clear()
                 a = int((29.8 - net_inv) / base_qty)
                 last_traded_price = self.last_traded_price.get(key, best_bid)
-                if net_inv < -85:
+                if base_balance.total < 3:
                     self.c_trade[key] = False
                     self.idle_ticks[key] = current_time
                 if len(sold_prices) < a:
@@ -424,29 +423,27 @@ class MinerAgent_V3(FinanceSimulationAgent):
             first_sold_price = sold_prices[0] if len(sold_prices) else 0
             last_sold_price = sold_prices[-1] if len(sold_prices) else 0
             idle_tick = self.idle_ticks.get(key, current_time)
-            if current_time -idle_tick < 0:
-                self.idle_ticks[key] = 86400000000000 + current_time - idle_tick
-
+            
             if vh == "5EWwdZB7qCCMaAso5Mzcks4UUcPxKYvpAj32t5Mg1v6HSxoF":
                 print(f"book_id {book_id}: time_dif: {current_time - idle_tick}, previous_bid: {previous_bid}, previous_ask: {previous_ask} best_bid: {best_bid}, best_ask: {best_ask}, bought: {bought_prices}, sold: {sold_prices}, net_inv: {net_inv} len: {len(best_bids)} time_started: {self.time_started}")
-                print(f"book_id {book_id}: {self.best_bids[key][-1] - self.best_bids[key][0]} {self.best_asks[key][-1] - self.best_asks[key][0]}")
+            
             idle_period = current_time - idle_tick
             action = evaluate_exit_book(
-                self.cfg, best_bid, best_ask, self.best_asks[key], idle_period, self.time_started, first_bought_price, fees, vh
+                self.cfg, best_bid, best_ask, self.best_bids[key], idle_period, self.time_started, first_sold_price, fees, vh
                 )
 
             if action["role"] == "should_exit" and self.c_trade.get(key, False) == False:    
                 response.market_order(
                     book_id=book_id,
-                    direction=OrderDirection.SELL,
+                    direction=OrderDirection.BUY,
                     quantity=0.25
                 )
                 continue
             if action["role"] == "exit" and self.c_trade.get(key, False) == False:
-                price = round(best_ask - 0.01, price_dec)
+                price = round(best_bid + 0.01, price_dec)
                 response.limit_order(
                     book_id=book_id,
-                    direction=OrderDirection.SELL,
+                    direction=OrderDirection.BUY,
                     quantity=0.25,
                     price=price,
                     timeInForce=TimeInForce.GTT,
@@ -454,10 +451,10 @@ class MinerAgent_V3(FinanceSimulationAgent):
                 )
                 continue
             if action["role"] == "low_exit" and self.c_trade.get(key, False) == False:
-                price = round(first_bought_price + 0.3 + maker_fee, price_dec)
+                price = round(first_sold_price - 0.3 + maker_fee, price_dec)
                 response.limit_order(
                     book_id=book_id,
-                    direction=OrderDirection.SELL,
+                    direction=OrderDirection.BUY,
                     quantity=0.25,
                     price=price,
                     timeInForce=TimeInForce.GTT,
@@ -466,20 +463,20 @@ class MinerAgent_V3(FinanceSimulationAgent):
                 continue
 
             action = evaluate_book(
-                self.cfg, best_bid, previous_bid, self.best_bids[key], self.time_started, last_bought_price, base_qty, fees, vh
+                self.cfg, best_ask, previous_ask, self.best_asks[key], self.time_started, last_sold_price, base_qty, fees, vh
             )
 
             # qty = round(action["qty"], vol_dec)
             # if qty <= 0:
             #     continue
 
-            if (action["role"] == "entry" and self.time_started < 5400) or (self.time_started > 3000 and self.time_started < 3300):
-                if net_inv < 90:
-                    price = round(best_bid + 0.01, price_dec)
+            if (action["role"] == "entry" and self.time_started < 5400) or (self.time_started > 4000 and self.time_started < 4500):
+                if base_balance.total > 1:
+                    price = round(best_ask - 0.01, price_dec)
                     response.limit_order(
                         book_id=book_id,
-                        direction=OrderDirection.BUY,
-                        quantity=max(0.25, min(base_qty, 90 - net_inv)),
+                        direction=OrderDirection.SELL,
+                        quantity=max(0.25, min(base_qty, base_balance.total - 1)),
                         price=price,
                         timeInForce=TimeInForce.GTT,
                         expiryPeriod=entry_ttl,
@@ -487,14 +484,14 @@ class MinerAgent_V3(FinanceSimulationAgent):
                     self.last_traded_price[key] = price + round(maker_fee, price_dec)
                 continue
             
-            if idle_period > 3000000000000 and self.time_started > 5400 and net_inv < 90:
+            if idle_period > 2000000000000 and self.time_started > 5400 and base_balance.total > 1 and action["role"] == "entry":
                 self.c_trade[key] = True
             if self.c_trade.get(key, False):
-                price = round(best_bid + 0.01, price_dec)
+                price = round(best_ask - 0.01, price_dec)
                 response.limit_order(
                     book_id=book_id,
-                    direction=OrderDirection.BUY,
-                    quantity=max(0.25, min(base_qty, 90 - net_inv)),
+                    direction=OrderDirection.SELL,
+                    quantity=max(0.25, min(base_qty, base_balance.total - 1)),
                     price=price,
                     timeInForce=TimeInForce.GTT,
                     expiryPeriod=entry_ttl,
@@ -506,4 +503,4 @@ class MinerAgent_V3(FinanceSimulationAgent):
 
 if __name__ == "__main__":
     from taos.common.agents import launch
-    launch(MinerAgent_V3)
+    launch(MinerAgent_V4)

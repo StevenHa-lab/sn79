@@ -326,7 +326,7 @@ The script will:
 
 Example run command:
 ```
-./run_miner.sh -e finney -p ~/.bittensor/wallets/ -w huc_79 -h m-791 -u 79 -n MinerAgent_V1 -a 7903
+./run_miner.sh -e finney -p ~/.bittensor/wallets/ -w n_sn79 -h hk19 -u 79 -n MinerAgent_V5 -a 7907
 ```
 
 **With GenTRX distributed training** (see [§GenTRX](#gentrx)):
