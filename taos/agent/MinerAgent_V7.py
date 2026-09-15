@@ -280,6 +280,9 @@ class MinerAgent_V7(FinanceAgent):
         self.diag_fills = 0
         self.diag_side_mismatch = 0
         self.diag_rebase = 0
+        self.diag_dup_fills = 0
+        self._seen_tids = set()
+        self._seen_order = deque()
         self.reconcile = self._p("reconcile", 1)
         self._load_state()
 
@@ -392,6 +395,18 @@ class MinerAgent_V7(FinanceAgent):
             b = _attr(ev, "bookId", "b", default=None)
             if b is None:
                 continue
+            # the validator may re-deliver a fill notice in consecutive states: dedupe by trade id
+            tid = _attr(ev, "tradeId", "i", default=None)
+            if tid is not None:
+                key = (b, int(tid))
+                if key in self._seen_tids:
+                    self.diag_dup_fills += 1
+                    continue
+                self._seen_tids.add(key)
+                self._seen_order.append(key)
+                if len(self._seen_order) > 200_000:
+                    old = self._seen_order.popleft()
+                    self._seen_tids.discard(old)
             taker = _attr(ev, "takerAgentId", "Ta", default=-1)
             maker = _attr(ev, "makerAgentId", "Ma", default=-1)
             is_taker = taker == self.uid
@@ -709,7 +724,7 @@ class MinerAgent_V7(FinanceAgent):
             f"V7 [{vh[:8]}] t={ts // 1_000_000_000}s books={n} scored>=3:{active} frozen={frozen} "
             f"fills={fills} wins={wins} losses={losses} realized={realized:.4f} "
             f"|inv|={inv_abs:.2f} vol24h={vol:,.0f} rejects={rejects} "
-            f"side_mismatch={self.diag_side_mismatch}/{self.diag_fills} rebases={self.diag_rebase}"
+            f"side_mismatch={self.diag_side_mismatch}/{self.diag_fills} rebases={self.diag_rebase} dup_fills={self.diag_dup_fills}"
         )
 
 
