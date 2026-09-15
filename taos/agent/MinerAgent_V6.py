@@ -23,7 +23,7 @@ Design (derived from the validator's scoring code, see notes in the repo discuss
 All parameters can be overridden with ``--agent.params key=value ...``:
 
   size            order size in base units                     (default 0.25, floored at min_order_size)
-  edge_bps        target round-trip edge, basis points of mid    (default 4.0)
+  edge_bps        target round-trip edge, basis points of mid    (default 6.0)
   min_edge_ticks  floor on the round-trip edge, in ticks         (default 4)
   exit_bps        minimum profit on a FIFO-head exit, bps        (default 2.0)
   exit_ticks      floor on that profit, in ticks                 (default 2)
@@ -32,8 +32,15 @@ All parameters can be overridden with ``--agent.params key=value ...``:
   ttl_s           GTT lifetime of every order, sim seconds       (default 20)
   requote_ticks   re-quote when the desired price moves by more  (default 2)
   cap_frac        fraction of the 24 h notional cap to use       (default 0.85)
+  pace_headroom   share of the daily budget allowed ahead of the
+                  linear daily pace (0.05 = 5%)                  (default 0.05)
   max_resting     hard cap on my resting orders per book         (default 6)
-  log_every       ticks between summary log lines                (default 120)
+  log_every       ticks between summary log lines                (default 30)
+
+Pacing: the validator's cap is a rolling 24 h window per book that survives the daily
+simulation restart, so the agent keeps its per-book volume history across restarts and only
+quotes new entries while the rolling notional is below cap_frac * cap * (day_progress +
+pace_headroom).  Exits (quotes that reduce inventory) are always allowed.
 """
 
 import math
@@ -175,7 +182,7 @@ class MinerAgent_V6(FinanceAgent):
 
     def initialize(self):
         self.size = self._p("size", 0.25)
-        self.edge_bps = self._p("edge_bps", 4.0)
+        self.edge_bps = self._p("edge_bps", 6.0)
         self.min_edge_ticks = self._p("min_edge_ticks", 4)
         self.exit_bps = self._p("exit_bps", 2.0)
         self.exit_ticks = self._p("exit_ticks", 2)
@@ -184,8 +191,9 @@ class MinerAgent_V6(FinanceAgent):
         self.ttl_s = self._p("ttl_s", 20)
         self.requote_ticks = self._p("requote_ticks", 2)
         self.cap_frac = self._p("cap_frac", 0.85)
+        self.pace_headroom = self._p("pace_headroom", 0.05)
         self.max_resting = self._p("max_resting", 6)
-        self.log_every = self._p("log_every", 120)
+        self.log_every = self._p("log_every", 30)
 
         # per validator hotkey -> {book_id: _BookState}
         self.state_by_validator = {}
@@ -211,8 +219,12 @@ class MinerAgent_V6(FinanceAgent):
         return d
 
     def _reset_validator(self, vh, reason):
-        bt.logging.info(f"V6: resetting state for validator {vh[:8]}... ({reason})")
-        self.state_by_validator[vh] = {}
+        """Simulation restart: open lots are discarded by the validator, but its 24 h volume
+        cap is a rolling window that survives, so keep the volume history."""
+        bt.logging.info(f"V6: resetting lots for validator {vh[:8]}... ({reason})")
+        for bs in self.state_by_validator.get(vh, {}).values():
+            bs.longs.clear()
+            bs.shorts.clear()
 
     @staticmethod
     def _round_down(x, tick):
@@ -364,10 +376,13 @@ class MinerAgent_V6(FinanceAgent):
             cap_bid = head.price - (head.fee / head.qty if head.qty > 0 else 0.0) - maker_fee_px - exit_edge
             bid_px = min(bid_px, self._round_down(cap_bid, tick))
 
-        # gating: inventory cap and the rolling 24 h notional budget
+        # gating: inventory cap and the rolling 24 h notional budget, paced linearly
+        # through the simulation day so the cap is never exhausted early
         want_bid = inv < self.max_inv - 1e-9
         want_ask = inv > -self.max_inv + 1e-9
-        over_budget = bs.volume_24h(ts) >= vol_cap
+        day_pos = (ts % DAY_NS) / DAY_NS
+        allowed = vol_cap * min(1.0, day_pos + self.pace_headroom)
+        over_budget = bs.volume_24h(ts) >= allowed
         if over_budget:
             want_bid = want_bid and inv < -1e-9      # only if it reduces a short
             want_ask = want_ask and inv > 1e-9       # only if it reduces a long
