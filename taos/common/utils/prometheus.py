@@ -4,7 +4,6 @@
 Prometheus metrics server wrapper: starts a singleton HTTP server on a configured
 port and exposes a `prometheus` class for server lifecycle management.
 """
-import os
 import argparse
 import bittensor as bt
 from typing import Union
@@ -16,6 +15,7 @@ class prometheus:
 
     # Prometheus global logging levels.
     class level(Enum):
+        """Prometheus verbosity levels: OFF, INFO, DEBUG."""
         OFF = "OFF"
         INFO = "INFO"
         DEBUG = "DEBUG"
@@ -51,14 +51,14 @@ class prometheus:
             start_server (bool): If True, start the built-in HTTP server. If False,
                 configure for use with an external server. Defaults to True.
         """
-        if config == None:
+        if config is None:
             config = prometheus.config()
 
         if isinstance(level, prometheus.level):
             level = level.name  # Convert ENUM to str.
 
-        config.prometheus.port = port if port != None else config.prometheus.port
-        config.prometheus.level = level if level != None else config.prometheus.level
+        config.prometheus.port = port if port is not None else config.prometheus.port
+        config.prometheus.level = level if level is not None else config.prometheus.level
 
         if isinstance(config.prometheus.level, str):
             config.prometheus.level = (
@@ -113,8 +113,8 @@ class prometheus:
     def config(cls) -> "bt.Config":
         """
         Get config from the argument parser
-        
-        Return: bt.Config object
+
+        Returns: bt.Config object
         """
         parser = argparse.ArgumentParser()
         cls.add_args(parser=parser)
@@ -130,7 +130,12 @@ class prometheus:
 
     @classmethod
     def add_args(cls, parser: argparse.ArgumentParser, prefix: str = None):
-        """Accept specific arguments from parser"""
+        """Accept specific arguments from parser
+
+        Args:
+            parser: The argument parser to extend.
+            prefix: Optional prefix for the argument names.
+        """
         try:
             parser.add_argument(
                 "--prometheus.port",
@@ -147,7 +152,7 @@ class prometheus:
                 default="INFO",
                 help="""Prometheus logging level. <OFF | INFO | DEBUG>""",
             )
-        except argparse.ArgumentError as e:
+        except argparse.ArgumentError:
             pass
 
     @classmethod

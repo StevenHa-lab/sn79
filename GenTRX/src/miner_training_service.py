@@ -25,7 +25,12 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from GenTRX.src.gradient_store import GradientStore
+    from GenTRX.src.model import ModelConfig, OrderModel
+    from GenTRX.src.tokenizer import OrderTokenizer, TokenizerConfig
 
 from GenTRX.src.bt_log import gtx_log
 from GenTRX.src.util.paths import default_output_dir
@@ -50,13 +55,21 @@ class MinerTrainingConfig:
     """
 
     uid: int
+    # Extra UIDs this instance also trains for (besides `uid`), sharing the
+    # in-memory base model + GPU. Gradients still go to each UID's own path.
+    uids: list[int] = field(default_factory=list)
     output_dir: Path = field(default_factory=default_output_dir)
     gradient_dir: Path | None = None  # defaults to output_dir / "gradients"
-    train_steps: int = 500
+    # Wall-clock training budget per round (seconds). Split across the UIDs
+    # served this round; train_incremental stops each UID when its slice is up.
+    # Keep below the round wallclock minus model/data download + upload headroom.
+    round_budget_s: float = 240.0
+    # Optional fixed total-step cap per UID (0 = budget-governed, the default).
+    train_steps: int = 0
     train_batch_size: int = 16
     train_seq_len: int = 256
     train_lr: float = 1e-4
-    top_k_frac: float = 0.05
+    top_k_frac: float = 0.10
     label_smooth_sigma: float = 1.0
     aggregator_uid: int = 0
     # Training mode shard: "simulation" (default) or "exchange". Combined
@@ -85,6 +98,7 @@ class _TrainingState:
     """Runtime state — not part of the public config."""
 
     pending_assignments: list[dict] = field(default_factory=list)
+    registered_uids: set[int] = field(default_factory=set)
     training_thread: threading.Thread | None = None
     training_in_progress: bool = False
     train_window_id: int = 0
@@ -132,6 +146,13 @@ class MinerTrainingService:
         self.cfg.gradient_dir.mkdir(parents=True, exist_ok=True)
 
         self.state = _TrainingState()
+        # UIDs budgeted up front each round; dynamically-pushed UIDs get added
+        # here after their first (leftover-time) round.
+        self.state.registered_uids = {self.cfg.uid, *self.cfg.uids}
+        # gradient_dir is resolved to a concrete Path above; expose it non-optional
+        # so downstream path joins don't trip the Optional field type.
+        self.gradient_dir: Path = self.cfg.gradient_dir
+
         self._lock = threading.Lock()  # protects pending_assignments + training_in_progress
 
         # Subtensor (set later via attach_subtensor for chain-based discovery)
@@ -155,10 +176,10 @@ class MinerTrainingService:
         )
 
         # Model / tokenizer (loaded lazily)
-        self.model = None
-        self.tokenizer = None
-        self.model_cfg = None
-        self.tokenizer_cfg = None
+        self.model: "OrderModel | None" = None
+        self.tokenizer: "OrderTokenizer | None" = None
+        self.model_cfg: "ModelConfig | None" = None
+        self.tokenizer_cfg: "TokenizerConfig | None" = None
         # Set at init from torch's view of CUDA so the startup banner reflects
         # the device that _load_model_from_checkpoint will pick. Re-checked at
         # load time so dynamic CUDA visibility changes still work.
@@ -169,10 +190,15 @@ class MinerTrainingService:
             self.device = "cpu"
 
         # S3 stores
-        self._store = None  # aggregator-bucket fallback (env-var)
-        self._data_store = None  # default data store (== _store unless overridden)
-        self._write_store = None  # per-miner write bucket
-        self._discovered_aggregator_store = None  # cached chain-based discovery
+        self._store: "GradientStore | None" = None  # aggregator-bucket fallback (env-var)
+        self._data_store: "GradientStore | None" = None  # default data store (== _store unless overridden)
+        self._write_store: "GradientStore | None" = None  # per-miner write bucket
+        self._discovered_aggregator_store: "GradientStore | None" = None  # cached chain-based discovery
+        # Guards the discovery cache so concurrent training threads don't both
+        # walk the metagraph + probe every uid's bucket. In practice the
+        # training loop is serialized, but the public API surface allows
+        # external callers (status endpoints, ad-hoc scripts) to land here too.
+        self._discovered_aggregator_store_lock = threading.Lock()
         self._discovered_aggregator_uid: int = self.cfg.aggregator_uid
         self._s3_cache_dir: Path | None = None
         self._s3_cached_files: dict[str, Path] = {}
@@ -240,13 +266,17 @@ class MinerTrainingService:
         if not isinstance(payload, dict) or "round" not in payload:
             return {"status": "rejected", "reason": "invalid payload"}
 
+        # The forwarding agent tags the assignment with its own UID. Fall back
+        # to this instance's primary UID for single-UID / legacy callers.
+        payload.setdefault("miner_uid", self.cfg.uid)
+
         with self._lock:
             self.state.pending_assignments.append(payload)
             in_progress = self.state.training_in_progress
 
         round_id = payload.get("round", "?")
         self._tlog.info(
-            f"assignment queued: round={round_id} "
+            f"assignment queued: round={round_id} uid={payload.get('miner_uid')} "
             f"validator_uid={payload.get('validator_uid', '?')} "
             f"books={payload.get('books', [])} "
             f"data_files={len(payload.get('data', []))} "
@@ -392,7 +422,7 @@ class MinerTrainingService:
     # ------------------------------------------------------------------
 
     def _kick_training(self) -> None:
-        """Spawn the background thread to consume pending assignments."""
+        """Spawn the background thread to train all pending per-UID assignments."""
         with self._lock:
             if self.state.training_in_progress:
                 return
@@ -402,33 +432,21 @@ class MinerTrainingService:
                 return
             self.state.training_in_progress = True
 
-        # Merge across validators
-        all_data_keys: list[str] = []
-        all_books: list[str] = []
-        target_v = 0
-        primary = assignments[0]
+        by_uid: dict[int, list[dict]] = {}
         for a in assignments:
-            all_data_keys.extend(a.get("data", []))
-            all_books.extend(a.get("books", []))
-            v = int(a.get("model_version", 0) or 0)
-            if v > target_v:
-                target_v = v
-
-        self._tlog.info(
-            f"assignments: {len(assignments)} validator(s), "
-            f"round={primary.get('round', '?')} "
-            f"model_v={target_v} books={all_books} "
-            f"data={len(all_data_keys)} files total"
+            by_uid.setdefault(int(a.get("miner_uid", self.cfg.uid)), []).append(a)
+        target_v = max(
+            (int(a.get("model_version", 0) or 0) for a in assignments), default=0
         )
 
-        if not all_data_keys:
-            self._tlog.info("no data keys in any assignment — skipping")
-            with self._lock:
-                self.state.training_in_progress = False
-            return
+        self._tlog.info(
+            f"training kick: {len(by_uid)} uid(s) {sorted(by_uid)} "
+            f"model_v={target_v} round_budget={self.cfg.round_budget_s:.0f}s"
+        )
+
         if self.model is None and target_v <= 0:
             self._tlog.info(
-                "no model loaded and assignment has no model_version — skipping (assignments preserved)"
+                "no model and no model_version — skipping (assignments preserved)"
             )
             with self._lock:
                 self.state.pending_assignments = assignments + self.state.pending_assignments
@@ -436,174 +454,177 @@ class MinerTrainingService:
             return
 
         self.state.training_thread = threading.Thread(
-            target=self._download_and_train_background,
-            args=(assignments, target_v, primary, all_books),
+            target=self._train_all_uids_background,
+            args=(by_uid, target_v),
             daemon=True,
         )
         self.state.training_thread.start()
 
-    def _download_and_train_background(
-        self,
-        assignments: list[dict],
-        target_v: int,
-        primary: dict,
-        all_books: list[str],
-    ) -> None:
-        try:
-            if self.model is None:
-                self._tlog.info(f"no local model — bootstrapping from assignment (v{target_v})")
-                if not self._ensure_model_version(target_v, primary) or self.model is None:
-                    self._tlog.info("model bootstrap failed — skipping (assignments preserved)")
-                    with self._lock:
-                        self.state.pending_assignments = assignments + self.state.pending_assignments
-                    return
+    def _train_all_uids_background(self, by_uid: dict, target_v: int) -> None:
+        """Train every pending UID against one shared base model.
 
-            need_model = target_v > self.state.model_version and target_v > 0
+        Downloads the target checkpoint once, then for each UID deepcopies the
+        base model, trains its pages incrementally within a budget slice, and
+        uploads a distinct gradient. Registered UIDs get equal guaranteed
+        slices; an unregistered (dynamically-pushed) UID trains on leftover time
+        this round and is registered for the next one.
+        """
+        try:
+            primary = next(iter(by_uid.values()))[0]
+            need_model = self.model is None or (
+                target_v > self.state.model_version and target_v > 0
+            )
             if need_model:
                 self._tlog.info(
-                    f"model rollover: v{self.state.model_version} → v{target_v}, downloading..."
+                    f"ensuring model v{target_v} (have v{self.state.model_version})..."
                 )
+                ok = self._ensure_model_version(target_v, primary)
+                if self.model is None:
+                    self._tlog.info("model bootstrap failed — assignments preserved")
+                    with self._lock:
+                        for lst in by_uid.values():
+                            self.state.pending_assignments = (
+                                lst + self.state.pending_assignments
+                            )
+                    return
+                if not ok:
+                    self._tlog.warning(
+                        f"model v{target_v} unavailable — training on v{self.state.model_version}"
+                    )
 
-            from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutTimeout
+            registered = [u for u in by_uid if u in self.state.registered_uids]
+            if registered:
+                per_uid = self.cfg.round_budget_s / len(registered)
+                order = registered + [
+                    u for u in by_uid if u not in self.state.registered_uids
+                ]
+            else:
+                per_uid = self.cfg.round_budget_s / max(1, len(by_uid))
+                order = list(by_uid)
 
-            MODEL_DL_TIMEOUT_S = 60.0
-            DATA_DL_TIMEOUT_S = 90.0
-            with ThreadPoolExecutor(max_workers=1 + len(assignments)) as pool:
-                f_model = (
-                    pool.submit(self._ensure_model_version, target_v, primary)
-                    if need_model else None
-                )
-                f_data = [pool.submit(self._download_assignment_data, a) for a in assignments]
-
-                if f_model is not None:
-                    try:
-                        model_ok = f_model.result(timeout=MODEL_DL_TIMEOUT_S)
-                    except FutTimeout:
-                        model_ok = False
-                        self._tlog.warning(
-                            f"model v{target_v} download timed out after "
-                            f"{MODEL_DL_TIMEOUT_S:.0f}s — training on v{self.state.model_version}"
-                        )
-                    if not model_ok:
-                        self._tlog.warning(
-                            f"model v{target_v} download failed — training on v{self.state.model_version}"
-                        )
-                parquet_files: list[Path] = []
-                for f in f_data:
-                    try:
-                        parquet_files.extend(f.result(timeout=DATA_DL_TIMEOUT_S))
-                    except FutTimeout:
-                        self._tlog.warning(f"data download timed out after {DATA_DL_TIMEOUT_S:.0f}s")
-
-            if not parquet_files:
-                self._tlog.warning("download failed for all files — skipping")
-                return
-
-            self._tlog.info(f"{len(parquet_files)} files ready, deepcopy model...")
-            train_model = copy.deepcopy(self.model)
-
-            self._tlog.info(
-                f"window {self.state.train_window_id} STARTED | "
-                f"{len(parquet_files)} files from {len(assignments)} validator(s) | "
-                f"books={all_books} | "
-                f"{self.cfg.train_steps} steps | "
-                f"model_v={target_v}"
-            )
-            self._train_background(parquet_files, train_model, primary)
+            spent = 0.0
+            for uid in order:
+                if uid in self.state.registered_uids:
+                    budget = per_uid
+                else:
+                    budget = min(per_uid, max(0.0, self.cfg.round_budget_s - spent))
+                    self.state.registered_uids.add(uid)  # promote for next round
+                if budget <= 0:
+                    self._tlog.info(
+                        f"uid {uid}: no budget left this round — deferred (registered next round)"
+                    )
+                    continue
+                spent += self._train_one_uid(uid, by_uid[uid], target_v, budget)
         except Exception as exc:
-            self._tlog.error(f"_download_and_train_background failed: {exc}")
+            self._tlog.error(f"_train_all_uids_background failed: {exc}")
             import traceback
             self._tlog.error(traceback.format_exc())
         finally:
             with self._lock:
                 self.state.training_in_progress = False
+            try:
+                self._prune_gradients()
+            except Exception:
+                pass
             self._tlog.info("thread finished")
             self._clear_s3_cache()
 
-    def _train_background(
-        self, parquet_files: list[Path], train_model, assignment: dict | None = None
-    ) -> None:
-        try:
-            from GenTRX.src.dataloader import OrderDataset, ChunkSampler
-            from GenTRX.src.distributed import train_window, WindowConfig
-            from GenTRX.src.gradient import compress, serialize
-            from torch.utils.data import DataLoader
+    def _build_page_loaders(self, files: list):
+        """One DataLoader per page file, order preserved (recent pages first)."""
+        from GenTRX.src.dataloader import OrderDataset, ChunkSampler
+        from torch.utils.data import DataLoader
 
-            self._tlog.info(f" building dataset from {len(parquet_files)} files...")
-            dataset = OrderDataset(
-                parquet_files,
-                seq_len=self.cfg.train_seq_len,
-                tokenizer=self.tokenizer,
-                max_cached=2,
-            )
-            sampler = ChunkSampler(dataset, shuffle=True)
-            loader = DataLoader(
-                dataset,
-                batch_size=self.cfg.train_batch_size,
-                sampler=sampler,
-                num_workers=0,
-            )
-            self._tlog.info(
-                f"dataset ready: {dataset.total_orders} orders, "
-                f"{len(loader)} batches, training {self.cfg.train_steps} steps..."
-            )
-
-            win_cfg = WindowConfig(
-                n_steps=self.cfg.train_steps,
-                lr=self.cfg.train_lr,
-                window_id=self.state.train_window_id,
-                miner_uid=self.cfg.uid,
-                # Tag with the version actually loaded so the aggregator's
-                # version-mismatch filter can drop stale-regime gradients.
-                # Without this the metadata defaults to 0 and the filter
-                # silently passes everything through (trained_v=0 is falsy).
-                model_version=int(self.state.model_version or 0),
-                label_smooth_sigma=self.cfg.label_smooth_sigma,
-            )
-            delta = train_window(train_model, loader, win_cfg, self.device)
-            self._tlog.info(
-                f"training done: loss {delta.metadata.loss_before:.4f} → {delta.metadata.loss_after:.4f}"
-            )
-
-            comp = compress(delta, top_k_frac=self.cfg.top_k_frac)
-            data = serialize(comp)
-
-            round_id = (assignment or {}).get("round", self.state.train_window_id)
-            if self._write_store is not None:
-                try:
-                    self._write_store.put_gradient(
-                        miner_uid=self.cfg.uid,
-                        round_id=round_id,
-                        data=data,
-                    )
-                    self._tlog.info(f"gradient uploaded to S3 (round={round_id})")
-                    self.state.last_uploaded_round = round_id
-                    self._prune_gradients()
-                    self._prune_s3_cache()
-                except Exception as exc:
-                    self._tlog.warning(f"S3 upload failed: {exc} — saving for retry")
-                    pending_dir = self.cfg.gradient_dir / "pending"
-                    pending_dir.mkdir(parents=True, exist_ok=True)
-                    pending_path = pending_dir / f"block_{round_id:08d}_miner_{self.cfg.uid}.grad"
-                    pending_path.write_bytes(data)
-            else:
-                raise RuntimeError(
-                    "No S3 store configured. Set GENTRX_AGENT_S3_* env vars to enable gradient upload."
+        loaders = []
+        for f in files:
+            try:
+                ds = OrderDataset(
+                    [f],
+                    seq_len=self.cfg.train_seq_len,
+                    tokenizer=self.tokenizer,
+                    max_cached=1,
                 )
-
-            self.state.last_loss_before = float(delta.metadata.loss_before)
-            self.state.last_loss_after = float(delta.metadata.loss_after)
-            self._tlog.info(
-                f"window {self.state.train_window_id} COMPLETE | "
-                f"loss {delta.metadata.loss_before:.4f} → {delta.metadata.loss_after:.4f} | "
-                f"gradient {len(data)/1024:.1f} KB"
+            except Exception as exc:
+                self._tlog.debug(f"skip page {f}: {exc}")
+                continue
+            loaders.append(
+                DataLoader(
+                    ds,
+                    batch_size=self.cfg.train_batch_size,
+                    sampler=ChunkSampler(ds, shuffle=True),
+                    num_workers=0,
+                )
             )
-            self.state.train_window_id += 1
+        return loaders
 
-        except Exception as exc:
-            self._tlog.error(f"FAILED: {exc}")
-            import traceback
-            self._tlog.error(traceback.format_exc())
+    def _write_store_for(self, uid: int):
+        """Per-UID write store. Defaults to the shared store (one bucket, with
+        `{uid}` in the path). Per-UID credential files are a future option."""
+        return self._write_stores.get(uid, self._write_store)
+
+    def _train_one_uid(
+        self, uid: int, assignments: list[dict], target_v: int, budget_s: float
+    ) -> float:
+        """Train one UID's pages within budget_s and upload its gradient.
+
+        Returns wall-clock seconds spent (download + train) so the caller can
+        track the remaining round budget for any leftover UIDs.
+        """
+        import time as _time
+
+        from GenTRX.src.distributed import train_incremental, WindowConfig
+        from GenTRX.src.gradient import compress, serialize
+
+        t0 = _time.perf_counter()
+        files: list[Path] = []
+        for a in assignments:
+            files.extend(self._download_assignment_data(a))
+        loaders = self._build_page_loaders(files)
+        if not loaders:
+            self._tlog.warning(f"uid {uid}: no trainable pages — skipping")
+            return _time.perf_counter() - t0
+
+        round_id = int(assignments[0].get("round", self.state.train_window_id))
+        train_model = copy.deepcopy(self.model)
+        self._tlog.info(
+            f"uid {uid}: window {self.state.train_window_id} START | "
+            f"{len(loaders)} pages | budget={budget_s:.0f}s | model_v={target_v}"
+        )
+        win_cfg = WindowConfig(
+            n_steps=self.cfg.train_steps,   # 0 = budget-governed
+            lr=self.cfg.train_lr,
+            window_id=self.state.train_window_id,
+            miner_uid=uid,
+            model_version=target_v,
+            label_smooth_sigma=self.cfg.label_smooth_sigma,
+            budget_s=budget_s,
+        )
+        delta = train_incremental(train_model, loaders, win_cfg, self.device)
+        data = serialize(compress(delta, top_k_frac=self.cfg.top_k_frac))
+
+        store = self._write_store_for(uid)
+        if store is not None:
+            try:
+                store.put_gradient(miner_uid=uid, round_id=round_id, data=data)
+                self._tlog.info(
+                    f"uid {uid}: gradient uploaded (round={round_id}, {len(data)/1024:.1f} KB)"
+                )
+                self.state.last_uploaded_round = round_id
+            except Exception as exc:
+                self._tlog.warning(f"uid {uid}: S3 upload failed: {exc} — saving for retry")
+                pending_dir = self.cfg.gradient_dir / "pending"
+                pending_dir.mkdir(parents=True, exist_ok=True)
+                (pending_dir / f"block_{round_id:08d}_miner_{uid}.grad").write_bytes(data)
+        else:
+            self._tlog.warning(f"uid {uid}: no write store configured — gradient dropped")
+
+        self.state.last_loss_before = float(delta.metadata.loss_before)
+        self.state.last_loss_after = float(delta.metadata.loss_after)
+        self.state.train_window_id += 1
+        self._tlog.info(
+            f"uid {uid}: COMPLETE | loss {delta.metadata.loss_before:.4f} → "
+            f"{delta.metadata.loss_after:.4f} | {delta.metadata.steps_trained} steps"
+        )
+        return _time.perf_counter() - t0
 
     # ------------------------------------------------------------------
     # Internal: S3 store discovery + downloads
@@ -803,18 +824,39 @@ class MinerTrainingService:
             if target <= self.state.model_version:
                 return True
 
-            gtx_log.info(f"Downloading checkpoint v{target} from aggregator bucket")
-            ckpt_bytes = store.get_checkpoint(agg_uid, target)
+            from GenTRX.src.distributed import apply_version_deltas
+
+            # Fast path: advance an existing model by applying canonical deltas.
+            if self.model is not None and self.state.model_version > 0:
+                expected = {n: p.shape for n, p in self.model.named_parameters()}
+                reached = apply_version_deltas(
+                    self.model, store, agg_uid, self.state.model_version, target, expected
+                )
+                if reached >= target:
+                    self.state.model_version = target
+                    gtx_log.info(f"Advanced model via deltas → v{target}")
+                    return True
+                gtx_log.info(f"Delta gap after v{reached}; reloading baseline")
+
+            # Cold start / delta gap: download latest baseline, replay to head.
+            baseline_v = latest if latest > 0 else target
+            gtx_log.info(f"Downloading baseline checkpoint v{baseline_v} from aggregator bucket")
+            ckpt_bytes = store.get_checkpoint(agg_uid, baseline_v)
             stage_dir = self.cfg.output_dir / "ckpt_cache"
             stage_dir.mkdir(parents=True, exist_ok=True)
             tmp = stage_dir / f"gentrx_ckpt_{self.cfg.uid}.pt"
             tmp.write_bytes(ckpt_bytes)
             self._load_model(str(tmp))
-            self.state.model_version = target
-            gtx_log.info(f"Model loaded: v{target}")
-            return True
+            self.state.model_version = baseline_v
+            if baseline_v < target:
+                expected = {n: p.shape for n, p in self.model.named_parameters()}
+                self.state.model_version = apply_version_deltas(
+                    self.model, store, agg_uid, baseline_v, target, expected
+                )
+            gtx_log.info(f"Model at v{self.state.model_version} (target v{target})")
+            return self.state.model_version >= target
         except Exception as exc:
-            gtx_log.warning(f"Checkpoint v{target} fetch failed: {exc}")
+            gtx_log.warning(f"Model sync to v{target} failed: {exc}")
             return False
 
     def _load_model(self, checkpoint: str) -> None:
@@ -860,25 +902,31 @@ class MinerTrainingService:
         return len(list(pending_dir.glob("*.grad")))
 
     def _prune_gradients(self) -> None:
-        """Trim the gradients/ prefix to the configured retention.
+        """Trim each served UID's gradients/ prefix to the configured retention.
 
         Hot bucket only — operators wanting long history should pull
         objects to cold storage on their own cadence.
         """
-        if self._write_store is None or self.cfg.keep_gradients <= 0:
+        if self.cfg.keep_gradients <= 0:
             return
-        try:
-            n = self._write_store.prune_keep_latest(
-                f"gradients/{self.cfg.uid}/",
-                keep=self.cfg.keep_gradients,
-                suffix=".grad",
-            )
-            if n:
-                self._tlog.info(
-                    f"pruned {n} old gradient(s), keeping latest {self.cfg.keep_gradients}"
+        for uid in sorted(self.state.registered_uids):
+            store = self._write_store_for(uid)
+            if store is None:
+                continue
+            try:
+                n = store.prune_keep_latest(
+                    f"gradients/{uid}/",
+                    keep=self.cfg.keep_gradients,
+                    suffix=".grad",
                 )
-        except Exception as exc:
-            self._tlog.debug(f"gradient prune failed: {exc}")
+                if n:
+                    self._tlog.info(
+                        f"uid {uid}: pruned {n} old gradient(s), "
+                        f"keeping latest {self.cfg.keep_gradients}"
+                    )
+            except Exception as exc:
+                self._tlog.debug(f"uid {uid}: gradient prune failed: {exc}")
+
 
     def _prune_s3_cache(self) -> None:
         """Age-evict files under <output_dir>/_s3_cache/.

@@ -23,6 +23,14 @@ Account::Account(uint32_t bookCount, std::optional<Balances> balances) noexcept
 
 //-------------------------------------------------------------------------
 
+Account::Account(Account::Holdings balances) noexcept
+{
+    m_holdings = std::move(balances);
+    m_activeOrders.resize(m_holdings.size());
+}
+
+//-------------------------------------------------------------------------
+
 void Account::jsonSerialize(rapidjson::Document& json, const std::string& key) const
 {
     auto serialize = [this](rapidjson::Document& json) {
@@ -76,11 +84,21 @@ Account Account::fromJson(const rapidjson::Value& json)
 {
     return Account{
         [&] -> Account::Holdings {
+            // One quote per AGENT, shared across books, matching helpers::makeHoldings. Balances::fromJson
+            // allocates a new quote per entry, so restoring without this gives every book its own TAO
+            // balance and only book 0 ever gets reconciled to the chain. See AccountRegistry::registerJson.
             Account::Holdings holdings;
             const rapidjson::Value& holdingsArrayJson = json["holdings"].GetArray();
             const uint32_t bookCount = holdingsArrayJson.Size();
+            std::shared_ptr<Balance> sharedQuote;
             for (BookId bookId = 0; bookId < bookCount; ++bookId) {
-                holdings.push_back(Balances::fromJson(holdingsArrayJson[bookId]));
+                auto bal = Balances::fromJson(holdingsArrayJson[bookId]);
+                if (!sharedQuote) {
+                    sharedQuote = bal.quote;
+                } else {
+                    bal.quote = sharedQuote;
+                }
+                holdings.push_back(std::move(bal));
             }
             return holdings;
         }(),

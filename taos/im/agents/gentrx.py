@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2025 Rayleigh Research <to@rayleigh.re>
 # SPDX-License-Identifier: MIT
 """GenTRXAgent
-    taos FinanceSimulationAgent for data collection, inference, and distributed training.
+    taos FinanceAgent for data collection, inference, and distributed training.
 
 All GenTRX-owned --agent.params keys carry a `gtx_` prefix to avoid colliding
 with strategy-owned keys when this agent is subclassed by a third-party
@@ -58,18 +58,19 @@ Inference params:
     gtx_quantity          (float): Order size in base units. Default: 1.0
 
 Training params:
-    gtx_training_enabled  (bool):  Enable assignment-driven training. Default: true
-    gtx_train_steps       (int):   Steps per training window. Default:
-                                   500 on cuda, 100 on cpu (CPU is much slower
-                                   per step; 5× fewer steps keeps cycle wall-
-                                   time reasonable).
+    gtx_training_enabled  (bool):  Enable assignment-driven training (opt-in; needs
+                                   the [gentrx] extra). Default: false
+    gtx_train_steps       (int):   Optional fixed-step cap per window. Default
+                                   0 = one pass over the assigned pages.
+    gtx_round_budget_s    (float): Wall-clock training budget per round, in
+                                   seconds. Default: 240.
     gtx_train_batch_size  (int):   Batch size. Default: 16 on cuda, 4 on cpu
                                    (attention is quadratic in seq×batch;
                                    smaller batch cuts CPU memory + per-step
                                    cost without changing data semantics).
     gtx_train_seq_len     (int):   Sequence length (also min observations). Default: 256
     gtx_train_lr          (float): Learning rate. Default: 1e-4
-    gtx_top_k_frac        (float): Gradient compression ratio. Default: 0.05
+    gtx_top_k_frac        (float): Gradient compression ratio. Default: 0.10
     gtx_label_smooth_sigma (float): Soft-CE width in bins (0 = strict). Must
                                     match the gradient server. Default: 1.0
     gtx_device            (str):   Device override ("cpu", "cuda", "cuda:0", or
@@ -103,27 +104,51 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import polars as pl
-import pyarrow as pa
-import pyarrow.parquet as pq
 import bittensor as bt
 
 from fastapi import Request
-from taos.im.agents import FinanceSimulationAgent
-from taos.im.protocol import MarketSimulationStateUpdate, FinanceAgentResponse
+from taos.im.agents import FinanceAgent, UnifiedAgentResponse, ExchangeStateUpdate
+from taos.im.protocol import MarketSimulationStateUpdate
 from taos.im.protocol.instructions import OrderDirection
 from taos.im.protocol.events import SimulationEndEvent
 
+# Light GenTRX helpers (no heavy deps) — safe on a core install; default_output_dir
+# is used in initialize() (the basic, non-training path).
 from GenTRX.src.bt_log import gtx_log
-from GenTRX.src.orderbook import MatchingEngine, LobSnapshot
 from GenTRX.src.util.paths import default_output_dir
-from GenTRX.src.util.schema import (
-    BID,
-    ASK,
-    CANCEL,
-    LOB_DEPTH,
-    order_stream_schema,
-)
+
+# GenTRX distributed-training deps are the OPT-IN [gentrx] extra (polars, pyarrow;
+# GenTRX.src.util.schema imports pyarrow). GenTRXAgent and basic trading import on
+# core deps alone — only opt-in training/inference (gtx_training_enabled /
+# gtx_n_trajectories>0) touch these, and every such path is gated on
+# training_enabled/inference_enabled. Bind to None when absent so the module still
+# imports; initialize() raises a clear "install .[gentrx]" error if the agent is
+# actually configured for training/inference without them.
+try:
+    import polars as pl
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from GenTRX.src.orderbook import MatchingEngine, LobSnapshot
+    from GenTRX.src.util.schema import (
+        BID,
+        ASK,
+        CANCEL,
+        EXEC_BUY,
+        EXEC_SELL,
+        LOB_DEPTH,
+        DEFAULT_PRICE_DECIMALS,
+        DEFAULT_VOLUME_DECIMALS,
+        order_stream_schema,
+    )
+    _GENTRX_DEPS_AVAILABLE = True
+    _GENTRX_IMPORT_ERROR = None
+except ImportError as _exc:
+    pl = pa = pq = None
+    MatchingEngine = LobSnapshot = order_stream_schema = None
+    BID = ASK = CANCEL = EXEC_BUY = EXEC_SELL = LOB_DEPTH = None
+    DEFAULT_PRICE_DECIMALS = DEFAULT_VOLUME_DECIMALS = None
+    _GENTRX_DEPS_AVAILABLE = False
+    _GENTRX_IMPORT_ERROR = _exc
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +195,20 @@ class _GenTRXState:
     Fields are populated by ``GenTRXAgent.initialize()``; this class
     only declares them.
     """
+
+    # SAFE DEFAULTS, so a bare state object never raises AttributeError.
+    #
+    # These are only annotations below; without class-level values, reading any field before
+    # initialize() populates it is an AttributeError that kills the MINER, not just the agent. That is
+    # exactly what gtx_enabled=false produces: initialize() returns early by design, leaving the object
+    # bare, while miner.py:99 still calls _ensure_model_version() on every startup. Guarding each read
+    # site was whack-a-mole -- model, then gentrx_inited, then store, each found only by crashing.
+    # Defaults fix the class of bug instead of its instances. initialize() overwrites all of them, so
+    # an enabled agent is unaffected.
+    enabled: bool = True
+    gentrx_inited: bool = False
+    model = None
+    store = None
 
     # ---- Data collection config (gtx_* params) ----
     output_dir: Path
@@ -235,22 +274,83 @@ class _GenTRXState:
     retry_last_at: float
     retry_cooldown: float
 
+    # ---- Lazy first-tick init guard ----
+    # Mode-dependent setup (gtx_mode → bucket_prefix → S3 stores → checkpoint
+    # bootstrap) cannot run in initialize() because _exchange_mode is only set
+    # after the first update(). _ensure_gentrx_inited() flips this on the first
+    # respond() call and short-circuits subsequent ticks.
+    gentrx_inited: bool
+
+    # ---- Co-base signal cache ----
+    # When a composed agent extends both ComposedAgentBase AND GenTRXAgent, the
+    # composer's engines.gentrx in_process module reads the latest per-book
+    # signal via :meth:`GenTRXAgent.gentrx_signal`. The cache is populated each
+    # tick by ``_execute_signal`` regardless of co-base status (the standalone
+    # path also places orders; the co-base path only reads the cache and lets
+    # the composer's weapons module decide what to do).
+    last_signals: dict[int, float]
 
 # ---------------------------------------------------------------------------
 # Agent
 # ---------------------------------------------------------------------------
 
 
-class GenTRXAgent(FinanceSimulationAgent):
-    """GenTRX data collection + optional inference + optional distributed training."""
+class GenTRXAgent(FinanceAgent):
+    """GenTRX data collection + optional inference + optional distributed training.
+
+    Mode-agnostic: runs under both ``MarketSimulationStateUpdate`` and
+    ``ExchangeStateUpdate``. ``gtx_mode`` (bucket shard) is derived from the
+    actual run mode on the first ``respond()`` call. GenTRX runs simulation-only
+    for now (``exchange_mode=False``); the interface supports exchange.
+    """
 
     def initialize(self) -> None:
+        """Set up the agent: strategy state, per-book records and the training-server link when configured."""
         bt.logging.set_info()
 
         # All GenTRX-owned state lives under self._gtx; subclasses see one
         # reserved attribute on self instead of every internal name.
         self._gtx = _GenTRXState()
         g = self._gtx
+
+        # gtx_enabled=false: FULL off switch, not just "do not train".
+        #
+        # gtx_collect_data and gtx_training_enabled gate collection and training, but the setup BELOW
+        # runs regardless: bucket prefix, S3 stores, checkpoint resolution. That work is expensive in
+        # both memory and startup latency
+        # start and the miner serving its axon, and a miner that cannot answer for that long is not
+        # usable. It also holds substantial RSS on a box where RAM is the binding constraint.
+        #
+        # A caller that wants GenTRX genuinely off had no way to say so. This is that way. Every gtx_*
+        # feature flag is forced off and setup is skipped, so the agent behaves as a pure trader: the
+        # event hooks below all short-circuit on collect_data/training_enabled/inference_enabled.
+        # GenTRX IS OPT-IN: with no gtx_* settings at all, it must not initialise. (Operator decision,
+        # 2026-08-09.) Defaulting `enabled` to True meant every agent inheriting GenTRXAgent paid the
+        # full setup cost -- bucket prefix, S3 stores, checkpoint resolution -- whether or not anyone
+        # asked for it, which is what put 563s to >944s between process start and the axon serving.
+        #
+        # Explicit gtx_enabled always wins. Otherwise presence of ANY other gtx_* setting is read as
+        # intent to use GenTRX, so existing configs that set gtx_training_enabled/gtx_collect_data keep
+        # working without also having to learn about this flag.
+        # Read intent from the VALUE, not the presence of the key: several agents set
+        # gtx_training_enabled/gtx_collect_data to False in their own initialize() to opt out, and
+        # treating that as "a gtx_* setting exists" would switch GenTRX back ON for exactly the agents
+        # trying to turn it off.
+        _gtx_asked = any(
+            _cfg_bool(self.config, _k, False)
+            for _k in ("gtx_training_enabled", "gtx_collect_data", "gtx_inference_enabled")
+        )
+        g.enabled = _cfg_bool(self.config, "gtx_enabled", _gtx_asked)
+        if not g.enabled:
+            g.collect_data = False
+            g.training_enabled = False
+            g.inference_enabled = False
+            # miner.py:99 reads _gtx.model unconditionally when the agent exposes _gtx, so the state
+            # object must still answer for it or the MINER dies at startup with AttributeError. Leaving
+            # a half-built state object behind is how a "disable" flag turns into an outage.
+            g.model = None
+            bt.logging.info("[GTX] disabled via gtx_enabled=false; skipping all GenTRX setup")
+            return
 
         # ---- Data collection config (gtx_* params) ----
         # Default resolves to <repo>/agents/data/<uid>/ via __file__-anchored
@@ -268,7 +368,7 @@ class GenTRXAgent(FinanceSimulationAgent):
         # Set gtx_collect_data=false on pure training agents that read data from
         # S3. In-memory event processing still runs to keep the inference buffer
         # live.
-        g.collect_data = _cfg_bool(self.config, "gtx_collect_data", True)
+        g.collect_data = _cfg_bool(self.config, "gtx_collect_data", False)  # opt-in, like training
         # Live dicts are sealed into columnar batches every chunk_size rows so
         # the in-memory list[dict] cost stays bounded to one chunk.
         g.chunk_size = max(1, int(getattr(self.config, "gtx_chunk_size", 10_000)))
@@ -315,7 +415,20 @@ class GenTRXAgent(FinanceSimulationAgent):
         _is_cuda = g.device.startswith("cuda")
 
         # ---- Training config ----
-        g.training_enabled = _cfg_bool(self.config, "gtx_training_enabled", True)
+        # OPT-IN: GenTRX distributed training is off unless explicitly enabled, so a
+        # plain miner runs basic trading on core deps without the [gentrx] extra.
+        g.training_enabled = _cfg_bool(self.config, "gtx_training_enabled", False)
+
+        # Training/inference need the opt-in [gentrx] extra (polars, pyarrow). If the
+        # agent is configured for either but the deps are absent, fail fast with a
+        # clear message instead of a cryptic NoneType error deep in a collection path.
+        if (g.training_enabled or g.inference_enabled) and not _GENTRX_DEPS_AVAILABLE:
+            raise RuntimeError(
+                "GenTRX training/inference is enabled (gtx_training_enabled / "
+                "gtx_n_trajectories>0) but the optional [gentrx] extra is not installed. "
+                "Install it with `pip install -e '.[gentrx]'`, or run basic trading only "
+                "with gtx_training_enabled=false."
+            ) from _GENTRX_IMPORT_ERROR
         # When set, the agent forwards each /gentrx/assignment payload to a
         # standalone miner_training_server instead of training inline.
         g.training_url = getattr(self.config, "gtx_training_url", "") or ""
@@ -323,15 +436,20 @@ class GenTRXAgent(FinanceSimulationAgent):
             getattr(self.config, "gtx_training_api_key", "")
             or os.environ.get("GENTRX_MINER_API_KEY", "")
         )
-        # Device-dependent training defaults: CPU is 5–50× slower per step than
-        # a modern GPU, and quadratic-attention memory at batch_size=16/seq=256
-        # is uncomfortable on CPU. Cut steps and batch size 5× and 4× to keep
-        # per-cycle wall-time and RAM tractable. Operators can still override
-        # via explicit gtx_train_steps / gtx_train_batch_size.
-        g.train_steps = int(getattr(self.config, "gtx_train_steps", 500 if _is_cuda else 100))
+        # One pass over the assigned pages per round (gtx_train_steps=0); a small
+        # incremental gradient — the big batch comes from aggregating across
+        # miners. Batch stays device-aware (quadratic-attention memory at
+        # batch=16/seq=256 is uncomfortable on CPU).
+        g.is_cuda = _is_cuda
+        g.train_steps = int(getattr(self.config, "gtx_train_steps", 0) or 0)
+        g.round_budget_s = float(getattr(self.config, "gtx_round_budget_s", 240.0))
+        # Optional drift check: verify the delta-advanced model against the
+        # server's published per-version hash, resync on mismatch. Off unless
+        # the server runs with --publish-state-hash.
+        g.verify_drift = _cfg_bool(self.config, "gtx_verify_drift", False)
         g.train_batch_size = int(getattr(self.config, "gtx_train_batch_size", 16 if _is_cuda else 4))
-        g.train_seq_len = int(getattr(self.config, "gtx_train_seq_len", 256))
-        g.top_k_frac = float(getattr(self.config, "gtx_top_k_frac", 0.05))
+        g.train_seq_len = int(getattr(self.config, "gtx_train_seq_len", 512))
+        g.top_k_frac = float(getattr(self.config, "gtx_top_k_frac", 0.10))
         # Retention on the per-miner write bucket. 0 disables pruning entirely
         # (gradients accumulate; operator handles cleanup). Default 50 ≈ ~4h
         # of history at the standard round cadence.
@@ -363,62 +481,9 @@ class GenTRXAgent(FinanceSimulationAgent):
         g.write_store = None
         g.discovered_aggregator_store = None
         g.discovered_aggregator_uid = int(getattr(self.config, "gtx_aggregator_uid", 0))
-        from GenTRX.src.gradient_store import gentrx_prefix, network_from_config
-        _mode = str(getattr(self.config, "gtx_mode", "simulation") or "simulation")
-        # gtx_network operator override → env var; network_from_subtensor
-        # (called via network_from_config) reads GENTRX_NETWORK first.
-        _network_override = str(getattr(self.config, "gtx_network", "") or "")
-        if _network_override:
-            import os as _os
-            _os.environ["GENTRX_NETWORK"] = _network_override
-        # Pass netuid so network_from_config falls back to the deterministic
-        # mapping (79 → mainnet, 366 → testnet, else → localnet) when
-        # subtensor.network is "unknown" — happens when operator passes only
-        # --subtensor.chain_endpoint without --subtensor.network.
-        _netuid = getattr(self.config, "netuid", None)
-        try:
-            _netuid = int(_netuid) if _netuid is not None else None
-        except (TypeError, ValueError):
-            _netuid = None
-        _network = network_from_config(
-            getattr(self.config, "subtensor", None), netuid=_netuid
-        )
-        g.bucket_prefix = gentrx_prefix(_network, _mode)
-        gtx_log.info(
-            f"GenTRX bucket prefix: {g.bucket_prefix} "
-            f"(network={_network}, mode={_mode})"
-        )
-        try:
-            from GenTRX.src.gradient_store import (
-                create_aggregator_store_from_env,
-                GradientStore,
-            )
-
-            g.store = create_aggregator_store_from_env(prefix=g.bucket_prefix)
-            if g.store:
-                gtx_log.info(
-                    f"S3 aggregator bucket fallback: {g.store.endpoint_url}/{g.store.bucket}"
-                )
-            g.data_store = g.store
-
-            agent_bucket = os.environ.get("GENTRX_AGENT_S3_BUCKET")
-            if agent_bucket:
-                g.write_store = GradientStore(
-                    endpoint_url=os.environ.get(
-                        "GENTRX_AGENT_S3_ENDPOINT_URL",
-                        g.store.endpoint_url if g.store else "",
-                    ),
-                    bucket=agent_bucket,
-                    access_key=os.environ.get("GENTRX_AGENT_S3_ACCESS_KEY", ""),
-                    secret_key=os.environ.get("GENTRX_AGENT_S3_SECRET_KEY", ""),
-                    region=os.environ.get("GENTRX_AGENT_S3_REGION", "auto"),
-                    prefix=g.bucket_prefix,
-                )
-                gtx_log.info(
-                    f"S3 write (gradients): {g.write_store.endpoint_url}/{g.write_store.bucket}"
-                )
-        except ImportError:
-            pass
+        g.bucket_prefix = ""  # populated by _ensure_gentrx_inited() on first respond()
+        g.gentrx_inited = False
+        g.last_signals = {}  # book_id → last signal float; read by composer co-base
 
         # ---- Training logger ----
         # logging.getLogger returns the same module-global Logger by name on
@@ -470,32 +535,11 @@ class GenTRXAgent(FinanceSimulationAgent):
                 gtx_log.error(f"Failed to load local checkpoint: {exc}")
         elif checkpoint:
             gtx_log.warning(f"Checkpoint not found locally: {checkpoint}")
-        # If no local checkpoint, bootstrap from S3 (load latest published).
-        # After bootstrap, model versions are pulled on-demand by _maybe_train
-        # using the model_version named in each assignment, no background poll.
-        if g.model is None:
-            self._ensure_model_version()
-
-        mode_parts = []
-        if g.model:
-            mode_parts.append("inference")
-        if g.training_enabled:
-            mode_parts.append("training")
-        if g.collect_data:
-            mode_parts.append("collect")
-
-        train_desc = (
-            f"assignment-driven training from S3, {g.train_steps} steps"
-            if g.training_enabled else ""
-        )
-        gtx_log.info(
-            f"GenTRXAgent | output={g.output_dir} "
-            f"| mode={'+'.join(mode_parts) or 'idle'}"
-            f" | device={g.device}"
-            f" | write_store={'configured' if g.write_store else 'NOT SET (gradient upload disabled)'}"
-            f"{'| gtx_collect_data=false (S3 only)' if not g.collect_data else ''}"
-            f"{f' | {train_desc}' if train_desc else ''}"
-        )
+        # S3 bootstrap (latest published checkpoint) is deferred to the first
+        # respond(), see _ensure_gentrx_inited(). The local-file checkpoint above
+        # is mode-independent so it stays here; the S3 path needs gtx_mode,
+        # which derives from _exchange_mode, which is only known after the
+        # first update() runs.
 
         # Apply retention to any data already on disk from a previous run.
         # Without this, a long-running miner restarted with a tighter cap (or
@@ -516,6 +560,11 @@ class GenTRXAgent(FinanceSimulationAgent):
 
         @self.router.post("/gentrx/assignment")
         async def receive_assignment(request: Request):
+            """Accept a training assignment pushed by the miner's training server.
+
+            Args:
+                request (Request): The HTTP request carrying the assignment.
+            """
             payload = await request.json()
             gtx_log.info(
                 "[GTX] assignment received: round=%s model_v=%s data=%d files",
@@ -529,15 +578,216 @@ class GenTRXAgent(FinanceSimulationAgent):
             return {"status": "ok"}
 
     # ------------------------------------------------------------------
+    # Lazy first-tick init (mode-dependent setup)
+    # ------------------------------------------------------------------
+
+    def _ensure_gentrx_inited(self) -> None:
+        """Resolve mode-dependent GenTRX state on the first tick.
+
+        ``self._exchange_mode`` is unknown at ``initialize()`` time — it's only
+        set per-state in ``FinanceAgent.update()``. So the bucket-prefix
+        resolution + S3 store creation + checkpoint bootstrap must wait until
+        we've seen the first state update. The ``gentrx_inited`` guard
+        short-circuits subsequent calls.
+        """
+        g = self._gtx
+        # gtx_enabled=false skips initialize() entirely, so this state object is intentionally bare.
+        # miner.py:99 still calls _ensure_model_version() -> here on every startup, so without this
+        # guard a disabled agent dies reading a field that was never meant to exist. Check `enabled`
+        # first, before any other field is touched.
+        if not getattr(g, "enabled", True):
+            return
+        if g.gentrx_inited:
+            return
+        g.gentrx_inited = True
+
+        from GenTRX.src.gradient_store import gentrx_prefix, network_from_config
+
+        # gtx_mode override: explicit param wins, else derive from actual run mode.
+        _explicit_mode = str(getattr(self.config, "gtx_mode", "") or "")
+        _mode = _explicit_mode or ("exchange" if self._exchange_mode else "simulation")
+
+        # gtx_network operator override → env var; network_from_subtensor
+        # (called via network_from_config) reads GENTRX_NETWORK first.
+        _network_override = str(getattr(self.config, "gtx_network", "") or "")
+        if _network_override:
+            os.environ["GENTRX_NETWORK"] = _network_override
+
+        # Pass netuid so network_from_config falls back to the deterministic
+        # mapping (79 → mainnet, 366 → testnet, else → localnet) when
+        # subtensor.network is "unknown" — happens when operator passes only
+        # --subtensor.chain_endpoint without --subtensor.network.
+        _netuid = getattr(self.config, "netuid", None)
+        try:
+            _netuid = int(_netuid) if _netuid is not None else None
+        except (TypeError, ValueError):
+            _netuid = None
+        _network = network_from_config(
+            getattr(self.config, "subtensor", None), netuid=_netuid
+        )
+        g.bucket_prefix = gentrx_prefix(_network, _mode)
+        gtx_log.info(
+            f"GenTRX bucket prefix: {g.bucket_prefix} "
+            f"(network={_network}, mode={_mode})"
+        )
+
+        try:
+            from GenTRX.src.gradient_store import (
+                create_aggregator_store_from_env,
+                GradientStore,
+            )
+
+            g.store = create_aggregator_store_from_env(prefix=g.bucket_prefix)
+            if g.store:
+                gtx_log.info(
+                    f"S3 aggregator bucket fallback: {g.store.endpoint_url}/{g.store.bucket}"
+                )
+            g.data_store = g.store
+
+            agent_bucket = os.environ.get("GENTRX_AGENT_S3_BUCKET")
+            if agent_bucket:
+                g.write_store = GradientStore(
+                    endpoint_url=os.environ.get(
+                        "GENTRX_AGENT_S3_ENDPOINT_URL",
+                        g.store.endpoint_url if g.store else "",
+                    ),
+                    bucket=agent_bucket,
+                    access_key=os.environ.get("GENTRX_AGENT_S3_ACCESS_KEY", ""),
+                    secret_key=os.environ.get("GENTRX_AGENT_S3_SECRET_KEY", ""),
+                    region=os.environ.get("GENTRX_AGENT_S3_REGION", "auto"),
+                    prefix=g.bucket_prefix,
+                )
+                gtx_log.info(
+                    f"S3 write (gradients): {g.write_store.endpoint_url}/{g.write_store.bucket}"
+                )
+        except ImportError:
+            pass
+
+        # Bootstrap from S3 only if no local checkpoint was loaded in initialize()
+        # AND the miner actually needs a model (training or inference on). A plain
+        # trading miner (gtx_training_enabled=false, gtx_n_trajectories=0) needs no
+        # model, so skip the bootstrap entirely — otherwise _ensure_model_version does
+        # on-chain aggregator-bucket discovery + an S3 checkpoint scan, which hangs/errors
+        # on a bare localnet (no S3/aggregator) and prevents the agent from ever serving.
+        # This is why sample agents lacking an _ensure_model_version no-op placed no
+        # orders even with training disabled: the bootstrap ran regardless.
+        if g.model is None and (g.training_enabled or g.inference_enabled):
+            self._ensure_model_version()
+
+        mode_parts = []
+        if g.model:
+            mode_parts.append("inference")
+        if g.training_enabled:
+            mode_parts.append("training")
+        if g.collect_data:
+            mode_parts.append("collect")
+        train_desc = (
+            f"assignment-driven training from S3, {g.train_steps} steps"
+            if g.training_enabled else ""
+        )
+        gtx_log.info(
+            f"GenTRXAgent ready (mode={_mode}) | output={g.output_dir} "
+            f"| roles={'+'.join(mode_parts) or 'idle'}"
+            f" | device={g.device}"
+            f" | write_store={'configured' if g.write_store else 'NOT SET (gradient upload disabled)'}"
+            f"{'| gtx_collect_data=false (S3 only)' if not g.collect_data else ''}"
+            f"{f' | {train_desc}' if train_desc else ''}"
+        )
+
+    # ------------------------------------------------------------------
     # Main loop
     # ------------------------------------------------------------------
 
-    def respond(self, state: MarketSimulationStateUpdate) -> FinanceAgentResponse:
-        response = FinanceAgentResponse(agent_id=self.uid)
+    def handle(
+        self,
+        state: MarketSimulationStateUpdate | ExchangeStateUpdate,
+    ) -> "FinanceAgentResponse | ExchangeAgentResponse":
+        """Run the normal agent cycle, then drive assignment-driven training.
+
+        The training trigger lives HERE, not in respond(). FinanceAgent.handle
+        dispatches to respond_simulation()/respond_exchange(), and only the
+        DEFAULT respond_simulation delegates back to respond() — so a subclass
+        that overrides respond_simulation/respond_exchange (or a composed agent
+        whose runtime supplies its own respond) never reaches respond() and
+        would silently stop training while the queue grows unbounded. Anchoring
+        the drain at handle() makes it independent of any customized respond.
+        """
+        response = super().handle(state)
+        # The presence of _gtx is not the same question as whether GenTRX is ON. A disabled agent
+        # (gtx_enabled=false) still HAS the state object, so this drained the training queue on every
+        # state update and raised on fields initialize() deliberately never set -- once per query, which
+        # is what turned a working agent into nine tracebacks in one dwell.
+        if getattr(self, "_gtx", None) is not None and getattr(self._gtx, "enabled", True):
+            self._drive_training()
+        return response
+
+    def _drive_training(self) -> None:
+        """Drain queued assignments into training (fast, non-blocking).
+
+        Forwards to a remote training service when gtx_training_url is set,
+        else spawns the in-process download+train background thread via
+        _maybe_train(). Guarded so nothing fires while a window is in flight.
+        """
+        if not (self._gtx.training_enabled and self._gtx.pending_assignments):
+            return
+        if self._gtx.training_url:
+            # Split mode: drain queue and forward each assignment to the
+            # standalone miner_training_server. Production dendrite delivery
+            # writes directly to self._gtx.pending_assignments
+            # (taos/im/neurons/miner.py forward_gentrx_assignment), bypassing
+            # the FastAPI route, so this drain is the only forwarding path that
+            # fires for live network traffic.
+            self._drain_and_forward_assignments()
+        elif not self._gtx.training_in_progress:
+            try:
+                self._maybe_train()
+            except Exception as exc:
+                self._gtx.tlog.error(f"_maybe_train failed: {exc}")
+                import traceback
+
+                self._gtx.tlog.error(traceback.format_exc())
+
+    def respond(
+        self,
+        state: MarketSimulationStateUpdate | ExchangeStateUpdate,
+    ) -> UnifiedAgentResponse:
+        # First-tick lazy init: _exchange_mode is only set after update() runs
+        # (FinanceAgent.handle dispatches update() before respond() each tick),
+        # so this is the earliest the actual run mode is known. Subsequent
+        # ticks short-circuit on the guard flag.
+        """Produce this block's response by delegating to the mode-specific branch.
+
+        Returns:
+            The response carrying whatever instructions the strategy queued.
+        """
+        self._ensure_gentrx_inited()
+
+        response = self.make_response()
+
+        # gtx_enabled=false: behave as a plain trader. Everything below is GenTRX inference and reads
+        # state that initialize() deliberately never populated, so without this the agent raised on
+        # EVERY query (38 AttributeErrors on price_scale in one dwell) -- it served, was queried on both
+        # mechanisms, and then threw instead of responding. Returning the empty response here is what
+        # makes "GenTRX off" mean "no GenTRX behaviour" rather than "broken agent"; subclasses that add
+        # their own order logic after super().respond() still run normally.
+        if not getattr(self._gtx, "enabled", True):
+            return response
 
         if self._gtx.price_scale is None:
-            self._gtx.price_scale = 10**state.config.priceDecimals
-            self._gtx.vol_scale = 10**state.config.volumeDecimals
+            # Exchange mode: ExchangeConfig has volumeDecimals but NO
+            # priceDecimals, so state.config.priceDecimals used to AttributeError
+            # and 500 every ExchangeStateUpdate (blocking training). Mirror the
+            # aggregator's exact rule (gradient_server _process_tick): if EITHER
+            # decimal is absent, fall back to BOTH canonical defaults (pd=2,vd=4)
+            # so the miner's price/vol scale can never diverge from the
+            # aggregator's — a mismatch would silently corrupt tokenization.
+            _pd = getattr(state.config, "priceDecimals", None)
+            _vd = getattr(state.config, "volumeDecimals", None)
+            if _pd is None or _vd is None:
+                _pd = DEFAULT_PRICE_DECIMALS
+                _vd = DEFAULT_VOLUME_DECIMALS
+            self._gtx.price_scale = 10 ** int(_pd)
+            self._gtx.vol_scale = 10 ** int(_vd)
 
         # Download the model_version named in the assignment when _maybe_train
         # runs (one download per round, naturally staggered by dendrite delivery).
@@ -590,24 +840,9 @@ class GenTRXAgent(FinanceSimulationAgent):
 
             except Exception as exc:
                 gtx_log.error(f"Book {book_id}: {exc}")
-        # Assignment-driven training: train when validator pushes an assignment
-        if self._gtx.training_enabled and self._gtx.pending_assignments:
-            if self._gtx.training_url:
-                # Split mode: drain queue and forward each assignment to the
-                # standalone miner_training_server. Production dendrite
-                # delivery writes directly to self._gtx.pending_assignments
-                # (taos/im/neurons/miner.py forward_gentrx_assignment),
-                # bypassing the FastAPI route, so this drain is the only
-                # forwarding path that fires for live network traffic.
-                self._drain_and_forward_assignments()
-            elif not self._gtx.training_in_progress:
-                try:
-                    self._maybe_train()
-                except Exception as exc:
-                    self._gtx.tlog.error(f"_maybe_train failed: {exc}")
-                    import traceback
-
-                    self._gtx.tlog.error(traceback.format_exc())
+        # Assignment-driven training is driven by handle() (see _drive_training),
+        # not here, so it survives subclasses that override respond_simulation/
+        # respond_exchange and never delegate back to this respond().
 
         return response
 
@@ -623,6 +858,9 @@ class GenTRXAgent(FinanceSimulationAgent):
         headers = {}
         if self._gtx.training_api_key:
             headers["X-API-Key"] = self._gtx.training_api_key
+        # Tag with this agent's UID so a shared (multi-UID) training service
+        # routes the gradient to the right bucket path.
+        payload.setdefault("miner_uid", self.uid)
         try:
             import httpx
             async with httpx.AsyncClient(timeout=5.0) as client:
@@ -660,6 +898,8 @@ class GenTRXAgent(FinanceSimulationAgent):
             import httpx
             with httpx.Client(timeout=5.0) as client:
                 for payload in assignments:
+                    # Tag with this agent's UID for shared multi-UID services.
+                    payload.setdefault("miner_uid", self.uid)
                     try:
                         resp = client.post(url, json=payload, headers=headers)
                         if resp.status_code >= 400:
@@ -680,6 +920,7 @@ class GenTRXAgent(FinanceSimulationAgent):
             self._gtx.tlog.error(f"forward client setup failed: {exc}")
 
     def onEnd(self, event: SimulationEndEvent) -> None:
+        """Handle simulation end: flush per-run state so the next run starts clean."""
         gtx_log.info("Simulation ended — flushing all book buffers.")
         for book_id in list(self._gtx.books):
             self._flush_book(book_id)
@@ -736,17 +977,15 @@ class GenTRXAgent(FinanceSimulationAgent):
     def _process_events(self, book_id: int, book: Any) -> None:
         """Process events from a tick into GenTRX training rows.
 
-        The simulator publishes Order, TradeInfo, and Cancellation events.
-        Order.quantity is the REMAINING size after any fills in this tick —
-        not the original placed size. To reconstruct the original order:
-
-          original_qty = Order.quantity + sum(Trade.quantity
-                         for trades where Trade.taker_id == Order.id)
-
-        This aggregation merges the order placement and its immediate fills
-        into a single GenTRX order event with the full original volume.
-        Market orders (fully filled, remaining=0) and crossing limit orders
-        (partially filled) are both handled correctly.
+        Events are emitted in log order with executions as a distinct, signed
+        type (EXEC_BUY/EXEC_SELL), not collapsed into the aggressing order.
+        Order.quantity is the REMAINING size after any fills in this tick, so a
+        crossing order of original size Q that fills F and rests R=Q-F produces
+        a signed execution row per fill plus a BID/ASK row for the remainder R
+        (omitted when R==0, a fully filled market order). The maker-side
+        reduction is represented by the execution rows. The matching engine is
+        still driven with the full original size (remaining + filled) so the
+        reconstructed book stays correct; only the emitted rows differ.
 
         Sanity check: Order.timestamp == Trade.timestamp for same-tick fills.
         """
@@ -754,7 +993,8 @@ class GenTRXAgent(FinanceSimulationAgent):
         if not book.events:
             return
 
-        # First pass: index trade fill volumes by taker_id (aggressing order)
+        # Index trade fill volumes by taker_id so the aggressing order can be
+        # driven through the engine at its full original size.
         taker_fill_qty: dict[int, float] = {}
         for event in book.events:
             if _is_trade(event):
@@ -763,14 +1003,27 @@ class GenTRXAgent(FinanceSimulationAgent):
                     event.quantity
                 )
 
-        # Second pass: process orders and cancellations
         for event in book.events:
             if _is_trade(event):
-                continue
-            if _is_cancellation(event):
+                self._collect_trade(event, buf)
+            elif _is_cancellation(event):
                 self._collect_cancel(event, buf)
             else:
                 self._collect_order(event, buf, taker_fill_qty)
+
+    def _collect_trade(self, event: Any, buf: BookBuffer) -> None:
+        # Signed execution at the true fill price. The aggressing order drives
+        # the engine; this row does not (the maker reduction it represents is
+        # applied when that order is processed), so emit row only.
+        is_buy = event.side == 0
+        order_type = EXEC_BUY if is_buy else EXEC_SELL
+        qty = float(event.quantity)
+        price_ticks = round(event.price * self._gtx.price_scale)
+        ts = int(event.timestamp)
+
+        snap = buf.engine.snapshot()
+        self._append_row(buf, ts, order_type, price_ticks, qty, snap)
+        buf.last_ts = ts
 
     def _collect_order(
         self, event: Any, buf: BookBuffer, taker_fill_qty: dict[int, float]
@@ -779,27 +1032,20 @@ class GenTRXAgent(FinanceSimulationAgent):
         order_type = BID if is_buy else ASK
         buf.order_sides[event.id] = is_buy
 
-        # Reconstruct original order size: remaining + filled quantity.
-        # Order.quantity is the remaining size after any immediate fills.
-        # taker_fill_qty[order.id] is the total volume consumed by trades
-        # where this order was the aggressor (taker).
+        # Order.quantity is the remaining (resting) size after any immediate
+        # fills; the fills are emitted separately as execution rows. The engine
+        # is driven with the full original size so matching reproduces the book.
         remaining = float(event.quantity)
         filled = taker_fill_qty.get(event.id, 0.0)
-        qty = remaining + filled
-
-        if filled > 0:
-            if qty <= 0:
-                gtx_log.debug(
-                    f"Order {event.id}: remaining={remaining} filled={filled} "
-                    f"=> qty={qty} (fully consumed market order?)"
-                )
+        full_qty = remaining + filled
 
         price_ticks = round(event.price * self._gtx.price_scale)
-        vol_ticks = max(1, round(qty * self._gtx.vol_scale))
+        vol_ticks = max(1, round(full_qty * self._gtx.vol_scale))
         ts = int(event.timestamp)
 
         snap = buf.engine.snapshot()
-        self._append_row(buf, ts, order_type, price_ticks, qty, snap)
+        if remaining > 0:
+            self._append_row(buf, ts, order_type, price_ticks, remaining, snap)
         buf.engine.process_order(order_type, price_ticks, vol_ticks, is_buy)
         buf.last_ts = ts
         # Order fully consumed (market order or crossing limit) — won't rest on
@@ -862,15 +1108,15 @@ class GenTRXAgent(FinanceSimulationAgent):
         """Build the row dict for one order event before it is buffered.
 
         This is the primary override point for custom data collection.
-        Called once per order or cancellation event while
+        Called once per order, cancellation or execution event while
         ``gtx_collect_data=true``.  Return the dict to append to the
         local parquet buffer, or ``None`` to drop the event entirely.
 
         Args:
             book_id:          Which market this event belongs to.
             ts:               Event timestamp in nanoseconds.
-            order_type:       BID, ASK, or CANCEL (integer constants from
-                              ``GenTRX.src.orderbook``).
+            order_type:       BID, ASK, CANCEL, EXEC_BUY or EXEC_SELL
+                              (integer constants from ``GenTRX.src.util.schema``).
             price_ticks:      Price in integer ticks (raw price × price_scale).
             qty:              Reconstructed original order size.
             snap:             LOB snapshot immediately before this event.
@@ -935,10 +1181,9 @@ class GenTRXAgent(FinanceSimulationAgent):
         tag_end = _ts_to_tag(interval_end)
         # Row-cap early flushes write multiple partials per interval; the seq
         # suffix keeps each unique. First flush of an interval has no suffix.
-        # Mirrors gradient-server's 0b474676 disambiguation — the validator's
-        # _tag_to_ns strips `_NNNN` when parsing timestamps, and dataset
-        # readers glob *.parquet without parsing filenames, so downstream
-        # paths are unaffected.
+        # The validator's _tag_to_ns strips `_NNNN` when parsing timestamps and
+        # dataset readers glob *.parquet without parsing filenames, so the seq
+        # suffix leaves downstream paths unaffected.
         suffix = f"_{buf.flush_seq:04d}" if buf.flush_seq else ""
         out_path = out_dir / f"{tag_start}-{tag_end}{suffix}.parquet"
 
@@ -1285,12 +1530,24 @@ class GenTRXAgent(FinanceSimulationAgent):
                 self._gtx._last_progress_log_ts = now
             return
 
-        # Consume all queued assignments
         assignments = self._gtx.pending_assignments
         self._gtx.pending_assignments = []
 
         if not assignments:
             return
+
+        # Keep only the freshest round: the merge is for same-round multi-validator
+        # consolidation, but a backlog accumulating across rounds balloons one window.
+        latest_round = max(int(a.get("round", 0) or 0) for a in assignments)
+        stale = [a for a in assignments if int(a.get("round", 0) or 0) != latest_round]
+        if stale:
+            self._gtx.tlog.warning(
+                f"dropping {len(stale)} stale queued assignment(s) from earlier "
+                f"rounds (training slower than round cadence), keeping round {latest_round}"
+            )
+            assignments = [
+                a for a in assignments if int(a.get("round", 0) or 0) == latest_round
+            ]
 
         # Merge data keys + compute target model version across validators
         all_data_keys: list[str] = []
@@ -1420,7 +1677,7 @@ class GenTRXAgent(FinanceSimulationAgent):
                 f"window {self._gtx.train_window_id} STARTED | "
                 f"{len(parquet_files)} files from {len(assignments)} validator(s) | "
                 f"books={all_books} | "
-                f"{self._gtx.train_steps} steps | "
+                f"budget={self._gtx.round_budget_s:.0f}s | "
                 f"model_v={target_v} | "
                 f"device={self._gtx.device}"
             )
@@ -1436,7 +1693,7 @@ class GenTRXAgent(FinanceSimulationAgent):
                     elapsed = time.time() - _t0
                     bt.logging.info(
                         f"[GTX] training in progress (uid={self.uid}): "
-                        f"{elapsed:.0f}s elapsed, {self._gtx.train_steps} steps total"
+                        f"{elapsed:.0f}s elapsed"
                     )
 
             _hb = threading.Thread(target=_heartbeat, daemon=True)
@@ -1491,6 +1748,95 @@ class GenTRXAgent(FinanceSimulationAgent):
         """
         return parquet_files
 
+    def _make_window_config(self, **overrides):
+        """Build a WindowConfig with the correctness invariants filled from agent
+        state — the version actually trained (so the aggregator's mismatch filter
+        works) and the soft-CE width the server scores with (or the score grades a
+        loss never trained). Callers override only the tunable knobs (n_steps, lr).
+        Keeping these here means a custom train() cannot silently drop them."""
+        from GenTRX.src.distributed import WindowConfig
+
+        params = dict(
+            n_steps=self._gtx.train_steps,
+            lr=self._gtx.train_lr,
+            window_id=self._gtx.train_window_id,
+            miner_uid=self.uid,
+            model_version=int(self._gtx.model_version or 0),
+            label_smooth_sigma=self._gtx.label_smooth_sigma,
+            budget_s=self._gtx.round_budget_s,
+        )
+        params.update(overrides)
+        return WindowConfig(**params)
+
+    def _submit_gradient(self, delta, assignment: dict | None = None) -> None:
+        """Compress, upload, prune, finalize — the publish surface shared by every
+        train() implementation. Stamps the trained version (belt-and-braces for
+        custom loops), honours the validator's per-round top_k advice, retries to a
+        local pending file on S3 failure, and advances the window counter."""
+        from GenTRX.src.gradient import compress, serialize
+
+        md = getattr(delta, "metadata", None)
+        if md is not None and not getattr(md, "model_v_trained", 0):
+            md.model_v_trained = int(self._gtx.model_version or 0)
+
+        # Data-starved window: train_incremental returns a zero delta when no
+        # loader yielded a batch (empty/too-short pages). Don't upload it — an
+        # empty gradient carries no signal, only wastes an S3 round-trip and a
+        # scoring slot, and (untagged edge cases aside) muddies aggregation.
+        steps = int(getattr(md, "steps_trained", 0) or 0) if md is not None else 0
+        norm = float(getattr(delta, "norm", 0.0) or 0.0)
+        if steps <= 0 or norm <= 0.0:
+            self._gtx.tlog.info(
+                f"skipping gradient upload: nothing trained this window "
+                f"(steps={steps}, norm={norm:.3g}) — data-starved round"
+            )
+            self._gtx.train_window_id += 1
+            return
+
+        _adv = (assignment or {}).get("advice") or {}
+        _adv_tk = _adv.get("top_k_frac")
+        top_k = float(_adv_tk) if _adv_tk else self._gtx.top_k_frac
+        comp = compress(delta, top_k_frac=top_k)
+        data = serialize(comp)
+
+        if self._gtx.write_store is None:
+            raise RuntimeError(
+                "No S3 store configured. Set GENTRX_S3_* env vars to enable gradient upload."
+            )
+        round_id = (assignment or {}).get("round", self._gtx.train_window_id)
+        try:
+            self._gtx.write_store.put_gradient(miner_uid=self.uid, round_id=round_id, data=data)
+            self._gtx.tlog.info(f"gradient uploaded to S3 (round={round_id})")
+            bt.logging.info(
+                f"[GTX] gradient uploaded (uid={self.uid}, round={round_id}, "
+                f"{len(data)/1024:.1f} KB)"
+            )
+            if self._gtx.keep_gradients > 0:
+                try:
+                    n = self._gtx.write_store.prune_keep_latest(
+                        f"gradients/{self.uid}/", keep=self._gtx.keep_gradients, suffix=".grad",
+                    )
+                    if n:
+                        self._gtx.tlog.info(
+                            f"pruned {n} old gradient(s), keeping latest {self._gtx.keep_gradients}"
+                        )
+                except Exception as prune_exc:
+                    self._gtx.tlog.debug(f"gradient prune failed: {prune_exc}")
+        except Exception as exc:
+            self._gtx.tlog.warning(f"S3 upload failed: {exc} — saving for retry")
+            pending_dir = self._gtx.gradient_dir / "pending"
+            pending_dir.mkdir(parents=True, exist_ok=True)
+            pending_path = pending_dir / f"block_{round_id:08d}_miner_{self.uid}.grad"
+            pending_path.write_bytes(data)
+            self._gtx.last_gradient_path = pending_path
+
+        self._gtx.tlog.info(
+            f"window {self._gtx.train_window_id} COMPLETE | "
+            f"loss {delta.metadata.loss_before:.4f} → {delta.metadata.loss_after:.4f} | "
+            f"gradient {len(data)/1024:.1f} KB"
+        )
+        self._gtx.train_window_id += 1
+
     def train(
         self, parquet_files: list[Path], train_model, assignment: dict | None = None
     ) -> None:
@@ -1508,14 +1854,13 @@ class GenTRXAgent(FinanceSimulationAgent):
 
         The default implementation:
           1. Calls ``select_training_files()`` to filter the file list.
-          2. Builds an ``OrderDataset`` + ``DataLoader``.
-          3. Calls ``train_window(train_model, loader, win_cfg, device)``
-             from ``GenTRX.src.distributed``.
+          2. Builds one ``DataLoader`` per page (recent first).
+          3. Calls ``train_incremental(train_model, loaders, win_cfg, device)``
+             from ``GenTRX.src.distributed`` (budget-governed).
           4. Compresses the resulting ``TrainingDelta`` and uploads to S3.
         """
-        from GenTRX.src.dataloader import OrderDataset, ChunkSampler
-        from GenTRX.src.distributed import train_window, WindowConfig
-        from GenTRX.src.gradient import compress, serialize
+        from GenTRX.src.dataloader import OrderDataset, InterleaveSampler
+        from GenTRX.src.distributed import train_incremental
         from torch.utils.data import DataLoader
 
         parquet_files = self.select_training_files(parquet_files, assignment)
@@ -1523,100 +1868,54 @@ class GenTRXAgent(FinanceSimulationAgent):
             self._gtx.tlog.info("select_training_files returned empty list — skipping")
             return
 
-        self._gtx.tlog.info(f" building dataset from {len(parquet_files)} files...")
-        dataset = OrderDataset(
-            parquet_files,
-            seq_len=self._gtx.train_seq_len,
-            tokenizer=self._gtx.tokenizer,
-            max_cached=2,
-        )
-        sampler = ChunkSampler(dataset, shuffle=True)
-        loader = DataLoader(
-            dataset,
-            batch_size=self._gtx.train_batch_size,
-            sampler=sampler,
+        # One interleaved dataset over ALL assigned files: block-shuffle so a
+        # budget-capped round SPANS the assignment instead of front-loading the
+        # freshest pages, recency-weighted (recency_alpha) so recent data is
+        # over-sampled. Files sorted oldest->newest so the weighting favours the
+        # newest. gtx_train_steps (>0) stays an optional total-step cap.
+        import pyarrow.parquet as _pq
+        good = []
+        for f in sorted(parquet_files):
+            try:
+                if _pq.read_metadata(f).num_rows > self._gtx.train_seq_len:
+                    good.append(f)
+            except Exception as exc:
+                self._gtx.tlog.debug(f"skip page {f}: {exc}")
+        if not good:
+            self._gtx.tlog.info("no trainable pages, skipping")
+            return
+        block = int(getattr(self._gtx, "shuffle_block", 1024))
+        alpha = float(getattr(self._gtx, "recency_alpha", 1.0))
+        max_cached = min(len(good), int(getattr(self._gtx, "train_max_cached", 4)))
+        try:
+            ds = OrderDataset(
+                good, seq_len=self._gtx.train_seq_len,
+                tokenizer=self._gtx.tokenizer, max_cached=max_cached,
+            )
+        except Exception as exc:
+            self._gtx.tlog.info(f"dataset build failed ({exc}), skipping")
+            return
+        loaders = [DataLoader(
+            ds, batch_size=self._gtx.train_batch_size,
+            sampler=InterleaveSampler(ds, shuffle=True, block=block, recency_alpha=alpha),
             num_workers=0,
-        )
-        self._gtx.tlog.info(
-            f"dataset ready: {dataset.total_orders} orders, "
-            f"{len(loader)} batches, training {self._gtx.train_steps} steps..."
-        )
+        )]
 
-        win_cfg = WindowConfig(
-            n_steps=self._gtx.train_steps,
-            lr=self._gtx.train_lr,
-            window_id=self._gtx.train_window_id,
-            miner_uid=self.uid,
-            # Tag with the version we ACTUALLY trained against — not the
-            # assignment's target. When a model-download timeout falls back
-            # to the previously-loaded weights, the assignment's intended
-            # version is misleading; the aggregator needs the real one so
-            # its version-mismatch filter can drop stale-regime gradients.
-            model_version=int(self._gtx.model_version or 0),
-            label_smooth_sigma=self._gtx.label_smooth_sigma,
+        self._gtx.tlog.info(
+            f"{len(good)} files, block={block} recency_alpha={alpha} "
+            f"max_cached={max_cached}, budget={self._gtx.round_budget_s:.0f}s..."
         )
-        delta = train_window(train_model, loader, win_cfg, self._gtx.device)
+        win_cfg = self._make_window_config()
+        delta = train_incremental(train_model, loaders, win_cfg, self._gtx.device)
         self._gtx.tlog.info(
             f"training done: loss {delta.metadata.loss_before:.4f} → {delta.metadata.loss_after:.4f}"
         )
         bt.logging.info(
             f"[GTX] training done (uid={self.uid}): "
             f"loss {delta.metadata.loss_before:.4f} → {delta.metadata.loss_after:.4f} "
-            f"({self._gtx.train_steps} steps)"
+            f"({delta.metadata.steps_trained} steps)"
         )
-
-        # Compress and submit
-        comp = compress(delta, top_k_frac=self._gtx.top_k_frac)
-        data = serialize(comp)
-
-        if self._gtx.write_store is not None:
-            round_id = (assignment or {}).get("round", self._gtx.train_window_id)
-            try:
-                self._gtx.write_store.put_gradient(
-                    miner_uid=self.uid,
-                    round_id=round_id,
-                    data=data,
-                )
-                self._gtx.tlog.info(f"gradient uploaded to S3 (round={round_id})")
-                bt.logging.info(
-                    f"[GTX] gradient uploaded (uid={self.uid}, round={round_id}, "
-                    f"{len(data)/1024:.1f} KB)"
-                )
-                if self._gtx.keep_gradients > 0:
-                    try:
-                        n = self._gtx.write_store.prune_keep_latest(
-                            f"gradients/{self.uid}/",
-                            keep=self._gtx.keep_gradients,
-                            suffix=".grad",
-                        )
-                        if n:
-                            self._gtx.tlog.info(
-                                f"pruned {n} old gradient(s), keeping latest {self._gtx.keep_gradients}"
-                            )
-                    except Exception as prune_exc:
-                        self._gtx.tlog.debug(f"gradient prune failed: {prune_exc}")
-            except Exception as exc:
-                # S3 failed — save locally for retry on next respond() cycle
-                self._gtx.tlog.warning(f"S3 upload failed: {exc} — saving for retry")
-                pending_dir = self._gtx.gradient_dir / "pending"
-                pending_dir.mkdir(parents=True, exist_ok=True)
-                pending_path = (
-                    pending_dir / f"block_{round_id:08d}_miner_{self.uid}.grad"
-                )
-                pending_path.write_bytes(data)
-                self._gtx.last_gradient_path = pending_path
-        else:
-            raise RuntimeError(
-                "No S3 store configured. Set GENTRX_S3_* env vars to enable gradient upload."
-            )
-
-        self._gtx.tlog.info(
-            f"window {self._gtx.train_window_id} COMPLETE | "
-            f"loss {delta.metadata.loss_before:.4f} → {delta.metadata.loss_after:.4f} | "
-            f"gradient {len(data)/1024:.1f} KB"
-        )
-
-        self._gtx.train_window_id += 1
+        self._submit_gradient(delta, assignment)
 
     def _ensure_model_version(
         self, target: int | None = None, assignment: dict | None = None
@@ -1634,6 +1933,20 @@ class GenTRXAgent(FinanceSimulationAgent):
         Returns True if the local model is at the requested version after the
         call (already current or freshly downloaded). Returns False on failure.
         """
+        # Pre-respond bootstrap path: miner.py / benchmark.py both call this
+        # before any state has arrived (so `_exchange_mode` is still the
+        # default False = simulation). The env-var store + bucket_prefix are
+        # populated lazily in _ensure_gentrx_inited, trigger it now so the
+        # fast env-var path is available below. Idempotent: the gentrx_inited
+        # flag is set BEFORE the inner _ensure_model_version recursion bottoms
+        # out, so this never loops.
+        self._ensure_gentrx_inited()
+        # gtx_enabled=false leaves the state object bare by design, and _ensure_gentrx_inited returns
+        # immediately in that case -- so every field read below (store, model, ...) is still unset.
+        # miner.py:99 calls this on every startup regardless of the flag, so bail here too or a disabled
+        # agent takes the miner down with it.
+        if not getattr(self._gtx, "enabled", True):
+            return False
         if assignment is not None:
             store = self._get_aggregator_store_for_assignment(assignment)
         elif self._gtx.store is not None:
@@ -1665,24 +1978,65 @@ class GenTRXAgent(FinanceSimulationAgent):
             if target <= self._gtx.model_version:
                 return True
 
-            gtx_log.info(f"Downloading checkpoint v{target} from aggregator bucket")
-            ckpt_bytes = store.get_checkpoint(agg_uid, target)
-            # Stage the checkpoint in the agent's output directory instead of
-            # a hardcoded /tmp path — survives /tmp cleaners and keeps all
-            # per-miner state under one tree the operator controls.
+            from GenTRX.src.distributed import apply_version_deltas
+
+            # Fast path: advance an existing model by applying canonical deltas
+            # (usually a single delta, v(n-1) → v(n)).
+            if self._gtx.model is not None and self._gtx.model_version > 0:
+                expected = {n: p.shape for n, p in self._gtx.model.named_parameters()}
+                reached = apply_version_deltas(
+                    self._gtx.model, store, agg_uid, self._gtx.model_version, target, expected
+                )
+                if reached >= target:
+                    self._gtx.model_version = target
+                    gtx_log.info(f"Advanced model via deltas to v{target}")
+                    if self._gtx.verify_drift:
+                        self._verify_drift(store, agg_uid, target)
+                    return True
+                gtx_log.info(f"Delta gap after v{reached}; reloading baseline")
+
+            # Cold start / delta gap: download the latest baseline checkpoint,
+            # then replay deltas up to the head. latest.json points at the
+            # baseline (full checkpoints are uploaded only every interval).
+            baseline_v = latest if latest > 0 else target
+            gtx_log.info(f"Downloading baseline checkpoint v{baseline_v} from aggregator bucket")
+            ckpt_bytes = store.get_checkpoint(agg_uid, baseline_v)
+            # Stage under the agent's output dir (survives /tmp cleaners).
             stage_dir = self._gtx.output_dir / "ckpt_cache"
             stage_dir.mkdir(parents=True, exist_ok=True)
             tmp = stage_dir / f"gentrx_ckpt_{self.uid}.pt"
             tmp.write_bytes(ckpt_bytes)
             del ckpt_bytes
             self._load_model(str(tmp))
-            self._gtx.model_version = target
-            gtx_log.info(f"Model loaded: v{target}")
-            return True
+            self._gtx.model_version = baseline_v
+            if baseline_v < target:
+                expected = {n: p.shape for n, p in self._gtx.model.named_parameters()}
+                self._gtx.model_version = apply_version_deltas(
+                    self._gtx.model, store, agg_uid, baseline_v, target, expected
+                )
+            gtx_log.info(f"Model at v{self._gtx.model_version} (target v{target})")
+            if self._gtx.verify_drift and self._gtx.model_version >= target:
+                self._verify_drift(store, agg_uid, target)
+            return self._gtx.model_version >= target
         except Exception as exc:
-            gtx_log.warning(f"Checkpoint v{target} fetch failed: {exc}")
-            self._gtx.tlog.warning(f"checkpoint v{target} fetch failed: {exc}")
+            gtx_log.warning(f"Model sync to v{target} failed: {exc}")
+            self._gtx.tlog.warning(f"model sync to v{target} failed: {exc}")
             return False
+
+    def _verify_drift(self, store, agg_uid: int, version: int) -> None:
+        """Optional: compare the delta-advanced model to the server's published
+        hash and force a baseline reload on mismatch. No-op if hashes absent."""
+        from GenTRX.src.distributed import model_state_hash
+
+        meta = store.get_head_meta(agg_uid)
+        want = meta.get("state_hash")
+        if not want or int(meta.get("version", -1)) != version:
+            return
+        if model_state_hash(self._gtx.model) != want:
+            self._gtx.tlog.warning(
+                f"drift detected at v{version}; forcing baseline reload next sync"
+            )
+            self._gtx.model_version = 0  # next _ensure_model_version reloads baseline
 
     def _retry_pending_gradients(self) -> None:
         """Retry uploading gradients that failed to reach S3 on a previous cycle.
@@ -1892,9 +2246,28 @@ class GenTRXAgent(FinanceSimulationAgent):
             "mid_deltas": _t(enc["mid_deltas"]),
         }
 
+    # Co-base order-suppression flag. The composer's codegen sets this to True
+    # on the generated ComposedAgent class when engines.gentrx (in_process) is
+    # in the manifest, so the composer's weapons module owns execution and
+    # GenTRX only contributes the signal via :meth:`gentrx_signal`.
+    _gtx_signal_only: bool = False
+
+    def gentrx_signal(self, book_id: int) -> float | None:
+        """Latest cached per-book GenTRX signal (sign = direction, magnitude
+        compared against ``gtx_signal_threshold``).  ``None`` until the first
+        ``respond()`` populates the cache for that book.  Read by the composer
+        co-base bridge (engines.gentrx in_process module).
+        """
+        return self._gtx.last_signals.get(book_id)
+
     def _execute_signal(
-        self, response: FinanceAgentResponse, book_id: int, signal: float
-    ) -> FinanceAgentResponse:
+        self, response: UnifiedAgentResponse, book_id: int, signal: float
+    ) -> UnifiedAgentResponse:
+        # Always cache so the composer co-base bridge can read the latest
+        # value regardless of whether the standalone order path is suppressed.
+        self._gtx.last_signals[book_id] = float(signal)
+        if self._gtx_signal_only:
+            return response
         if signal > self._gtx.signal_threshold:
             response.market_order(book_id, OrderDirection.BUY, self._gtx.order_qty)
         elif signal < -self._gtx.signal_threshold:
@@ -1922,6 +2295,13 @@ def _cfg_bool(config: Any, key: str, default: bool) -> bool:
     if isinstance(val, bool):
         return val
     if isinstance(val, int):
+        return bool(val)
+    # FLOATS ARRIVE HERE ROUTINELY, because ParseKwargs (taos/common/config/__init__.py) calls float()
+    # on every --agent.params value it can. So `gtx_enabled=0` reaches this as 0.0, which is NOT an int,
+    # and str(0.0) is "0.0" -- not in the string table below, so it fell through to `default` and the
+    # flag silently kept its default value.
+    # A flag that silently ignores a caller's explicit 0 is worse than one that rejects it.
+    if isinstance(val, float):
         return bool(val)
     s = str(val).strip().lower()
     if s in ("true", "1", "yes"):

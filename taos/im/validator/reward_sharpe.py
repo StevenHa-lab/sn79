@@ -27,10 +27,8 @@ import random
 import bittensor as bt
 import numpy as np
 from typing import Dict, Tuple
-from collections import defaultdict
 from taos.im.neurons.validator import Validator
 from taos.im.protocol import MarketSimulationStateUpdate, FinanceAgentResponse
-from taos.im.utils import normalize
 from taos.im.utils.sharpe import sharpe, batch_sharpe
 
 def score_uid(validator_data: Dict, uid: int) -> float:
@@ -57,7 +55,7 @@ def score_uid(validator_data: Dict, uid: int) -> float:
     reward_weights = validator_data['reward_weights']
 
     simulation_timestamp = validator_data['simulation_timestamp']
-    publish_interval = simulation_config['publish_interval']
+    simulation_config['publish_interval']
 
     if not sharpe_values[uid]:
         return 0.0
@@ -181,6 +179,7 @@ def score_uid(validator_data: Dict, uid: int) -> float:
     
     # Calculate activity weighted normalized sharpes
     activity_weighted_normalized_sharpes_unrealized = []
+    book_ids_unrealized = []
     for book_id, activity_factor in activity_factors_uid.items():
         norm_sharpe = normalized_sharpes_unrealized[book_id]
         if activity_factor < 1 or norm_sharpe > 0.5:
@@ -188,8 +187,10 @@ def score_uid(validator_data: Dict, uid: int) -> float:
         else:
             weighted = (2 - activity_factor) * norm_sharpe
         activity_weighted_normalized_sharpes_unrealized.append(min(weighted, 1))
+        book_ids_unrealized.append(book_id)
 
     activity_weighted_normalized_sharpes_realized = []
+    book_ids_realized = []
     for book_id, activity_factor_realized in activity_factors_realized_uid.items():
         norm_sharpe_realized = normalized_sharpes_realized[book_id]
         if activity_factor_realized < 1 or norm_sharpe_realized > 0.5:
@@ -197,14 +198,15 @@ def score_uid(validator_data: Dict, uid: int) -> float:
         else:
             weighted_realized = (2 - activity_factor_realized) * norm_sharpe_realized
         activity_weighted_normalized_sharpes_realized.append(min(weighted_realized, 1))
+        book_ids_realized.append(book_id)
 
     uid_sharpe['books_weighted'] = {
         book_id: weighted_sharpe
-        for book_id, weighted_sharpe in enumerate(activity_weighted_normalized_sharpes_unrealized)
+        for book_id, weighted_sharpe in zip(book_ids_unrealized, activity_weighted_normalized_sharpes_unrealized)
     }
     uid_sharpe['books_weighted_realized'] = {
         book_id: weighted_sharpe
-        for book_id, weighted_sharpe in enumerate(activity_weighted_normalized_sharpes_realized)
+        for book_id, weighted_sharpe in zip(book_ids_realized, activity_weighted_normalized_sharpes_realized)
     }
     
     # Use the 1.5 rule to detect left-hand outliers in the activity-weighted Sharpes    
@@ -446,7 +448,7 @@ def set_delays(self: Validator, synapse_responses: dict[int, MarketSimulationSta
         delay = min_delay + delay_frac * (max_delay - min_delay)
         return int(delay)
 
-    for uid, synapse_response in synapse_responses.items():
+    for _uid, synapse_response in synapse_responses.items():
         response = synapse_response.response
         if response:
             base_delay = compute_delay(synapse_response.dendrite.process_time)

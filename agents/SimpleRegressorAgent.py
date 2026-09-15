@@ -10,8 +10,6 @@ import pandas as pd
 import numpy as np
 import bittensor as bt
 from threading import Thread
-from copy import deepcopy
-from pathlib import Path
 from collections import defaultdict
 
 from taos.common.agents import launch
@@ -24,6 +22,7 @@ from sklearn.metrics import accuracy_score
 
 
 class SimpleRegressorAgent(FinanceSimulationAIRegressorAgent):
+    """Example: trades a linear-regressor prediction from the shared AI agent base."""
     def print_config(self):
         """Prints the agent's current strategy configuration."""
         bt.logging.info(f"""
@@ -97,7 +96,7 @@ Output Directory           : {self.output_dir}
             book (Book): Book object from the state update.
             timestamp (int): Simulation timestamp of the associated state update.
         """
-        if not validator in self.book_event_history or not self.book_event_history[validator]:
+        if validator not in self.book_event_history or not self.book_event_history[validator]:
             lookback_minutes = max(
                 (self.simulation_config.publish_interval // 1_000_000_000) // 60,
                 self.sampling_interval * 2 // 60,
@@ -201,7 +200,7 @@ Output Directory           : {self.output_dir}
         Returns:
             taos.im.protocol.FinanceAgentResponse : The response which will be attached to the synapse for return to the querying validator.
         """
-        response = FinanceAgentResponse(agent_id=self.uid)
+        response = self.make_response()  # mode-aware: emits exchange or simulation instructions
         start = time.time()
 
         for book_id, book in state.books.items():
@@ -209,7 +208,7 @@ Output Directory           : {self.output_dir}
             bestAsk = book.asks[0].price if book.asks else bestBid + 10 ** (-self.simulation_config.priceDecimals)
             midquote = (bestBid + bestAsk) / 2            
 
-            if not state.dendrite.hotkey in self.predictors:
+            if state.dendrite.hotkey not in self.predictors:
                 self.predictors[state.dendrite.hotkey] = {}
                 self.target[state.dendrite.hotkey] = {}
                 self.last_signal[state.dendrite.hotkey] = {}
@@ -263,7 +262,6 @@ Output Directory           : {self.output_dir}
             self.midquotes[state.dendrite.hotkey][book_id] = midquote
 
             # Trading logic
-            dec = self.simulation_config.priceDecimals
             if signal > self.signal_threshold:
                 # If the signal is positive, firstly place a buy order just above the current best bid level
                 response.limit_order(

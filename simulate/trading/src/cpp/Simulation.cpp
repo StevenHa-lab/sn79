@@ -86,7 +86,7 @@ void Simulation::dispatchGenericMessage(
 
 //-------------------------------------------------------------------------
 
-void Simulation::queueMessage(Message::Ptr msg) const
+void Simulation::queueMessage(const Message::Ptr& msg) const
 {
     m_messageQueue.push(msg);
 }
@@ -145,7 +145,6 @@ std::mt19937& Simulation::rng() const noexcept
 
 void Simulation::receiveMessage(Message::Ptr msg)
 {
-    // TODO: Do something?
 }
 
 //-------------------------------------------------------------------------
@@ -173,7 +172,20 @@ void Simulation::configure(const pugi::xml_node& node)
     m_time.step = node.attribute("step").as_ullong(1);
     m_time.current = node.attribute("current").as_ullong(m_time.start);
 
-    m_rng = std::mt19937{std::random_device{}()};
+    // An explicit `rngSeed` attribute makes runs reproducible; without one the legacy
+    // non-deterministic random_device stands. The block index is mixed
+    // in so parallel blocks configured from the same XML don't share a stream
+    // (splitmix-style scramble rather than +blockIdx, which would make adjacent
+    // seeds collide across blocks).
+    if (auto seedAttr = node.attribute("rngSeed"); !seedAttr.empty()) {
+        uint64_t s = seedAttr.as_ullong() ^ (0x9E3779B97F4A7C15ULL * (m_blockIdx + 1));
+        s ^= s >> 30; s *= 0xBF58476D1CE4E5B9ULL;
+        s ^= s >> 27; s *= 0x94D049BB133111EBULL;
+        s ^= s >> 31;
+        m_rng = std::mt19937{static_cast<std::mt19937::result_type>(s)};
+    } else {
+        m_rng = std::mt19937{std::random_device{}()};
+    }
 
     m_config = [node] -> std::string {
         std::ostringstream oss;
@@ -213,7 +225,7 @@ void Simulation::configureAgents(pugi::xml_node node)
 
     static const std::set<std::string> specialAgents{
         "DISTRIBUTED_PROXY_AGENT",
-        "EXCHANGE",
+        //"EXCHANGE",
         "LOGGER_TRADES"
     };
 
@@ -242,15 +254,33 @@ void Simulation::configureAgents(pugi::xml_node node)
                         agentType,
                         [=, this] -> taosim::accounting::Account {
                             const auto& params = m_exchange->config().parameters();
-                            return taosim::accounting::Account{
-                                static_cast<uint32_t>(m_exchange->books().size()),
-                                taosim::accounting::Balances::fromXML(
-                                    doc->child("Balances"),
-                                    taosim::accounting::RoundParams{
-                                        .baseDecimals = params.baseIncrementDecimals,
-                                        .quoteDecimals = params.quoteIncrementDecimals
+                            if (m_exchange->sharedQuoteBalances()) {
+                                return taosim::accounting::Account{
+                                    static_cast<uint32_t>(m_exchange->books().size()),
+                                    taosim::accounting::Balances::fromXML(
+                                        doc->child("Balances"),
+                                        taosim::accounting::RoundParams{
+                                            .baseDecimals = params.baseIncrementDecimals,
+                                            .quoteDecimals = params.quoteIncrementDecimals
+                                        },
+                                        &m_rng)
+                                    };
+                            }
+                            else {
+                                return taosim::accounting::Account(
+                                    ranges::views::iota(0u, m_exchange->books().size())
+                                    | ranges::views::transform([&](auto) {
+                                        return taosim::accounting::Balances::fromXML(
+                                            doc->child("Balances"),
+                                            taosim::accounting::RoundParams{
+                                                .baseDecimals = params.baseIncrementDecimals,
+                                                .quoteDecimals = params.quoteIncrementDecimals
+                                            },
+                                            &m_rng);
                                     })
-                                };
+                                    | ranges::to<std::vector>
+                                );
+                            }
                         });
                 }
             }();
@@ -266,7 +296,7 @@ void Simulation::configureAgents(pugi::xml_node node)
                                 "{}'s fee policy type must be the same as default", std::string(agentBaseName)));
                         }
                         (*feePolicy)[agentBaseName] =
-                            taosim::exchange::TieredFeePolicy::fromXML(feePolicyNode, this);
+                            taosim::matching::TieredFeePolicy::fromXML(feePolicyNode, this);
                         logDebug("TIERED FEE POLICY - {}", agentBaseName);
                         int c = 0;
                         if (auto* tiered = dynamic_cast<TieredFeePolicy*>((*feePolicy)[agentBaseName].get())) {
@@ -336,7 +366,7 @@ void Simulation::configureLogging(pugi::xml_node node)
 
 //-------------------------------------------------------------------------
 
-void Simulation::deliverMessage(Message::Ptr msg)
+void Simulation::deliverMessage(const Message::Ptr& msg)
 {
     for (const auto& target : msg->targets) {
         if (target == "*") {
@@ -369,24 +399,26 @@ void Simulation::deliverMessage(Message::Ptr msg)
                     const auto& haystack = agent->name();
                     return haystack.find(needle);
                 });
-            std::for_each(lb, ub, [msg](const auto& agent) { agent->receiveMessage(msg); });
+            std::for_each(lb, ub, [&msg](const auto& agent) { agent->receiveMessage(msg); });
         }
         else {
-            auto it = std::lower_bound(
-                m_localAgentManager->begin(),
-                m_localAgentManager->end(),
-                target,
-                [](const auto& agent, const auto& val) { return agent->name() < val; });
-            if ((*it)->name() != target) {
-                return;
+            // O(1) hash lookup (was O(log N) lower_bound — hot path with
+            // millions of dispatches per tick across 30k+ agents).
+            Agent* const agentPtr = m_localAgentManager->findByName(target);
+            if (agentPtr == nullptr) {
+                // A message addressed to a name no agent answers to is DROPPED. Say so, once per name:
+                // this was silent, and a whole class of defect looks like "the component never produced
+                // the message" from every other surface. `continue`, not `return`: a miss on one target
+                // must not also drop the message for the targets after it.
+                static std::set<std::string> reported;
+                if (reported.insert(target).second) {
+                    fmt::println(
+                        "[WARN] message to unknown target '{}' dropped (type {}); no agent answers to "
+                        "that name", target, msg->type);
+                }
+                continue;
             }
-            else if (it == m_localAgentManager->end()) {
-                throw taosim::simulation::SimulationException(fmt::format(
-                    "{}: unknown message target '{}'",
-                    std::source_location::current().function_name(),
-                    target));
-            }
-            (*it)->receiveMessage(msg);
+            agentPtr->receiveMessage(msg);
         }
     }
 }
@@ -464,6 +496,15 @@ void Simulation::step()
 
     updateTime(std::max(m_time.current, cutoff));
     m_signals.step();
+}
+
+//-------------------------------------------------------------------------
+
+void Simulation::clearFilledOrders() noexcept
+{
+    for (auto& book : m_exchange->books()) {
+        book->clearFilledOrders();
+    }
 }
 
 //-------------------------------------------------------------------------

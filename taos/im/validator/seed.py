@@ -5,17 +5,12 @@ Market data seed collection: real-time price feed from Coinbase/Binance,
 written to CSV files accessible by the simulator.
 """
 import os
-import sys
 import argparse
 import signal
 import traceback
 import time
-import pandas as pd
 import bittensor as bt
 
-from binance.websocket.spot.websocket_stream import SpotWebsocketStreamClient as BinanceClient
-from taos.im.utils.coinbase import CoinbaseClient
-from coinbase.websocket import WSClientConnectionClosedException, WSClientException
 
 from taos.im.utils.streams import *
 
@@ -72,7 +67,6 @@ def seed(config):
     seed_count = 0
     seed_filename = None
     seed_file = None
-    last_seed_count = seed_count
     last_seed = None
     pending_seed_data = ''
     
@@ -82,7 +76,6 @@ def seed(config):
     external_file = None
     sampled_external_filename = None
     sampled_external_file = None
-    last_external_count = external_count
     last_external = None
     last_sampled_external = None
     next_sampled_external = None
@@ -114,19 +107,19 @@ def seed(config):
             if seed_file:
                 try:
                     seed_file.close()
-                except:
+                except Exception:
                     pass
                 seed_file = None
             if external_file:
                 try:
                     external_file.close()
-                except:
+                except Exception:
                     pass
                 external_file = None
             if sampled_external_file:
                 try:
                     sampled_external_file.close()
-                except:
+                except Exception:
                     pass
                 sampled_external_file = None
             
@@ -146,6 +139,11 @@ def seed(config):
             _log_dir_changed = False
     
     def on_coinbase_trade(trade: dict):
+        """Handle one Coinbase trade message and record it as seed flow.
+
+        Args:
+            trade (dict): The exchange's trade payload.
+        """
         nonlocal last_seed, seed_count, pending_seed_data
         nonlocal last_external, external_count, pending_external_data
         nonlocal next_sampled_external
@@ -161,6 +159,11 @@ def seed(config):
                 record_external(trade)
 
     def on_binance_trade(trade: dict):
+        """Handle one Binance trade message and record it as seed flow.
+
+        Args:
+            trade (dict): The exchange's trade payload.
+        """
         nonlocal last_seed, seed_count, pending_seed_data
         nonlocal last_external, external_count, pending_external_data
 
@@ -173,6 +176,11 @@ def seed(config):
                 record_external(trade)
 
     def record_seed(trade: dict) -> None:
+        """Record a fundamental-seed trade for the simulation to consume.
+
+        Args:
+            trade (dict): Normalised trade with price, size and side.
+        """
         nonlocal seed_count, pending_seed_data, last_seed, seed_filename, seed_file
         
         try:
@@ -195,7 +203,7 @@ def seed(config):
                         seed_filename = os.path.join(_current_log_dir, "fundamental_seed.csv")
                         if os.path.exists(seed_filename) and os.stat(seed_filename).st_size > 0:
                             with open(seed_filename) as f:
-                                for line in f:
+                                for _line in f:
                                     seed_count += 1
                         seed_file = open(seed_filename, 'a')
                         seed_file.write(pending_seed_data)
@@ -208,6 +216,11 @@ def seed(config):
             bt.logging.error(f"Exception in seed handling: Seed={seed} | Error={ex}")
                     
     def record_external(trade: dict) -> None:
+        """Record an external-venue trade used for calibration rather than seeding.
+
+        Args:
+            trade (dict): Normalised trade with price, size and side.
+        """
         nonlocal external_count, pending_external_data, last_external
         nonlocal external_filename, external_file, sampled_external_filename
         nonlocal sampled_external_file, sampled_external_count
@@ -234,7 +247,7 @@ def seed(config):
                         external_filename = os.path.join(_current_log_dir, "external_seed.csv")
                         if os.path.exists(external_filename) and os.stat(external_filename).st_size > 0:
                             with open(external_filename) as f:
-                                for line in f:
+                                for _line in f:
                                     external_count += 1
                         external_file = open(external_filename, 'a')
                         external_file.write(pending_external_data)
@@ -243,7 +256,7 @@ def seed(config):
                         sampled_external_filename = os.path.join(_current_log_dir, "external_seed_sampled.csv")
                         if os.path.exists(sampled_external_filename) and os.stat(sampled_external_filename).st_size > 0:
                             with open(sampled_external_filename) as f:
-                                for line in f:
+                                for _line in f:
                                     sampled_external_count += 1
                         sampled_external_file = open(sampled_external_filename, 'a')
                     external_count += 1
@@ -259,6 +272,7 @@ def seed(config):
     seed_client = None
     
     def connect() -> None:
+        """Open (or re-open) the upstream websocket and subscribe to the configured symbols."""
         nonlocal last_reconnect_time, seed_exchange, seed_client
         time_since_reconnect = time.time() - last_reconnect_time
         if time_since_reconnect < reconnect_cooldown:
@@ -289,14 +303,15 @@ def seed(config):
                     time.sleep(min(attempts * 2, 30))
                 else:
                     last_reconnect_time = time.time()
-                    bt.logging.info(f"Connected to Binance seed stream")
+                    bt.logging.info("Connected to Binance seed stream")
                     break
             else:
                 last_reconnect_time = time.time()
-                bt.logging.info(f"Connected to Coinbase seed stream")
+                bt.logging.info("Connected to Coinbase seed stream")
                 break
     
     def check_seeds():
+        """Verify seed flow is still arriving and reconnect the sources that have gone quiet."""
         nonlocal last_seed, seed_count, last_external, external_count
         nonlocal next_external_sampling_time, next_sampled_external, last_sampled_external
         nonlocal sampled_external_count, seed_file, external_file, sampled_external_file
@@ -313,12 +328,11 @@ def seed(config):
                 if seed_exchange == 'coinbase' and seed_client._is_websocket_open():
                     try:
                         seed_client.close()
-                    except:
+                    except Exception:
                         pass
                 reconnect = True
                 last_seed = None
                 seed_count = 0
-            last_seed_count = seed_count
             
         if last_external:
             if external_file:
@@ -329,7 +343,7 @@ def seed(config):
                 if seed_exchange == 'coinbase' and seed_client._is_websocket_open():
                     try:
                         seed_client.close()
-                    except:
+                    except Exception:
                         pass
                 reconnect = True
                 last_external = None
@@ -428,7 +442,7 @@ def seed_thread(self) -> None:
                                     self.seed_filename = os.path.join(self.simulation.logDir,"fundamental_seed.csv")
                                     if os.path.exists(self.seed_filename) and os.stat(self.seed_filename).st_size > 0:
                                         with open(self.seed_filename) as f:
-                                            for line in f:
+                                            for _line in f:
                                                 self.seed_count += 1
                                     self.seed_file = open(self.seed_filename,'a')
                                     self.seed_file.write(self.pending_seed_data)
@@ -457,7 +471,7 @@ def seed_thread(self) -> None:
                                     self.external_filename = os.path.join(self.simulation.logDir,"external_seed.csv")
                                     if os.path.exists(self.external_filename) and os.stat(self.external_filename).st_size > 0:
                                         with open(self.external_filename) as f:
-                                            for line in f:
+                                            for _line in f:
                                                 self.external_count += 1
                                     self.external_file = open(self.external_filename,'a')
                                     self.external_file.write(self.pending_external_data)
@@ -466,7 +480,7 @@ def seed_thread(self) -> None:
                                     self.sampled_external_filename = os.path.join(self.simulation.logDir,"external_seed_sampled.csv")
                                     if os.path.exists(self.sampled_external_filename) and os.stat(self.sampled_external_filename).st_size > 0:
                                         with open(self.sampled_external_filename) as f:
-                                            for line in f:
+                                            for _line in f:
                                                 self.sampled_external_count += 1
                                     self.sampled_external_file = open(self.sampled_external_filename,'a')
                                 self.external_count += 1
@@ -507,11 +521,11 @@ def seed_thread(self) -> None:
                                 time.sleep(min(attempts * 2, 30))  # Exponential backoff capped at 30s
                             else:
                                 last_reconnect_time = time.time()
-                                bt.logging.info(f"Connected to Binance seed stream")
+                                bt.logging.info("Connected to Binance seed stream")
                                 break
                         else:
                             last_reconnect_time = time.time()
-                            bt.logging.info(f"Connected to Coinbase seed stream")
+                            bt.logging.info("Connected to Coinbase seed stream")
                             break
                 
                 def check_seeds():
@@ -526,7 +540,7 @@ def seed_thread(self) -> None:
                             if self.seed_exchange=='coinbase' and self.seed_client._is_websocket_open():
                                 try:
                                     self.seed_client.close()
-                                except:
+                                except Exception:
                                     pass
                             reconnect = True
                             self.last_seed = None
@@ -541,7 +555,7 @@ def seed_thread(self) -> None:
                             if self.seed_exchange=='coinbase' and self.seed_client._is_websocket_open():
                                 try:
                                     self.seed_client.close()
-                                except:
+                                except Exception:
                                     pass
                             reconnect = True
                             self.last_external = None

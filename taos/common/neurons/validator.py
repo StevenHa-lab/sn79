@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: 2025 Rayleigh Research <to@rayleigh.re>
+# SPDX-FileCopyrightText: 2026 Rayleigh Research <to@rayleigh.re>
 # SPDX-License-Identifier: MIT
 # The MIT License (MIT)
 # Copyright © 2023 Yuma Rao
@@ -30,7 +30,6 @@ import threading
 import bittensor as bt
 
 from typing import List, Optional, Tuple
-from traceback import print_exception
 
 
 def compute_two_pool_allocation(
@@ -96,6 +95,33 @@ def compute_two_pool_allocation(
     }
     return raw_weights, summary
 
+
+def resync_inputs_unchanged(previous_axons, current_axons, remembered_hotkeys, current_hotkeys):
+    """Whether resync_metagraph can return early without missing a uid slot changing hands.
+
+    Covers the hotkeys as well as the axons: a uid changing occupant is detected by comparing the
+    remembered hotkeys against the metagraph's, and an axon-only test misses the case where the new
+    occupant publishes the axon info the departed miner had -- the same operator re-registering on the
+    same box and port. handle_deregistration must still run there.
+
+    Separate from resync_metagraph's body so it can be tested directly.
+
+    Args:
+        previous_axons: Axons as of the last resync.
+        current_axons: Axons on the fresh metagraph.
+        remembered_hotkeys: Hotkeys as of the last resync.
+        current_hotkeys: Hotkeys on the fresh metagraph.
+
+    Returns:
+        bool: True when nothing changed hands and resync can return early.
+    """
+    return (
+        previous_axons == current_axons
+        and len(remembered_hotkeys) == len(current_hotkeys)
+        and list(remembered_hotkeys) == list(current_hotkeys)
+    )
+
+
 from abc import abstractmethod
 
 from taos.common.neurons import BaseNeuron
@@ -114,6 +140,7 @@ class BaseValidatorNeuron(BaseNeuron):
 
     @classmethod
     def add_args(cls, parser: argparse.ArgumentParser):
+        """Add validator CLI arguments to the parser."""
         super().add_args(parser)
         add_validator_args(cls, parser)
 
@@ -147,10 +174,14 @@ class BaseValidatorNeuron(BaseNeuron):
         self.sync(save_state=False)
 
         # Serve axon to enable external connections.
-        if not self.config.neuron.axon_off:
+        _observe = getattr(getattr(self.config, 'neuron', None), 'observe', False)
+        if not self.config.neuron.axon_off and not _observe:
             self.serve_axon()
         else:
-            bt.logging.warning("`neuron.axon_off=True` - IP will not be served to chain.")
+            if _observe:
+                bt.logging.info("Observe mode — skipping axon registration.")
+            else:
+                bt.logging.warning("`neuron.axon_off=True` - IP will not be served to chain.")
 
         # Instantiate runners
         self.should_exit: bool = False
@@ -185,6 +216,7 @@ class BaseValidatorNeuron(BaseNeuron):
             pass
 
     async def concurrent_forward(self):
+        """Run the configured number of forward passes concurrently."""
         coroutines = [
             self.forward()
             for _ in range(self.config.neuron.num_concurrent_forwards)
@@ -193,6 +225,7 @@ class BaseValidatorNeuron(BaseNeuron):
 
     # The `run` function is not used by this subnet since the validator is launched as a FastAPI client in order to receive communications from the simulator.
     def run(self):
+        """The validator main loop: sync, forward, score and persist until stopped."""
         pass
 
     def run_in_background_thread(self):
@@ -330,17 +363,25 @@ class BaseValidatorNeuron(BaseNeuron):
         """
         Weight setting function
         """
+        if getattr(self.config.neuron, 'observe', False):
+            bt.logging.info("Observe mode — skipping weight submission")
+            return
+
         # Get relevant hyperparameters
-        version_key = self.hyperparams.weights_version
         commit_reveal_weights_enabled = bool(self.hyperparams.commit_reveal_weights_enabled)
+        mechid = getattr(self.config.neuron, 'mechid', None)
+        if mechid is None:
+            mechid = 1 if getattr(self.config, 'engine', 'simulation') == 'exchange' else 0
         # Prepare weights for submission
         uint_uids, uint_weights = self.prepare_weights()
         bt.logging.info(f"`commit_reveal_weights_enabled` : {commit_reveal_weights_enabled}")
+        bt.logging.info(f"`mechid` : {mechid}")
         result, msg = self.subtensor.set_weights(
             wallet=self.wallet,
             netuid=self.config.netuid,
             uids=uint_uids,
             weights=uint_weights,
+            mechid=mechid,
             wait_for_inclusion=False,
             wait_for_finalization=False,
             version_key=self.spec_version,
@@ -365,8 +406,9 @@ class BaseValidatorNeuron(BaseNeuron):
         bt.logging.debug("Syncing metagraph...")
         self.metagraph.sync(subtensor=self.subtensor)
 
-        # Check if the metagraph axon info has changed.
-        if previous_metagraph.axons == self.metagraph.axons and len(self.hotkeys) == len(self.metagraph.hotkeys):            
+        if resync_inputs_unchanged(
+            previous_metagraph.axons, self.metagraph.axons, self.hotkeys, self.metagraph.hotkeys
+        ):
             bt.logging.debug("No axon changes!")
             return
 
@@ -408,6 +450,11 @@ class BaseValidatorNeuron(BaseNeuron):
         is the rank-norm + per-UID EMA gentrx vector (no Pareto). Both apply the
         same slow `moving_average_alpha`. `gentrx_rewards=None` is treated as a
         zero vector (gentrx pool dormant).
+
+        Args:
+            trading_rewards: Post-Pareto trading reward vector.
+            uids: Uids the vectors are aligned to.
+            gentrx_rewards: Rank-normalised, per-uid-EMA GenTRX vector.
         """
         bt.logging.debug("Updating Scores...")
         if torch.isnan(trading_rewards).any():

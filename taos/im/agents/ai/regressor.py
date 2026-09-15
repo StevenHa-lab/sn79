@@ -135,7 +135,8 @@ Output Directory : {self.output_dir}
         """
         validators = os.listdir(self.output_dir)
         for validator in validators:
-            if not is_valid_ss58_address(validator): continue
+            if not is_valid_ss58_address(validator):
+                continue
             pretrain_files = glob.glob(self.features_file(validator, '*'))
             for pretrain_file in pretrain_files:
                 book_id = os.path.basename(pretrain_file).split('.')[1]
@@ -220,6 +221,13 @@ Output Directory : {self.output_dir}
             data (dict): Dictionary with 'predictors' and 'target' entries.
         """
         def append_to_csv(file_path: str, data: dict, include_header: bool = False):
+            """Append one row to a CSV file, writing the header first when asked.
+
+            Args:
+                file_path (str): Destination file.
+                data (dict): Column values for this row.
+                include_header (bool): Write the header before the row.
+            """
             df = pd.DataFrame(data)
             df.to_csv(file_path, index=False, mode='a', header=include_header)
 

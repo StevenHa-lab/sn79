@@ -14,6 +14,8 @@
 #include "Balance.hpp"
 #include "Collateral.hpp"
 
+#include <random>
+
 //-------------------------------------------------------------------------
 
 namespace taosim::accounting
@@ -24,7 +26,7 @@ namespace taosim::accounting
 struct BalancesDesc
 {
     Balance base;
-    Balance quote;
+    std::shared_ptr<Balance> quote;
     RoundParams roundParams;
 };
 
@@ -40,7 +42,7 @@ class Balances : public JsonSerializable
 {
 public:
     Balance base{};
-    Balance quote{};
+    std::shared_ptr<Balance> quote{};
     std::map<OrderID, decimal_t> m_buyLeverages;
     std::map<OrderID, decimal_t> m_sellLeverages;
     std::map<OrderID, Loan> m_loans;
@@ -54,7 +56,11 @@ public:
 
     Balances() noexcept = default;
     explicit Balances(const BalancesDesc& desc) noexcept;
-    Balances(Balance base, Balance quote, uint32_t baseDecimals, uint32_t quoteDecimals) noexcept;
+    Balances(
+        Balance base,
+        std::shared_ptr<Balance> quote,
+        uint32_t baseDecimals,
+        uint32_t quoteDecimals) noexcept;
 
     [[nodiscard]] bool canBorrow(
         decimal_t collateralAmount, decimal_t price, OrderDirection direction) const noexcept;
@@ -81,7 +87,11 @@ public:
         rapidjson::Document& json, const std::string& key = {}) const override;
 
     [[nodiscard]] static Balances fromJson(const rapidjson::Value& json);
-    [[nodiscard]] static Balances fromXML(pugi::xml_node node, const RoundParams& roundParams);
+    // rng: when supplied, the pareto wealth draw uses THIS stream instead of a local
+    // std::random_device one, which is what makes a seeded run reproducible. Passing nullptr keeps
+    // the historical device-seeded behaviour, so runs without an rngSeed are unchanged.
+    [[nodiscard]] static Balances fromXML(
+        pugi::xml_node node, const RoundParams& roundParams, std::mt19937* rng = nullptr);
 
 private:
     [[nodiscard]] std::vector<std::pair<OrderID, decimal_t>> settleLoan(
@@ -122,7 +132,7 @@ struct fmt::formatter<taosim::accounting::Balances>
     template<typename FormatContext>
     auto format(const taosim::accounting::Balances& bals, FormatContext& ctx) const
     {
-        return fmt::format_to(ctx.out(), "Base: {}\nQuote: {}\n", bals.base, bals.quote);
+        return fmt::format_to(ctx.out(), "Balances{{base: {}, quote: {}}}", bals.base, *bals.quote);
     }
 };
 

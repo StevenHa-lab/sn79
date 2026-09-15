@@ -18,24 +18,40 @@
 # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 # DEALINGS IN THE SOFTWARE.
 
+import sys
 import torch
 import argparse
 import bittensor as bt
 from loguru import logger
 
 from taos.common.config import add_validator_args
+from taos.im.config.simulation import add_simulation_args
+# taos.im.config.exchange is loaded lazily inside add_im_validator_args when
+# engine='exchange' is requested. Not part of this tree; import is guarded.
+
+
+def _detect_engine_mode() -> str:
+    """Pre-scan sys.argv to detect --engine value before the full argparse pass."""
+    args = sys.argv[1:]
+    for i, arg in enumerate(args):
+        if arg == '--engine' and i + 1 < len(args):
+            return args[i + 1]
+        if arg.startswith('--engine='):
+            return arg.split('=', 1)[1]
+    return 'simulation'
+
 
 def add_im_validator_args(cls, parser):
     """Add validator specific arguments to the parser."""
     add_validator_args(cls, parser)
-    
+
     parser.add_argument(
         "--repo.remote",
         type=str,
         help="Repository remote name.",
         default="origin",
     )
-    
+
     parser.add_argument(
         '--benchmark.enabled',
         type=bool,
@@ -48,48 +64,6 @@ def add_im_validator_args(cls, parser):
         type=str,
         default='../config/benchmark_agents.json',
         help='JSON file path with benchmark agent configurations'
-    )
-    
-    parser.add_argument(
-        "--simulation.seeding.fundamental.symbol.coinbase",
-        type=str,
-        help="Coinbase spot market symbol price to be used to seed simulation price.",
-        default="BTC-USD",
-    )
-    
-    parser.add_argument(
-        "--simulation.seeding.fundamental.symbol.binance",
-        type=str,
-        help="Binance spot market symbol price to be used to seed simulation price.",
-        default="btcusdt",
-    )
-    
-    parser.add_argument(
-        "--simulation.seeding.external.symbol.coinbase",
-        type=str,
-        help="Coinbase futures market symbol price to be used to seed external price used in simulation.",
-        default="TAO-PERP-INTX",
-    )
-    
-    parser.add_argument(
-        "--simulation.seeding.external.symbol.binance",
-        type=str,
-        help="Binance futures market symbol price to be used to seed external price used in simulation.",
-        default="taousdt",
-    )
-    
-    parser.add_argument(
-        "--simulation.seeding.external.sampling_seconds",
-        type=int,
-        help="real time period in seconds over which external trade prices are written to file.",
-        default=60,
-    )
-
-    parser.add_argument(
-        "--simulation.xml_config",
-        type=str,
-        help="Path to XML file containing simulation configuration.",
-        default="../../../simulate/trading/run/config/simulation_0.xml",
     )
 
     parser.add_argument(
@@ -127,6 +101,22 @@ def add_im_validator_args(cls, parser):
         default=5_000_000_000,
     )
     
+    parser.add_argument(
+        "--scoring.score_ema_halflife",
+        type=int,
+        help="Half-life in simulation nanoseconds of the per-UID track-record EMA applied to the "
+             "trading score BEFORE the reward floor + Pareto allocation. Standing is earned across "
+             "multiple windows rather than from one: a single strong window converts into standing "
+             "only gradually, and later weak windows forfeit unearned standing — the market "
+             "analogue of multi-period track records / deferred compensation. Expressed as sim-time "
+             "so it is independent of the scoring cadence; 0 disables. Default equals "
+             "scoring.kappa.lookback (the 3h assessment window): the standing's memory horizon "
+             "matches the evidence horizon it is built on. Distinct from "
+             "neuron.moving_average_alpha, which smooths the POST-Pareto weight signal at the "
+             "scoring-cycle scale and does not affect rankings.",
+        default=10_800_000_000_000,
+    )
+
     parser.add_argument(
         "--scoring.max_instructions_per_book",
         type=int,
@@ -209,6 +199,92 @@ def add_im_validator_args(cls, parser):
         type=float,
         help="Weight applied to Realized PnL evaluation in final score calculation",
         default=0.21,
+    )
+
+    parser.add_argument(
+        "--scoring.debeta.enabled",
+        action="store_true",
+        help="Enable the combined de-beta trading score (P8): balanced two-sided spread capture "
+             "(making) + drift-stripped directional skill (kappa-of-alpha), rank-combined by w_make. "
+             "Full-replace of the kappa+pnl trading score (Option A). Default OFF: when off the "
+             "legacy kappa+pnl path is used unchanged.",
+        default=False,
+    )
+
+    parser.add_argument(
+        "--scoring.debeta.w_make",
+        type=float,
+        help="De-beta operator dial: weight on the making (liquidity) rank vs (1-w_make) on the "
+             "drift-stripped skill rank. Conservative launch weight 0.30 (skill-led); raise toward "
+             "0.50-0.65 to emphasise liquidity provision.",
+        default=0.30,
+    )
+
+    parser.add_argument(
+        "--scoring.debeta.centered_window",
+        type=int,
+        help="Half-window (in trades) for the non-lagging centered mid used by the making "
+             "spread-capture component.",
+        default=15,
+    )
+
+    parser.add_argument(
+        "--scoring.debeta.floor_scale",
+        type=float,
+        help="E5 magnitude floor for kappa-of-alpha: a per-book |alpha| must clear "
+             "floor_scale*median(|alpha|) to count (kappa is magnitude-blind; kills tiny-consistent "
+             "spam). 0 disables the floor.",
+        default=0.5,
+    )
+
+    parser.add_argument(
+        "--scoring.debeta.min_books",
+        type=int,
+        help="Activation guard ONLY: if fewer than this many miners receive a positive de-beta score "
+             "in a cycle, that cycle scores on the legacy path (warmup / cold-accumulator safety). "
+             "It does NOT set the per-miner qualifying-book requirement: the skill leg's own minimum "
+             "book count is fixed at 4 inside kappa_of_alpha/kappa_floored and is not configurable.",
+        default=4,
+    )
+
+    parser.add_argument(
+        "--scoring.debeta.p11_strength",
+        type=float,
+        help="P11 counterparty-diversity discount strength on the making leg: making *= "
+             "(1 - strength*max(0,excess_concentration)). 0 disables (default). 1.0 fully removes a "
+             "dedicated-feeder maker's making credit; a diverse maker is untouched. Closes the E3 "
+             "sacrificial-feeder hole in the making metric.",
+        default=0.0,
+    )
+
+    parser.add_argument(
+        "--scoring.debeta.mark_mode",
+        type=str,
+        choices=["last", "vwap", "median"],
+        help="M1 settlement-style marking: value inventory MTM on a rolling reference over the "
+             "last mark_window prints instead of the last trade (the settlement-window analogue "
+             "used by real venues), so a single manufactured print cannot revalue a position. "
+             "'vwap' = volume-weighted mean (movable by one large wash print - measured); "
+             "'median' = window median (robust: moving it needs a sustained majority of prints). "
+             "Default 'last': last-trade marking, byte-identical to 0.6.0.",
+        default="last",
+    )
+
+    parser.add_argument(
+        "--scoring.debeta.mark_window",
+        type=int,
+        help="Window length in prints for the rolling settlement mark (mark_mode vwap/median). "
+             "Inert while mark_mode=last.",
+        default=200,
+    )
+
+    parser.add_argument(
+        "--scoring.pnl.lookback",
+        type=int,
+        help="Window in simulation nanoseconds of realized P&L observations used for the "
+             "PnL-score component. Independent of scoring.kappa.lookback; defaults to the "
+             "same 3h so behaviour is unchanged unless explicitly tuned.",
+        default=10800_000_000_000,
     )
 
     parser.add_argument(
@@ -299,6 +375,13 @@ def add_im_validator_args(cls, parser):
              "has no block-sync config. Default 25 ≈ 5min at mainnet 12s/block, "
              "matches the 5min training window. Pass 0 for timer mode (proxy only).",
         default=25,
+    )
+    parser.add_argument(
+        "--gentrx.books_per_miner",
+        type=int,
+        help="Books (pages) assigned per miner per round. More pages = more "
+             "data per window (a bigger one-pass batch), less overfit.",
+        default=3,
     )
     parser.add_argument(
         "--scoring.activity.trade_volume_sampling_interval",
@@ -401,10 +484,44 @@ def add_im_validator_args(cls, parser):
     parser.add_argument(
         "--rewarding.pareto.shape",
         type=float,
-        help="Shape parameter for Pareto distribution used in allocating rewards.",
+        help="Shape parameter for Pareto distribution used in allocating rewards. Lower "
+             "= steeper payout curve concentrated on top performers. 1.0 concentrated ~51% of "
+             "reward on the top-5 UIDs, over-amplifying whichever strategy currently tops Kappa; "
+             "the default spreads that to about a third and restores mid-tier reward at negligible "
+             "cost to the highest genuine earners. Sharpen it again once the top of the board is "
+             "reliably skill-driven.",
+             
         default=1.42,
     )
-    
+
+    parser.add_argument(
+        "--rewarding.floor.enabled",
+        type=bool,
+        help="Enable the soft score floor: taper below-percentile trading scores toward "
+             "zero before Pareto allocation, so merely-adequate UID fleets stop earning "
+             "and rewards concentrate on genuine performers. Enabled by default; the "
+             "taper is gentle enough that a genuinely-improving newcomer clears it well "
+             "inside the 24 h immunity window.",
+        default=True,
+    )
+
+    parser.add_argument(
+        "--rewarding.floor.percentile",
+        type=float,
+        help="Percentile of active (positive) trading scores below which the soft floor "
+             "tapers rewards toward zero. Default 50 (median).",
+        default=50.0,
+    )
+
+    parser.add_argument(
+        "--rewarding.floor.softness",
+        type=float,
+        help="Soft-floor taper width in (0, 1]: scores ramp linearly from 0 at "
+             "threshold*(1-softness) up to full at the threshold. Smaller = sharper "
+             "(→ hard cliff); 1.0 = gentlest. Default 0.5.",
+        default=0.5,
+    )
+
     parser.add_argument(
         "--reporting.disabled",
         action="store_true",
@@ -412,84 +529,43 @@ def add_im_validator_args(cls, parser):
         default=False,
     )
 
-    # ── Exchange engine arguments ──────────────────────────────────────────────
     parser.add_argument(
-        "--exchange.netuids",
-        type=str,
-        help="Comma-separated subnet UIDs to include as exchange books. "
-             "Empty = auto-discover from chain state on first tick.",
-        default="",
-    )
-
-    parser.add_argument(
-        "--exchange.wallet.mode",
-        type=str,
-        choices=["single", "per_agent"],
-        help="Wallet mode for on-chain execution. "
-             "'single': one default wallet for all agents; "
-             "'per_agent': each agent UID uses a dedicated wallet.",
-        default="single",
-    )
-
-    parser.add_argument(
-        "--exchange.wallet.path",
-        type=str,
-        help="Filesystem path to the bittensor wallets directory.",
-        default="~/.bittensor/wallets",
-    )
-
-    parser.add_argument(
-        "--exchange.timeout",
-        type=float,
-        help="IPC response timeout in seconds for LOB exchange communication.",
-        default=60.0,
-    )
-
-    parser.add_argument(
-        "--exchange.max_retries",
+        "--neuron.mechid",
         type=int,
-        help="Maximum number of send+receive attempts before giving up on a batch.",
-        default=3,
+        help="Bittensor submechanism ID for weight submission. Defaults to 0 for simulation engine, 1 for exchange engine.",
+        default=None,
     )
 
     parser.add_argument(
-        "--exchange.ipc.request_queue",
+        "--engine",
         type=str,
-        help="POSIX message queue name for LOB batch requests.",
-        default="/mvtrx_req_queue",
+        choices=["simulation", "exchange"],
+        help="Validator engine mode: 'simulation' (default) or 'exchange'.",
+        default="simulation",
     )
 
     parser.add_argument(
-        "--exchange.ipc.response_queue",
-        type=str,
-        help="POSIX message queue name for LOB batch responses.",
-        default="/mvtrx_res_queue",
+        "--neuron.observe",
+        action="store_true",
+        default=False,
+        help=(
+            "Observe mode: collect chain state and push to the data service for UI display, "
+            "but skip all miner queries and weight submission. "
+            "Useful for connecting to mainnet/testnet to preview the UI without any chain interaction."
+        ),
     )
 
-    parser.add_argument(
-        "--exchange.ipc.request_shm",
-        type=str,
-        help="POSIX shared memory name for LOB batch request payloads.",
-        default="/mvtrx_req_shm",
-    )
-
-    parser.add_argument(
-        "--exchange.ipc.response_shm",
-        type=str,
-        help="POSIX shared memory name for LOB batch response payloads.",
-        default="/mvtrx_res_shm",
-    )
-
-    parser.add_argument(
-        "--exchange.ipc.request_semaphore",
-        type=str,
-        help="POSIX semaphore name used to signal the LOB that a request is ready.",
-        default="/mvtrx_req_sem",
-    )
-
-    parser.add_argument(
-        "--exchange.ipc.response_semaphore",
-        type=str,
-        help="POSIX semaphore name used by the LOB to signal that a response is ready.",
-        default="/mvtrx_res_sem",
-    )
+    # ── Engine-specific arguments (loaded conditionally) ──────────────────────
+    engine_mode = _detect_engine_mode()
+    if engine_mode == 'exchange':
+        try:
+            from taos.im.config.exchange import add_exchange_args
+        except ImportError as e:
+            raise RuntimeError(
+                "engine='exchange' requested but taos.im.config.exchange is not "
+                "available: exchange-mode engine runs require components that are "
+                "not part of this repository."
+            ) from e
+        add_exchange_args(cls, parser)
+    else:
+        add_simulation_args(cls, parser)

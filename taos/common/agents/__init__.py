@@ -10,6 +10,11 @@ from taos.common.protocol import SimulationStateUpdate, AgentResponse, EventNoti
 
 # Defining an abstract base class for simulation agents
 class SimulationAgent(ABC):
+    """Abstract base every agent process implements.
+
+    Attributes:
+        uid (int): The agent's uid on the subnet, set at launch.
+    """
     def __init__(self, uid, config, log_dir = None):
         """
         Initializer method that sets up the agent's unique ID and configuration.
@@ -26,7 +31,12 @@ class SimulationAgent(ABC):
         Path(self.output_dir).mkdir(parents=True, exist_ok=True)
         self.state_file = os.path.join(log_dir, 'state.mp')
         self.router = APIRouter()
-        self.router.add_api_route("/handle", self.handle, methods=["POST"])
+        # response_model=None: handle() returns a Pydantic union FinanceAgentResponse | ExchangeAgentResponse,
+        # but ExchangeAgentResponse is a sentinel-stub class on the public sim-only surface (the real
+        # Pydantic class lives in the excluded taos.im.protocol.exchange). FastAPI rejects sentinel classes
+        # as response_models. Disable response-model generation; serialization still happens via Pydantic
+        # on the returned object itself.
+        self.router.add_api_route("/handle", self.handle, methods=["POST"], response_model=None)
         self.initialize()  # Calling the abstract method to perform any agent-specific setup
 
     def handle(self, state: SimulationStateUpdate) -> AgentResponse:
@@ -34,7 +44,7 @@ class SimulationAgent(ABC):
         Method to handle a new simulation state update.
         """
         start=time.time()
-        # self.update(state)  # Update the agent's state based on the new simulation state
+        self.update(state)  # Update the agent's state based on the new simulation state
         bt.logging.debug(f"Updated ({time.time() - start}s)")
         start=time.time()
         response = self.respond(state)  # Generate a response based on the current state
@@ -98,6 +108,11 @@ class SimulationAgent(ABC):
         ...
 
 def launch(agent_class):
+    """Run an agent class as the miner's strategy process.
+
+    Args:
+        agent_class: The agent subclass to instantiate and serve.
+    """
     import argparse
     import uvicorn
     from taos.common.config import ParseKwargs

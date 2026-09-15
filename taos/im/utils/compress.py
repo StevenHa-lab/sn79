@@ -5,7 +5,8 @@ Payload compression utilities: lz4/zlib/zstd + Base64 encoding for synapse
 data, with parallel batching support via ThreadPoolExecutor.
 """
 import zstandard as zstd
-import zlib, lz4.frame
+import zlib
+import lz4.frame
 import pybase64
 import base64
 import msgspec
@@ -36,6 +37,15 @@ def compress(
     """
     Compress a payload using either JSON (legacy, version < 45)
     or Msgpack (version >= 45), wrapped in Base64 text.
+
+    Args:
+        payload: The object to compress.
+        level: Compression level.
+        engine: Compression engine name.
+        version: Protocol version selecting the codec.
+
+    Returns:
+        str: The Base64-wrapped compressed payload.
     """
     try:
         if version < 45:
@@ -59,6 +69,14 @@ def decompress(
     - version < 45 → JSON
     - version >= 45 → Msgpack
     Supports Base64-encoded transport, and old dict container format.
+
+    Args:
+        payload: The compressed payload.
+        engine: Compression engine name.
+        version: Protocol version selecting the codec.
+
+    Returns:
+        The decompressed object.
     """
     try:
         if isinstance(payload, str):
@@ -115,14 +133,17 @@ def compress_batch(axon_synapses: dict, batch, compressed_books: str, level: int
     for uid in batch:
         axon_synapses[uid].books = None
         payload = {
+            "pools":    getattr(axon_synapses[uid], 'pools', None),
             "accounts": axon_synapses[uid].accounts,
-            "notices": axon_synapses[uid].notices,
-            "config": axon_synapses[uid].config,
+            "notices":  axon_synapses[uid].notices,
+            "config":   axon_synapses[uid].config,
             "response": axon_synapses[uid].response,
         }
+        if hasattr(axon_synapses[uid], 'pools'):
+            axon_synapses[uid].pools = None
         axon_synapses[uid].accounts = None
-        axon_synapses[uid].notices = None
-        axon_synapses[uid].config = None
+        axon_synapses[uid].notices  = None
+        axon_synapses[uid].config   = None
         axon_synapses[uid].response = None
         axon_synapses[uid].compressed = {
             "books": compressed_books,

@@ -440,6 +440,16 @@ void ALGOTraderAgent::configure(const pugi::xml_node& node)
     m_topLevel = std::vector<TopLevel>(m_bookCount, TopLevel{});
 
     m_deviationProbCoef = node.attribute("wakeDeviationCoef").as_double(1.0);
+    // Limits-to-arbitrage response. reversionPower>1 makes the probabilistic reversion CONVEX
+    // in the fractional deviation from fundamental: near-zero in the normal trading range (price
+    // floats freely, short-horizon direction stays a ~random walk — essential so the subnet
+    // rewards genuine prediction, not a trivial fade-to-fundamental play), ramping to full only
+    // at large, persistent mispricings which it then bounds. Smooth (no kink → no predictable
+    // support/resistance level to trade against). reversionDeadband gates only the IMMEDIATE
+    // (aggressive) execution path so it never fires on small deviations. Defaults (power=1,
+    // band=0) = legacy linear behaviour.
+    m_reversionDeadband = node.attribute("reversionDeadband").as_double(0.0);
+    m_reversionPower = node.attribute("reversionPower").as_double(1.0);
     m_timeActivationCoef = node.attribute("wakeupTimeCoef").as_double(86'400'000'000'000.0);
 }
 
@@ -513,7 +523,7 @@ void ALGOTraderAgent::handleSimulationStart(Message::Ptr msg)
 
 void ALGOTraderAgent::handleTrade(Message::Ptr msg)
 {
-    const auto payload = std::dynamic_pointer_cast<EventTradePayload>(msg->payload);
+    const auto payload = std::static_pointer_cast<EventTradePayload>(msg->payload);
     const BookId bookId = payload->bookId;
     m_lastPrice.at(bookId) = payload->trade.price();
     m_state.at(payload->bookId).volumeStats.push(payload->trade);
@@ -523,7 +533,7 @@ void ALGOTraderAgent::handleTrade(Message::Ptr msg)
 
 void ALGOTraderAgent::handleBookResponse(Message::Ptr msg) 
 {
-    const auto payload = std::dynamic_pointer_cast<RetrieveL2ResponsePayload>(msg->payload);
+    const auto payload = std::static_pointer_cast<RetrieveL2ResponsePayload>(msg->payload);
     BookId bookId = payload->bookId;
     m_state.at(bookId).volumeStats.pushLevels(
         static_cast<Timestamp>(payload->time / m_period), payload->bids, payload->asks);
@@ -535,8 +545,13 @@ void ALGOTraderAgent::handleBookResponse(Message::Ptr msg)
     const double lastPrice = util::decimal2double(m_lastPrice.at(bookId));
     auto& state = m_state.at(bookId);
     const auto& balances =  simulation()->account(name()).at(bookId);
-    
-    if (fundamental >= lastPrice) {
+
+    // Immediate reversion also respects the no-trade band (see wakeupProb).
+    if (lastPrice > 0.0
+        && std::abs(fundamental - lastPrice) / lastPrice <= m_reversionDeadband) {
+        // inside the band: no immediate action; fall through to the periodic L2 request below
+    }
+    else if (fundamental >= lastPrice) {
          if (state.status != ALGOTraderStatus::EXECUTING  && state.volumeStats.askVolume() >= m_immediateBase) {
             state.status = ALGOTraderStatus::EXECUTING;
             state.direction = OrderDirection::BUY;
@@ -568,7 +583,7 @@ void ALGOTraderAgent::handleBookResponse(Message::Ptr msg)
 
 void ALGOTraderAgent::handleL1Response(Message::Ptr msg)
 {
-    const auto payload = std::dynamic_pointer_cast<RetrieveL1ResponsePayload>(msg->payload);    
+    const auto payload = std::static_pointer_cast<RetrieveL1ResponsePayload>(msg->payload);    
     const BookId bookId = payload->bookId;
     auto& topLevel = m_topLevel.at(bookId);
     topLevel.bid = taosim::util::decimal2double(payload->bestBidVolume);
@@ -597,7 +612,7 @@ void ALGOTraderAgent::handleWakeup(Message::Ptr msg)
             if (fundamental >= lastPrice) {
                 state.direction = OrderDirection::BUY;
                 state.volumeToBeExecuted = std::min(volumeToBeExecuted,
-                    balances.quote.getFree()*decimal_t{0.99}/m_lastPrice.at(bookId));
+                    balances.quote->getFree()*decimal_t{0.99}/m_lastPrice.at(bookId));
             } else if (fundamental <= lastPrice) {
                 state.direction = OrderDirection::SELL;
                 state.volumeToBeExecuted = std::min(volumeToBeExecuted,
@@ -631,7 +646,7 @@ void ALGOTraderAgent::handleWakeup(Message::Ptr msg)
 
 void ALGOTraderAgent::handleMarketOrderResponse(Message::Ptr msg)
 {
-    const auto payload = std::dynamic_pointer_cast<PlaceOrderMarketResponsePayload>(msg->payload);
+    const auto payload = std::static_pointer_cast<PlaceOrderMarketResponsePayload>(msg->payload);
     const auto requestPayload = payload->requestPayload;
 
     const decimal_t executedVolume = requestPayload->volume;
@@ -662,7 +677,7 @@ void ALGOTraderAgent::handleMarketOrderResponse(Message::Ptr msg)
 void ALGOTraderAgent::handleMarketOrderPlacementErrorResponse(Message::Ptr msg)
 {
     const auto payload =
-        std::dynamic_pointer_cast<PlaceOrderMarketErrorResponsePayload>(msg->payload);
+        std::static_pointer_cast<PlaceOrderMarketErrorResponsePayload>(msg->payload);
 
     const BookId bookId = payload->requestPayload->bookId;
 
@@ -683,7 +698,7 @@ void ALGOTraderAgent::execute(BookId bookId, ALGOTraderState& state)
     const decimal_t volume = std::min(drawnQty,
                                          state.volumeToBeExecuted);
     const decimal_t volumeToExecute = state.direction == OrderDirection::BUY ? 
-    std::min(volume, (balances.quote.getFree()* decimal_t{0.99}) /m_lastPrice.at(bookId))
+    std::min(volume, (balances.quote->getFree()* decimal_t{0.99}) /m_lastPrice.at(bookId))
         : std::min(volume, (baseBalance.getFree() * (decimal_t{0.99}) ));
 
     simulation()->logDebug(
@@ -711,7 +726,7 @@ double ALGOTraderAgent::wakeupProb(ALGOTraderState& state, double fundDist)
     double fullCostEst = m_depth*slope > volumeEstimate ? 1.0 : 1+ std::max(0.01, (2*m_depth*slope - volumeEstimate)/volumeEstimate);
     double probCost = std::min(1.0,1/(1+std::exp(2*((slope - volume*0.2)/slope))) * fullCostEst);
     double probTime = (state.statusChangeTime == 0) ? 1.0 : std::min(1.0, (simulation()->currentTimestamp()- state.statusChangeTime)/m_timeActivationCoef); 
-    double probDist = std::min(1.0,fundDist * m_deviationProbCoef); 
+    double probDist = std::min(1.0, std::pow(fundDist * m_deviationProbCoef, m_reversionPower)); 
 
     double probability = probVolatility * probCost * probTime * probDist;
     return std::min(1.0,std::max(probability,0.0));

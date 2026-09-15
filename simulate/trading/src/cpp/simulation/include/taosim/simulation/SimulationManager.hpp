@@ -8,15 +8,20 @@
 #include <taosim/checkpoint/CheckpointToken.hpp>
 #include <taosim/checkpoint/CheckpointManager.hpp>
 #include <taosim/ipc/ipc.hpp>
+#include <taosim/net/net.hpp>
 #include <taosim/replay/ReplayManager.hpp>
 #include <taosim/simulation/SharedResources.hpp>
-#include <net.hpp>
 
 #include <boost/asio.hpp>
 #include <pugixml.hpp>
 
+#include <cstdlib>
 #include <memory>
+#include <string>
 #include <vector>
+
+//-------------------------------------------------------------------------
+
 
 //-------------------------------------------------------------------------
 
@@ -31,17 +36,12 @@ struct SimulationBlockInfo
     uint32_t dimension;
 };
 
-struct NetworkingInfo
-{
-    std::string host, port, bookStateEndpoint, generalMsgEndpoint;
-    int64_t resolveTimeout, connectTimeout, writeTimeout, readTimeout;
-};
-
 //-------------------------------------------------------------------------
 
 class SimulationManager
 {
 public:
+
     void runSimulations();
     void runReplay();
     void runReplayAdvanced();
@@ -65,11 +65,21 @@ public:
     static std::unique_ptr<SimulationManager> fromCheckpoint(const checkpoint::CheckpointToken& ckptToken);
     static std::unique_ptr<SimulationManager> fromReplay(const replay::ReplayDesc& desc);
 
-    // TODO: ENV?
-    static constexpr std::string_view s_validatorReqMessageQueueName{"taosim-req"};
-    static constexpr std::string_view s_validatorResMessageQueueName{"taosim-res"};
-    static constexpr std::string_view s_statePublishShmName{"state"};
-    static constexpr std::string_view s_remoteResponsesShmName{"responses"};
+    // IPC object names, optionally suffixed by the TAOSIM_IPC_SUFFIX env var so
+    // multiple taosim runs can share one host with private, non-colliding POSIX
+    // IPC (the namespace/unshare route needs privileges this host's AppArmor
+    // policy denies). Empty/unset suffix => names unchanged (backward compatible).
+    // The Python side (simbo/ipc.py) reads the SAME env var and applies the
+    // SAME suffix, so the two processes agree on the object names.
+    static std::string makeIpcName(std::string_view base)
+    {
+        const char* suffix = std::getenv("TAOSIM_IPC_SUFFIX");
+        return suffix ? std::string{base} + suffix : std::string{base};
+    }
+    inline static const std::string s_validatorReqMessageQueueName = makeIpcName("taosim-req");
+    inline static const std::string s_validatorResMessageQueueName = makeIpcName("taosim-res");
+    inline static const std::string s_statePublishShmName = makeIpcName("state");
+    inline static const std::string s_remoteResponsesShmName = makeIpcName("responses");
 
 private:
     void setupLogDir(pugi::xml_node simuNode, const fs::path& logPath);
@@ -86,7 +96,8 @@ private:
     std::vector<std::unique_ptr<Simulation>> m_simulations;
     fs::path m_logDir;
     Timestamp m_gracePeriod;
-    NetworkingInfo m_netInfo;
+    taosim::net::NetworkingInfo m_netInfo;
+    std::string m_bookStateEndpoint, m_generalMsgEndpoint;
     UnsyncSignal<void()> m_stepSignal;
     std::unique_ptr<ipc::PosixMessageQueue> m_validatorReqMessageQueue;
     std::unique_ptr<ipc::PosixMessageQueue> m_validatorResMessageQueue;
@@ -104,11 +115,6 @@ private:
             t0ckptSave, t1ckptSave,
             t0ckptLoad, t1ckptLoad;
     } m_measurements;
-
-    net::awaitable<void> asyncSendOverNetwork(
-        const rapidjson::Value& reqBody, const std::string& endpoint, rapidjson::Document& resJson);
-    http::request<http::string_body> makeHttpRequest(
-        const std::string& target, const std::string& body);
 };
 
 //-------------------------------------------------------------------------

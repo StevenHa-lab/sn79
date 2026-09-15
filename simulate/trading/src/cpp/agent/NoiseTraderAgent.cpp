@@ -10,12 +10,12 @@
 #include "DistributionFactory.hpp"
 #include "RayleighDistribution.hpp"
 #include "Simulation.hpp"
+#include <taosim/util/RootFinding.hpp>
 
 #include <boost/algorithm/string/regex.hpp>
 #include <boost/bimap.hpp>
 
 #include <boost/accumulators/accumulators.hpp>
-#include <unsupported/Eigen/NonLinearOptimization>
 #include <boost/accumulators/statistics/stats.hpp>
 #include <boost/random.hpp>
 
@@ -28,9 +28,7 @@ namespace taosim::agent
 
 inline auto investmentPosition = [](double price, double forecast, double variance, double base, double quote) {
     return (std::log(forecast/price) + variance)/(variance*price);
-};    
-
-//-------------------------------------------------------------------------
+};
 
 NoiseTraderAgent::NoiseTraderAgent(Simulation* simulation) noexcept
     : Agent{simulation}
@@ -43,7 +41,6 @@ void NoiseTraderAgent::configure(const pugi::xml_node& node)
     Agent::configure(node);
 
     m_rng = &simulation()->rng();
-
 
     pugi::xml_attribute attr;
     static constexpr auto ctx = std::source_location::current().function_name();
@@ -138,7 +135,6 @@ void NoiseTraderAgent::configure(const pugi::xml_node& node)
     m_maxDelay = (attr.empty() || attr.as_ullong() < 1'000'000'000) ? static_cast<Timestamp>(450'000'000'000) : attr.as_ullong();
     attr = node.attribute("minDMD");
     m_minDelay = (attr.empty() || attr.as_ullong() < 100'000'000) ? static_cast<Timestamp>(100'000'000) : attr.as_ullong();
-    // -- END
 
     // BEGIN Order details
     attr = node.attribute("meanVolume");
@@ -149,16 +145,29 @@ void NoiseTraderAgent::configure(const pugi::xml_node& node)
     attr = node.attribute("balanceCoef");
     m_balanceCoef=  (attr.empty() || attr.as_double() <= 0.0) ? 0.5 : attr.as_double();
 
-    m_sigma = node.attribute("sigmaExp").as_double(0.000001);
+    m_sigma = node.attribute("sigmaExp").as_double(0.00001);
+    m_feeReserveFrac = std::clamp(node.attribute("feeReserveFrac").as_double(0.01), 0.0, 0.5);
     m_mWeight = node.attribute("weight").as_double(0.1);
 
-    // for cancellation of limit orders
+    try {
+        (void)simulation()->exchange()->process("magneticfield", 0);
+    } catch (const std::exception&) {
+        throw std::invalid_argument(fmt::format(
+            "{}: requires a Books process named 'magneticfield' (used for the Ising field "
+            "and to hold ACD wakeup state)", name()));
+    }
+
     attr = node.attribute("tau");
     m_tau = (attr.empty() || attr.as_ullong() == 0) ? 120'000'000'000 : attr.as_ullong();
 
-    
     m_state.orderFlag = std::vector<bool>(m_bookCount, false);
- 
+
+    m_magneticField.reserve(m_bookCount);
+    for (BookId b = 0; b < m_bookCount; ++b) {
+        m_magneticField.push_back(dynamic_cast<process::MagneticField*>(
+            simulation()->exchange()->process("magneticfield", b)));
+    }
+
     size_t pos = name().find_last_not_of("0123456789");
     if (pos != std::string::npos && pos + 1 < name().size()) {
         std::string numStr = name().substr(pos + 1);
@@ -221,9 +230,9 @@ void NoiseTraderAgent::handleSimulationStart()
                 "WAKEUP",
                 MessagePayload::create<RetrieveL1Payload>(bookId));
 
-            const auto field = dynamic_cast<process::MagneticField*>(simulation()->exchange()->process("magneticfield",bookId));
-            float initValue = std::exp((float) m_maxDelay/3.0f);
-            field->insertDurationComp(m_baseName, process::DurationComp{.delay=initValue, .psi=initValue});
+            const auto field = m_magneticField[bookId];
+            const float initPsi = m_omegaDu / (1.0f - m_alphaDu - m_betaDu);
+            field->insertDurationComp(m_baseName, process::DurationComp{.delay=initPsi, .psi=initPsi});
         }
     }
 }
@@ -231,7 +240,14 @@ void NoiseTraderAgent::handleSimulationStart()
 //-------------------------------------------------------------------------
 
 void NoiseTraderAgent::handleSimulationStop()
-{}
+{
+    if (m_catUId != 0) return;
+    for (BookId bookId = 0; bookId < m_bookCount; ++bookId) {
+        const auto field = dynamic_cast<process::MagneticField*>(
+            simulation()->exchange()->process("magneticfield", bookId));
+        if (field) field->emitDiagnostics(m_baseName, bookId);
+    }
+}
 
 //-------------------------------------------------------------------------
 
@@ -265,23 +281,26 @@ void NoiseTraderAgent::handleWakeup(Message::Ptr &msg)
 
 void NoiseTraderAgent::handleRetrieveL1Response(Message::Ptr msg)
 {
-    const auto payload = std::dynamic_pointer_cast<RetrieveL1ResponsePayload>(msg->payload);
+    const auto payload = std::static_pointer_cast<RetrieveL1ResponsePayload>(msg->payload);
 
     const BookId bookId = payload->bookId;
-    
+
     uint64_t chosenOne = selectTurn();
-    const auto field = dynamic_cast<process::MagneticField*>(simulation()->exchange()->process("magneticfield", bookId));
+    const auto field = m_magneticField[bookId];
     double avgMagnetism = std::abs(field->avgMagnetism());
     const auto lastDurationComp = field->getDurationComp(m_baseName);
     float lastDelay = lastDurationComp.delay;
-    float psi_prev = lastDurationComp.psi; 
+    float psi_prev = lastDurationComp.psi;
     float psi_next = m_omegaDu + m_alphaDu * lastDelay + m_betaDu *psi_prev + m_gammaDu*std::log(1-avgMagnetism);
-    if (isnan(psi_next)) {
-        psi_next = m_omegaDu/(1-m_alphaDu - m_omegaDu);
+    if (!std::isfinite(psi_next)) {
+        psi_next = m_omegaDu/(1-m_alphaDu - m_betaDu);
     }
-    float delay = std::exp(psi_next) * m_acdDelayDist(*m_rng);
-    Timestamp delay_timestamped = std::clamp(static_cast<Timestamp>(delay), m_minDelay, m_maxDelay);
-    delay= (float) delay_timestamped;
+    double delayRaw = static_cast<double>(std::exp(psi_next)) * m_acdDelayDist(*m_rng);
+    if (!std::isfinite(delayRaw) || delayRaw > static_cast<double>(m_maxDelay)) {
+        delayRaw = static_cast<double>(m_maxDelay);
+    }
+    Timestamp delay_timestamped = std::clamp(static_cast<Timestamp>(delayRaw), m_minDelay, m_maxDelay);
+    const float delay = static_cast<float>(delay_timestamped);
     simulation()->dispatchMessage(
         simulation()->currentTimestamp(),
         delay_timestamped,
@@ -305,8 +324,8 @@ void NoiseTraderAgent::handleRetrieveL1Response(Message::Ptr msg)
 
 void NoiseTraderAgent::handleMarketOrderPlacementResponse(Message::Ptr msg)
 {
-    const auto payload = std::dynamic_pointer_cast<PlaceOrderMarketResponsePayload>(msg->payload);
-    m_state.orderFlag.at(payload->requestPayload->bookId) = false;
+    const auto payload = std::static_pointer_cast<PlaceOrderMarketResponsePayload>(msg->payload);
+    m_state.orderFlag[payload->requestPayload->bookId] = false;
 }
 
 //-------------------------------------------------------------------------
@@ -314,18 +333,18 @@ void NoiseTraderAgent::handleMarketOrderPlacementResponse(Message::Ptr msg)
 void NoiseTraderAgent::handleMarketOrderPlacementErrorResponse(Message::Ptr msg)
 {
     const auto payload =
-        std::dynamic_pointer_cast<PlaceOrderMarketErrorResponsePayload>(msg->payload);
+        std::static_pointer_cast<PlaceOrderMarketErrorResponsePayload>(msg->payload);
 
     const BookId bookId = payload->requestPayload->bookId;
 
-    m_state.orderFlag.at(bookId) = false;
+    m_state.orderFlag[bookId] = false;
 }
 
 //-------------------------------------------------------------------------
 
 void NoiseTraderAgent::handleLimitOrderPlacementResponse(Message::Ptr msg)
 {
-    const auto payload = std::dynamic_pointer_cast<PlaceOrderLimitResponsePayload>(msg->payload);
+    const auto payload = std::static_pointer_cast<PlaceOrderLimitResponsePayload>(msg->payload);
 
     simulation()->dispatchMessage(
         simulation()->currentTimestamp(),
@@ -336,7 +355,7 @@ void NoiseTraderAgent::handleLimitOrderPlacementResponse(Message::Ptr msg)
         MessagePayload::create<CancelOrdersPayload>(
             std::vector{taosim::event::Cancellation(payload->id)}, payload->requestPayload->bookId));
 
-    m_state.orderFlag.at(payload->requestPayload->bookId) = false;
+    m_state.orderFlag[payload->requestPayload->bookId] = false;
 }
 
 //-------------------------------------------------------------------------
@@ -344,11 +363,11 @@ void NoiseTraderAgent::handleLimitOrderPlacementResponse(Message::Ptr msg)
 void NoiseTraderAgent::handleLimitOrderPlacementErrorResponse(Message::Ptr msg)
 {
     const auto payload =
-        std::dynamic_pointer_cast<PlaceOrderLimitErrorResponsePayload>(msg->payload);
+        std::static_pointer_cast<PlaceOrderLimitErrorResponsePayload>(msg->payload);
 
     const BookId bookId = payload->requestPayload->bookId;
 
-    m_state.orderFlag.at(bookId) = false;
+    m_state.orderFlag[bookId] = false;
 }
 
 //-------------------------------------------------------------------------
@@ -370,7 +389,7 @@ void NoiseTraderAgent::handleTrade(Message::Ptr msg)
 
 void NoiseTraderAgent::placeOrder(BookId bookId)
 {
-    const auto field = dynamic_cast<process::MagneticField*>(simulation()->exchange()->process("magneticfield", bookId));
+    const auto field = m_magneticField[bookId];
     const int sign = field->signAt(m_catUId);
     if (m_logFlag) field->logState(simulation()->currentTimestamp(), m_catUId);
     const float magnetism = field->avgMagnetism();
@@ -380,29 +399,17 @@ void NoiseTraderAgent::placeOrder(BookId bookId)
     const auto freeBase =
         taosim::util::decimal2double(simulation()->account(name()).at(bookId).base.getFree());
     const auto freeQuote =
-        taosim::util::decimal2double(simulation()->account(name()).at(bookId).quote.getFree());
+        taosim::util::decimal2double(simulation()->account(name()).at(bookId).quote->getFree());
     float adjustedRet = m_sigma +  m_mWeight*magnetism + field->magnetismReturn();
     ForecastResult forecastResult = {.price= m_price*std::exp(adjustedRet), .varianceOfLastLogReturns=m_sigma};
     const auto [indifferencePrice, indifferencePriceConverged] =
         calculateIndifferencePrice(forecastResult, freeBase, freeQuote);
-    if (!indifferencePriceConverged){ 
-          if (sign > 0) {
-                placeBuy(bookId, volume);
-            } else if (sign < 0) {
-                placeSell(bookId, volume);
-            }
-        return;}
+    if (!indifferencePriceConverged) return;
 
+    const auto [minimumPrice, minimumPriceConverged] =
+        calculateMinimumPrice(forecastResult, freeBase, freeQuote, indifferencePrice);
+    if (!minimumPriceConverged) return;
 
-    auto [minimumPrice, minimumPriceConverged] =
-        calculateMinimumPrice(forecastResult, freeBase, freeQuote);
-    if (!minimumPriceConverged) {
-            if (sign > 0) {
-                placeBuy(bookId, volume);
-            } else if (sign < 0) {
-                placeSell(bookId, volume);
-            }
-        return;}
     const auto maximumPrice = forecastResult.price;
     double weight; 
     if (sign*magnetism > 0) {
@@ -420,14 +427,21 @@ void NoiseTraderAgent::placeOrder(BookId bookId)
     } else {
         weight = 1- avgMagnetism;
     }
-    const double sampledPrice = samplePrice(minimumPrice*(1+balance),indifferencePrice,maximumPrice*(1-balance),sign,weight);
+    const double sampleLow = std::max(minimumPrice, m_priceIncrement);
+    const double sampleHigh = maximumPrice;
+    if (sampleLow >= sampleHigh) return;
+
+    const double sampledPrice = samplePrice(sampleLow, indifferencePrice, sampleHigh, sign, weight);
     const double price = std::round(sampledPrice / m_priceIncrement) * m_priceIncrement;
+    if (price <= 0.0) return;
     if (sampledPrice < indifferencePrice) {
         volume = calcPositionPrice(forecastResult,sampledPrice,freeBase,freeQuote) - freeBase;
+        volume = std::min(volume, freeQuote / price * (1.0 - m_feeReserveFrac));
         placeBid(bookId,volume,price);
         field->setValAt(m_catUId, 1);
     } else if (sampledPrice > indifferencePrice) {
         volume = freeBase - calcPositionPrice(forecastResult, sampledPrice,freeBase,freeQuote);
+        volume = std::min(volume, freeBase);
         placeAsk(bookId, volume, price);
         field->setValAt(m_catUId, -1);
     }
@@ -436,17 +450,21 @@ void NoiseTraderAgent::placeOrder(BookId bookId)
 double NoiseTraderAgent::samplePrice(double minP, double indiffP, double maxP,
                    int sign, double weight)
 {
-    double i = (indiffP - minP) / (maxP - minP);
+    if (!(maxP > minP)) {
+        return minP;
+    }
+    const double i = std::clamp((indiffP - minP) / (maxP - minP), 0.0, 1.0);
 
     double mode;
     if (sign >= 0) {
-        mode = i * (1.0 - weight);   
+        mode = i * (1.0 - weight);
     }
     else {
         mode = i + (1.0 - i) * weight;
     }
+    mode = std::clamp(mode, 0.0, 1.0);
 
-    double s = 6.0; 
+    double s = 6.0;
     double alpha = mode * (s - 2.0) + 1.0;
     double beta  = (1.0 - mode) * (s - 2.0) + 1.0;
     std::gamma_distribution<double> distA(alpha, 1.0);
@@ -462,90 +480,33 @@ double NoiseTraderAgent::samplePrice(double minP, double indiffP, double maxP,
 NoiseTraderAgent::OptimizationResult NoiseTraderAgent::calculateIndifferencePrice(
     const NoiseTraderAgent::ForecastResult& forecastResult, double freeBase, double freeQuote)
 {
-    struct Functor
-    {
-        ForecastResult forecastResult;
-        double freeBase;
-        double freeQuote;
-
-        Functor(ForecastResult forecastResult, double freeBase, double freeQuote) noexcept
-        : forecastResult{forecastResult}, freeBase{freeBase}, freeQuote{freeQuote}
-        {}
-
-        int inputs() const noexcept { return 1; }
-        int values() const noexcept { return 1; }
-
-        int operator()(const Eigen::VectorXd& x, Eigen::VectorXd& fvec) const
-        {
-            fvec[0] = investmentPosition(x[0], 
-                        forecastResult.price, 
-                        forecastResult.varianceOfLastLogReturns, 
-                        freeBase,
-                        freeQuote) 
-                    - freeBase;
-            return 0;
-        }
+    auto residual = [&](double x) {
+        return investmentPosition(x, forecastResult.price,
+            forecastResult.varianceOfLastLogReturns, freeBase, freeQuote) - freeBase;
     };
-
-    Functor functor{forecastResult,  freeBase, freeQuote};
-    Eigen::HybridNonLinearSolver<Functor> solver{functor};
-    solver.parameters.xtol = 1.49012e-8;
-    Eigen::VectorXd x{1};
-    x[0] = 1.0;
-    Eigen::HybridNonLinearSolverSpace::Status status = solver.hybrd1(x);
-    return {
-        .value = x[0],
-        .converged = status == Eigen::HybridNonLinearSolverSpace::RelativeErrorTooSmall
-    };
+    const auto upperBound =
+        forecastResult.price * std::exp(forecastResult.varianceOfLastLogReturns);
+    const auto root = util::solveScalarBracketed(residual, m_priceIncrement, upperBound);
+    return {.value = root.value, .converged = root.converged};
 }
 
 //-------------------------------------------------------------------------
 
 NoiseTraderAgent::OptimizationResult NoiseTraderAgent::calculateMinimumPrice(
-    const NoiseTraderAgent::ForecastResult& forecastResult, double freeBase, double freeQuote)
+    const NoiseTraderAgent::ForecastResult& forecastResult,
+    double freeBase,
+    double freeQuote,
+    double indifferencePrice)
 {
-    struct Functor
-    {
-        ForecastResult forecastResult;
-        double freeBase;
-        double freeQuote;
-
-        Functor(
-            ForecastResult forecastResult,
-            double freeBase,
-            double freeQuote) noexcept
-        
-            : forecastResult{forecastResult},
-              freeBase{freeBase},
-              freeQuote{freeQuote}
-        {}
-
-        int inputs() const noexcept { return 1; }
-        int values() const noexcept { return 1; }
-
-        int operator()(const Eigen::VectorXd& x, Eigen::VectorXd& fvec) const
-        {
-            fvec[0] = x[0] * 
-                    (investmentPosition(x[0], 
-                            forecastResult.price, 
-                            forecastResult.varianceOfLastLogReturns,
-                            freeBase,
-                            freeQuote) 
-                    - freeBase) - freeQuote;
-            return 0;
-        }
+    auto residual = [&](double x) {
+        return x * (investmentPosition(x, forecastResult.price,
+            forecastResult.varianceOfLastLogReturns, freeBase, freeQuote) - freeBase) - freeQuote;
     };
-
-    Functor functor{forecastResult, freeBase, freeQuote};
-    Eigen::HybridNonLinearSolver<Functor> solver{functor};
-    solver.parameters.xtol = 1.49012e-8;
-    Eigen::VectorXd x{1};
-    x[0] = 1.0;
-    Eigen::HybridNonLinearSolverSpace::Status status = solver.hybrd1(x);
-    return {
-        .value = x[0],
-        .converged = status == Eigen::HybridNonLinearSolverSpace::RelativeErrorTooSmall
-    };
+    const auto root = util::solveScalarBracketed(residual, m_priceIncrement, indifferencePrice);
+    if (!root.converged && root.status == util::RootStatus::SameSignNegative) {
+        return {.value = m_priceIncrement, .converged = true};
+    }
+    return {.value = root.value, .converged = root.converged};
 }
 
 // -------------------------------------------------------------------------
@@ -556,7 +517,7 @@ void NoiseTraderAgent::placeBid(BookId bookId, double volume, double price)
 {
     volume = std::floor(volume / m_volumeIncrement) * m_volumeIncrement;
     if (volume == 0) return;
-    m_state.orderFlag.at(bookId) = true;
+    m_state.orderFlag[bookId] = true;
 
     simulation()->dispatchMessage(
         simulation()->currentTimestamp(),
@@ -574,7 +535,7 @@ void NoiseTraderAgent::placeBid(BookId bookId, double volume, double price)
 
 void NoiseTraderAgent::placeBuy(BookId bookId, double volume)
 {
-    m_state.orderFlag.at(bookId) = true;
+    m_state.orderFlag[bookId] = true;
 
     simulation()->dispatchMessage(
         simulation()->currentTimestamp(),
@@ -594,7 +555,7 @@ void NoiseTraderAgent::placeAsk(BookId bookId, double volume, double price)
 {
     volume = std::floor(volume / m_volumeIncrement) * m_volumeIncrement;
     if (volume == 0) return;
-    m_state.orderFlag.at(bookId) = true;
+    m_state.orderFlag[bookId] = true;
     simulation()->dispatchMessage(
         simulation()->currentTimestamp(),
         orderPlacementLatency(),
@@ -612,7 +573,7 @@ void NoiseTraderAgent::placeAsk(BookId bookId, double volume, double price)
 
 void NoiseTraderAgent::placeSell(BookId bookId, double volume)
 {
-    m_state.orderFlag.at(bookId) = true;
+    m_state.orderFlag[bookId] = true;
     simulation()->dispatchMessage(
         simulation()->currentTimestamp(),
         orderPlacementLatency(),

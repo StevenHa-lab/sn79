@@ -78,7 +78,7 @@ public:
         const std::string& type,
         std::map<std::string, std::string> payload) const;
 
-    void queueMessage(Message::Ptr msg) const;
+    void queueMessage(const Message::Ptr& msg) const;
 
     template<typename... Args>
     requires std::constructible_from<taosim::message::PrioritizedMessage, Args...>
@@ -108,8 +108,16 @@ public:
     [[nodiscard]] auto&& agents(this auto&& self) noexcept { return self.m_localAgentManager->agents(); }
     [[nodiscard]] Timestamp currentTimestamp() const noexcept;
     [[nodiscard]] Timestamp duration() const noexcept;
+    // Identity of the instruction currently being dispatched, empty outside dispatch. See
+    // OrderClientContext::instrSeq for why this is optional rather than a counter starting at 0.
+    [[nodiscard]] std::optional<uint64_t> currentInstructionSeq() const noexcept
+    {
+        return m_instructionSeq;
+    }
+    void beginInstruction() noexcept { m_instructionSeq = ++m_instructionCounter; }
+    void endInstruction() noexcept { m_instructionSeq.reset(); }
     [[nodiscard]] MultiBookExchangeAgent* exchange() const noexcept { return m_exchange; }
-    [[nodiscard]] DistributedProxyAgent* proxy() const noexcept { return m_proxy; }
+    [[nodiscard]] taosim::agent::DistributedProxyAgent* proxy() const noexcept { return m_proxy; }
     [[nodiscard]] taosim::simulation::SimulationSignals& signals() const noexcept;
     [[nodiscard]] std::mt19937& rng() const noexcept;
     [[nodiscard]] const taosim::simulation::SimulationConfig& config() const noexcept { return m_config2; }
@@ -117,6 +125,19 @@ public:
     [[nodiscard]] auto&& time(this auto&& self) noexcept { return self.m_time; }
     [[nodiscard]] uint32_t blockIdx() const noexcept { return m_blockIdx; }
     [[nodiscard]] auto&& logWindow(this auto&& self) noexcept { return self.m_logWindow; }
+
+    // Wall-clock nanoseconds of the chain block being processed, or 0 when there is no chain.
+    //
+    // Set once per batch in exchange mode from the chain's block timestamp, which is the same value the
+    // validator puts on its ingest payload and therefore the clock the trades tape, agent_fills and
+    // the events stream all report against. Log records stamped from it agree with those surfaces
+    // instead of carrying a third clock.
+    //
+    // ZERO IS THE SIMULATION CASE and every consumer must fall back to its existing behaviour on
+    // zero: simulation has no blocks, its timestamps are sim-relative and its logs are correct as
+    // they are. Nothing about sim logging changes.
+    [[nodiscard]] Timestamp blockTimestamp() const noexcept { return m_blockTimestamp; }
+    void setBlockTimestamp(Timestamp ns) noexcept { m_blockTimestamp = ns; }
     [[nodiscard]] auto&& messageQueue(this auto&& self) noexcept { return self.m_messageQueue; }
     [[nodiscard]] bool replayMode() const noexcept { return m_replayMode; }
     [[nodiscard]] const auto& replayDesc() const noexcept { return m_replayDesc; }
@@ -154,6 +175,13 @@ public:
         }
     }
     
+    void logDebug(std::string_view sv) const noexcept
+    {
+        if (m_debug) {
+            fmt::println("[DEBUG] {}", sv);
+        }
+    }
+
     void setDebug(bool flag) noexcept { m_debug = flag; }
     [[nodiscard]] bool debug() const noexcept { return m_debug; }
 
@@ -176,13 +204,17 @@ public:
         uint64_t seed, double S0, double mu, double sigma, uint32_t N);
 
     void step();
+    void clearFilledOrders() noexcept;
+    void deliverMessage(const Message::Ptr& msg);
 
     [[nodiscard]] static std::unique_ptr<Simulation> fromXML(pugi::xml_node node);
 
 private:
+    std::optional<uint64_t> m_instructionSeq;
+    uint64_t m_instructionCounter{};
+
     void configureAgents(pugi::xml_node node);
     void configureLogging(pugi::xml_node node);
-    void deliverMessage(Message::Ptr msg);
     void start();
     void stop();
 
@@ -199,7 +231,7 @@ private:
     mutable taosim::simulation::SimulationSignals m_signals;
     std::unique_ptr<LocalAgentManager> m_localAgentManager;
     MultiBookExchangeAgent* m_exchange{};
-    DistributedProxyAgent* m_proxy;
+    taosim::agent::DistributedProxyAgent* m_proxy;
     mutable std::mt19937 m_rng;
     std::string m_id;
     std::string m_config;
@@ -211,6 +243,7 @@ private:
     uint32_t m_blockDim{};
     fs::path m_baseLogDir;
     Timestamp m_logWindow{};
+    Timestamp m_blockTimestamp{};
     bool m_replayMode{};
     taosim::replay::ReplayDesc m_replayDesc;
     const taosim::simulation::SharedResources* m_sharedResources{};

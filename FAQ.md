@@ -1,6 +1,6 @@
 <div align="center">
 
-# **τaos** ☯ **‪ي‬n 79**<!-- omit in toc -->
+# **MVTRX**: Bittensor SN79<!-- omit in toc -->
 ### **Decentralized Simulation of Automated Trading in Intelligent Markets:** <!-- omit in toc -->
 ### **Risk-Averse Agent Optimization** <!-- omit in toc -->
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT) 
@@ -9,7 +9,7 @@
 
 </div>
 
-#### 1. How does τaos differ from other finance-related subnets?
+#### 1. How does MVTRX differ from other finance-related subnets?
 
 Other finance-related subnets, at least to our knowledge at time of writing, focus on incentivizing the creation and deployment of trading strategies which act against particular real-world markets, and seek to extract value from the trading signals produced by miners.  While this approach has some promise, τaos has more general aspirations to provide value across a broad spectrum of use cases within the financial industry.  By providing an environment where miners trade in many statistically similar but independently evolving simulated markets simultaneously, we not only encourage the study and development of much more robust trading strategies, but also produce vast quantities of high-resolution, maximally detailed data which can be used by traders, researchers, institutions and regulators to better understand and account for the underlying risks present in all markets.
 
@@ -19,19 +19,23 @@ While the exact details of the incentive mechanism are subject to change over ti
 
 The returns for the Kappa-3 calculation are based on actual realized P&L from closed positions (completed round-trip trades), and the measurement is taken over a rolling window of length defined in the [validator config](/taos/im/config/__init__.py) as `--scoring.kappa.lookback`.  Note that the actual simulation time period of the assessment is related to this through the `Simulation.step` in the [simulation config](/simulate/trading/run/config/simulation_0.xml) - a new observation is obtained every `Simulation.step` simulation nanoseconds.
 
-There are then a few additional transformations applied to avoid manipulation and encourage active trading; miners' scores are scaled in proportion to their round-trip trading volume over the assessment window, with a decay factor being applied during any inactive periods.  A penalty is applied to miners scores in cases where significant outliers in terms of performance exist between the simulated books.  The full details of the implementation can be understood by studying the [reward logic](/taos/im/validator/reward.py).  The overall score of a miner is determined as an exponential moving average of the score calculated at each observation, with the period of the EMA being set via the `--neuron.moving_average_alpha` parameter which is applied in the [base validator logic](/taos/dev/taos/common/neurons/validator.py).
+There are then a few additional transformations applied to avoid manipulation and encourage active trading; miners' scores are scaled in proportion to their round-trip trading volume over the assessment window, with a decay factor being applied during any inactive periods.  A penalty is applied to miners scores in cases where significant outliers in terms of performance exist between the simulated books.  The full details of the implementation can be understood by studying the [reward logic](/taos/im/validator/reward.py).  The overall score of a miner is determined as an exponential moving average of the score calculated at each observation, with the period of the EMA being set via the `--neuron.moving_average_alpha` parameter which is applied in the [base validator logic](/taos/common/neurons/validator.py).
 
 #### 3. How do I get started mining in the subnet?
 
-This FAQ is a good entry point, after which it is recommended to go through the [README](/README.md).  Once you are familiar with the subnet function and vision, and decide you want to get involved, you can check out the [agents readme](/taos/dev/agents/README.md) for more detailed information on how to design and develop strategies for the τaos framework.  Before getting into mining on testnet or mainnet, we recommend also to set up a local testing environment using the ["proxy" validator](/taos/dev/agents/proxy/README.md) tools which enable to launch a local instance of the simulation engine and confirm how your strategy behaves and performs against the background market.
+This FAQ is a good entry point, after which it is recommended to go through the [README](/README.md).  Once you are familiar with the subnet function and vision, and decide you want to get involved, you can check out the [agents readme](/agents/README.md) for more detailed information on how to design and develop strategies for the τaos framework.  Before getting into mining on testnet or mainnet, we recommend also to set up a local testing environment using the ["proxy" validator](/agents/proxy/README.md) tools which enable to launch a local instance of the simulation engine and confirm how your strategy behaves and performs against the background market.
 
-Once you have developed and tested your strategy locally, you may next wish to inspect the current behaviour and performance of existing miners in the subnet via the [taos.simulate.trading dashboard](https://taos.simulate.trading) (an updated version of this dashboard as well as documentation to assist in interpreting the visualizations are upcoming).To get an idea of the expected performance of your strategy and validate your hosting and networking configuration, you can request testnet TAO via the [Bittensor Discord](https://discord.com/channels/799672011265015819/1389370202327748629), register a UID in our test netuid 366 and deploy and [monitor](https://testnet.simulate.trading) your miner here.  We continously run a validator in testnet using the latest code and configurations.  Once you are confident that your agent has what it takes, register to mainnet and join the comptetition!  If you have any questions or concerns, reach out to us at our [Discord Channel](https://discord.com/channels/799672011265015819/1353733356470276096).
+Once you have developed and tested your strategy locally, you may next wish to inspect the current behaviour and performance of existing miners in the subnet via the [taos.simulate.trading dashboard](https://taos.simulate.trading) (an updated version of this dashboard as well as documentation to assist in interpreting the visualizations are upcoming).  To get an idea of the expected performance of your strategy and validate your hosting and networking configuration, you can request testnet TAO via the [Bittensor Discord](https://discord.com/channels/799672011265015819/1389370202327748629), register a UID in our test netuid 366 and deploy and [monitor](https://testnet.simulate.trading) your miner here.  We continuously run a validator in testnet using the latest code and configurations.  Once you are confident that your agent has what it takes, register to mainnet and join the competition!  If you have any questions or concerns, reach out to us at our [Discord Channel](https://discord.com/channels/799672011265015819/1353733356470276096).
 
 **Note that the example miners given in the /agents directory are not expected to perform well in the subnet - you need to develop a smart custom algorithm to compete**
 
-#### 4. Is there a τaos testnet?
+#### 4. Is there an MVTRX testnet?
 
 Yes, netuid 366 with monitoring via [testnet.simulate.trading](https://testnet.simulate.trading).
+
+The Bittensor test network carries no exchange, so netuid 366 is not the place to exercise trading.
+For that there is a public localnet at `wss://localnet.mvtrx.exchange:443`, which runs the exchange
+and is open for testing. Point the run scripts at it with `-e wss://localnet.mvtrx.exchange:443`.
 
 #### 5. How do I monitor my miner?
 
@@ -52,7 +56,7 @@ Being that our markets are synthetic and generated through a powerful C++ engine
 If you have just registered the miner, note that scores are not assigned until sufficient time has passed to allow calculating a meaningful Kappa-3 ratio with enough realized trades.  If the situation persists, you will need to check your UID at the [Agents Dashboard](https://taos.simulate.trading/d/edy6vxytuud4wd/agents) and confirm a few critical things:
 
 - Do you see recent trades for all book IDs?  Miners must trade on every book in order to receive score.
-- Under the Requests plot, do you see a large proportion of failures or timeouts?  If you are not seeing mostly success, usually this is due to taking too long to respond - validators allow a maximum of `--neuron.timeout` seconds (defined in the [base validator config](/taos/dev/taos/common/config/__init__.py)) for miners to respond.  This can be addressed by increasing resources, optimizing your strategy logic and ensuring sufficient network connectivity; you may also want to consider geolocating your miner nearby to the biggest validators for the best possible latency.
+- Under the Requests plot, do you see a large proportion of failures or timeouts?  If you are not seeing mostly success, usually this is due to taking too long to respond - validators allow a maximum of `--neuron.timeout` seconds (defined in the [base validator config](/taos/common/config/__init__.py)) for miners to respond.  This can be addressed by increasing resources, optimizing your strategy logic and ensuring sufficient network connectivity; you may also want to consider geolocating your miner nearby to the biggest validators for the best possible latency.
 - Pay attention to the Kappa-3 Score and Kappa Penalty, these are the primary metrics used in determining miner score.
 
 #### 9. As a miner, I've hit the trading volume limit and can no longer submit instructions.  How is this limit enforced and what can I do now?
@@ -85,7 +89,7 @@ Kappa-3 is calculated from realized P&L values which explicitly include all trad
 
 Currently, the scoring framework does not directly penalize order cancellations or the repeated submission of identical orders. The system focuses on realized profitability and round-trip trading volume. However, we recognize that excessive cancellations or unchanging re-posts can place unnecessary load on the simulation and may represent inefficient behavior rather than legitimate market-making.
 
-Future refinements may apply operational-efficiency considerations, such as penalties for high cancel-to-fill ratios or for repeatedly submitting identical orders that do not produce new executions. We may also consider simpler guardrails at the agent level—for example, raising minimum order sizes, reducing the number of instructions permitted per round, or further limiting the maximum number of open orders.
+Future refinements may apply operational-efficiency considerations, such as penalties for high cancel-to-fill ratios or for repeatedly submitting identical orders that do not produce new executions. We may also consider simpler guardrails at the agent level, for example raising minimum order sizes, reducing the number of instructions permitted per round, or further limiting the maximum number of open orders.
 
 #### 15. How does the scoring system encourage participation across all books?
 

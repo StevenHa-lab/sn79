@@ -53,9 +53,9 @@ def _get_pnl_fingerprint(realized_pnl_values):
     return (count, total, sum_squares, min_val, max_val)
 
 
-def kappa_3(uid, realized_pnl_values, tau, lookback, norm_min, norm_max, 
+def kappa_3(uid, realized_pnl_values, tau, lookback, norm_min, norm_max,
            min_lookback, min_realized_observations, grace_period, deregistered_uids, book_count,
-           cache=None) -> dict:
+           cache=None, book_ids=None) -> dict:
     """
     Calculates realized Kappa-3 ratio based on actual P&L from completed round-trip trades.
     
@@ -83,21 +83,39 @@ def kappa_3(uid, realized_pnl_values, tau, lookback, norm_min, norm_max,
         Dict containing realized Kappa-3 metrics, or None on error
     """
     try:
+        # Deregistration / empty-history guard MUST precede the fingerprint-cache lookup. On a UID
+        # replacement the reused slot's realized_pnl_history stays byte-identical to the old occupant's
+        # until reset_agent_histories lands (it waits on the simulator RDRA notice), so the fingerprint
+        # matches and a cache hit would otherwise hand the new (still-deregistered, not-yet-traded) slot
+        # the deregistered miner's cached kappa, bypassing this guard and feeding the score EMA off
+        # someone else's score. Guard first, then cache.
+        if uid in deregistered_uids or not realized_pnl_values:
+            return None
+
         if cache is not None:
             current_fingerprint = _get_pnl_fingerprint(realized_pnl_values)
             if uid in cache:
                 cached_fingerprint, cached_kappa = cache[uid]
                 if cached_fingerprint == current_fingerprint:
                     return cached_kappa
-
-        if uid in deregistered_uids or not realized_pnl_values:
-            return None
         timestamps = sorted(realized_pnl_values.keys())
+        # Explicit assessment window: restrict to the last `lookback` ns of
+        # observations instead of relying on the upstream prune to bound the
+        # history. Data-relative to the newest observation, so it is deterministic
+        # in the input (the fingerprint cache stays valid) and removes between-prune
+        # drift, making the kappa window exact.
+        if lookback and lookback > 0:
+            cutoff = timestamps[-1] - lookback
+            if timestamps[0] < cutoff:
+                timestamps = [ts for ts in timestamps if ts >= cutoff]
         if timestamps[-1] - timestamps[0] < min_lookback:
             return None
-        
+
         num_values = len(timestamps)
-        book_ids = list(range(book_count))
+        # Iterate the actual traded book-id set when provided (e.g. [1..128] with
+        # root/netuid-0 excluded); fall back to 0-based range(book_count) for
+        # legacy/sim callers that don't pass an explicit set.
+        book_ids = list(range(book_count)) if book_ids is None else list(book_ids)
         num_books = len(book_ids)
         
         np_realized_pnl = np.zeros((num_books, num_values), dtype=np.float64)
@@ -137,37 +155,21 @@ def kappa_3(uid, realized_pnl_values, tau, lookback, norm_min, norm_max,
             realized_means = realized_returns.mean(axis=1)
             realized_downside = np.maximum(tau - realized_returns, 0.0)
             realized_lpm3 = np.power(realized_downside, 3).mean(axis=1)
-            realized_upside = np.maximum(realized_returns - tau, 0.0)
-            realized_upm3 = np.power(realized_upside, 3).mean(axis=1)
-            
+
             # Data-driven regularization to prevent division by near-zero
             typical_scale = np.abs(realized_means) + np.std(realized_returns, axis=1)
             regularization = np.power(typical_scale * 0.1, 3)
-            
-            # Adaptive epsilon based on mean direction
-            # If mean is positive (winning), be generous with epsilon (ignore tiny losses)
-            # If mean is negative (losing), be strict with epsilon (don't ignore real losses)
-            epsilon_per_book = np.where(
-                realized_means > tau,
-                1e-2,
-                1e-6
+
+            # Monotonic Kappa-3: single downside-penalized formula for every sufficient book.
+            # A clean (zero-downside) record has LPM3->0 -> denominator is the regularization
+            # floor -> high (clamp-bounded) score; any losing round-trip raises LPM3 and lowers
+            # kappa. No separate upside-dispersion branch, so a clean win record can no longer be
+            # out-scored by an otherwise-identical record containing a loss (the previous
+            # non-monotonic inversion). Loss-bearing books are unchanged vs the old standard path.
+            kappa_ratios_realized[sufficient_mask] = (
+                (realized_means[sufficient_mask] - tau)
+                / np.cbrt(realized_lpm3[sufficient_mask] + regularization[sufficient_mask])
             )
-            
-            # Standard formula (meaningful downside) with regularization
-            valid_mask = sufficient_mask & (realized_lpm3 > epsilon_per_book)
-            kappa_ratios_realized[valid_mask] = (
-                (realized_means[valid_mask] - tau) / np.cbrt(realized_lpm3[valid_mask] + regularization[valid_mask])
-            )
-            
-            # Perfect formula (negligible downside AND positive mean) with regularization
-            perfect_mask = sufficient_mask & (realized_lpm3 <= epsilon_per_book) & (realized_means > tau)
-            kappa_ratios_realized[perfect_mask] = (
-                (realized_means[perfect_mask] - tau) / np.cbrt(realized_upm3[perfect_mask] + regularization[perfect_mask])
-            )
-            
-            # Zero score (no meaningful downside but negative mean)
-            zero_mask = sufficient_mask & (realized_lpm3 <= epsilon_per_book) & (realized_means <= tau)
-            kappa_ratios_realized[zero_mask] = 0.0
         
         kappa_values = {
             'books': {
@@ -205,26 +207,15 @@ def kappa_3(uid, realized_pnl_values, tau, lookback, norm_min, norm_max,
             realized_total_mean = total_realized_normalized.mean()
             realized_total_downside = np.maximum(tau - total_realized_normalized, 0.0)
             realized_total_lpm3 = np.power(realized_total_downside, 3).mean()
-            realized_total_upside = np.maximum(total_realized_normalized - tau, 0.0)
-            realized_total_upm3 = np.power(realized_total_upside, 3).mean()
-            
+
             # Regularization for portfolio
             total_typical_scale = abs(realized_total_mean) + np.std(total_realized_normalized)
             total_regularization = (total_typical_scale * 0.1) ** 3
-            
-            # Adaptive epsilon for portfolio
-            epsilon_portfolio = 1e-2 if realized_total_mean > tau else 1e-6
-            
-            if realized_total_lpm3 > epsilon_portfolio:
-                kappa_values['total'] = count_multiplier * float(
-                    (realized_total_mean - tau) / np.cbrt(realized_total_lpm3 + total_regularization)
-                )
-            elif realized_total_mean > tau:
-                kappa_values['total'] = count_multiplier * float(
-                    (realized_total_mean - tau) / np.cbrt(realized_total_upm3 + total_regularization)
-                )
-            else:
-                kappa_values['total'] = count_multiplier * 0.0
+
+            # Monotonic Kappa-3 (see per-book note): single downside-penalized formula.
+            kappa_values['total'] = count_multiplier * float(
+                (realized_total_mean - tau) / np.cbrt(realized_total_lpm3 + total_regularization)
+            )
         else:
             kappa_values['total'] = None
         
@@ -244,14 +235,14 @@ def kappa_3(uid, realized_pnl_values, tau, lookback, norm_min, norm_max,
         
         return kappa_values
         
-    except Exception as ex:
+    except Exception:
         print(f"Failed to calculate Kappa-3 for UID {uid}: {traceback.format_exc()}")
         return None
 
 
 def kappa_3_batch(realized_pnl_values, tau, lookback, norm_min, norm_max,
                   min_lookback, min_realized_observations, grace_period, deregistered_uids, book_count,
-                  cache=None):
+                  cache=None, build_cache_updates=True, book_ids=None):
     """
     Process a batch of UIDs for Kappa-3 calculation with realized P&L only.
     
@@ -278,19 +269,24 @@ def kappa_3_batch(realized_pnl_values, tau, lookback, norm_min, norm_max,
     for uid, realized_pnl_value in realized_pnl_values.items():
         kappa_values = kappa_3(
             uid, realized_pnl_value, tau, lookback, norm_min, norm_max,
-            min_lookback, min_realized_observations, grace_period, 
-            deregistered_uids, book_count, cache=cache
+            min_lookback, min_realized_observations, grace_period,
+            deregistered_uids, book_count, cache=cache, book_ids=book_ids
         )
         results[uid] = kappa_values
-        fingerprint = _get_pnl_fingerprint(realized_pnl_value)
-        cache_updates[uid] = (fingerprint, kappa_values)        
+        # Only build cache_updates when the cache is active. With the cache off
+        # (the mainnet default) these get pickled by the worker, unpickled in the
+        # parent's collect, then discarded — a redundant copy of kappa_values that
+        # roughly doubled the collect payload (the scoring-round tail's dominant
+        # GIL hold), plus a wasted full-history _get_pnl_fingerprint scan.
+        if build_cache_updates:
+            cache_updates[uid] = (_get_pnl_fingerprint(realized_pnl_value), kappa_values)
     return results, cache_updates
 
 def _init_worker_affinity(cores):
     """
     Worker initializer that sets CPU affinity.
     Must be at module level for pickling.
-    
+
     Args:
         cores: List of CPU cores to bind to
     """
@@ -300,9 +296,51 @@ def _init_worker_affinity(cores):
         except (AttributeError, OSError):
             pass
 
+
+# Module-level cache of the worker initializer partial, keyed by tuple(cores).
+# Loky's get_reusable_executor treats a change in initializer *identity* (not
+# equality) as a reason to shut down and rebuild the pool. Building
+# partial(_init_worker_affinity, cores) fresh on every call causes a full
+# fork-server recreate every reward cycle — 10-15s of overhead per cycle.
+# Caching by (cores,) tuple gives a stable object identity for repeat calls
+# with the same core allocation, so the pool stays warm.
+_worker_init_cache: dict = {}
+
+def _get_worker_initializer(cores):
+    if cores is None:
+        return None
+    key = tuple(cores)
+    if key not in _worker_init_cache:
+        _worker_init_cache[key] = partial(_init_worker_affinity, cores)
+    return _worker_init_cache[key]
+
+def _kappa_cache_enabled():
+    """The per-UID PnL fingerprint cache is DISABLED by default.
+
+    At mainnet history size it recomputed a ~6s/scoring-round full-history
+    fingerprint for EVERY UID on the main reward thread just to skip re-pickling
+    unchanged UIDs to loky — but pickling is ~0.06s and the hit rate is ~30%
+    (miners trade most rounds), so it cost far more than it saved. With it off,
+    all UIDs go straight to loky, which is correctness-neutral (same kappa,
+    freshly recomputed — the cold-cache path that already ran every restart).
+
+    Re-enable only for comparison/rollback: env KAPPA_CACHE=1, or a `.kappa_cache`
+    repo-root sentinel (checked live, no relaunch; the sentinel wins over the env).
+    """
+    try:
+        _s = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", ".kappa_cache"
+        )
+        if os.path.exists(_s):
+            return True
+    except Exception:
+        pass
+    return os.environ.get("KAPPA_CACHE", "0") == "1"
+
+
 def batch_kappa_3(realized_pnl_values, tau, batches, lookback, norm_min, norm_max,
-                  min_lookback, min_realized_observations, grace_period, deregistered_uids, 
-                  book_count, cache=None, cores=None):
+                  min_lookback, min_realized_observations, grace_period, deregistered_uids,
+                  book_count, cache=None, cores=None, book_ids=None):
     """
     Parallel processing of Kappa-3 calculations with realized P&L only.
     
@@ -326,34 +364,116 @@ def batch_kappa_3(realized_pnl_values, tau, batches, lookback, norm_min, norm_ma
     Returns:
         Tuple of (results_dict, cache_updates_dict)
     """
-    if cores is not None:
-        initializer = partial(_init_worker_affinity, cores)
-    else:
-        initializer = None
-    pool = get_reusable_executor(
-        max_workers=len(batches),
-        initializer=initializer,
-        timeout=300
-    )
-    
+    # FAST PATH: check fingerprint cache on the main thread BEFORE pickling.
+    # Every UID whose PnL hasn't changed since last cycle can be resolved
+    # directly from `cache` in ~1μs — no pickle, no IPC, no worker roundtrip.
+    # In steady state most UIDs don't trade in every 5s scoring window, so
+    # this typically resolves 200+/259 UIDs on mainnet without touching loky.
+    # Before this fast path, EVERY UID's realized_pnl_history was pickled
+    # into a batch dict and shipped to a loky worker, which then paid the
+    # cache-check cost per worker — orders of magnitude more overhead than
+    # a same-thread dict lookup.
+    import time as _time
+    _t0 = _time.perf_counter()
+    _n_in = sum(len(b) for b in batches)
+
+    cache_hits: dict = {}
+    _cache_on = cache is not None and _kappa_cache_enabled()
+    if _cache_on:
+        remaining_batches = []
+        for batch in batches:
+            remaining_uids = []
+            for uid in batch:
+                # Dereg guard precedes the cache hit (same reason as kappa_3): a still-deregistered reused
+                # slot keeps the old occupant's fingerprint until reset lands, so a cache hit here would
+                # serve the old kappa. Route dereg uids to the worker, whose kappa_3 guard returns None.
+                if uid in deregistered_uids:
+                    remaining_uids.append(uid)
+                    continue
+                realized_pnl_value = realized_pnl_values.get(uid, {})
+                fingerprint = _get_pnl_fingerprint(realized_pnl_value)
+                if uid in cache:
+                    cached_fingerprint, cached_kappa = cache[uid]
+                    if cached_fingerprint == fingerprint:
+                        cache_hits[uid] = cached_kappa
+                        continue
+                remaining_uids.append(uid)
+            if remaining_uids:
+                remaining_batches.append(remaining_uids)
+        batches = remaining_batches
+
+    # [REWARD-PROFILE kappa] fast-path is a main-thread, GIL-held loop over every
+    # UID (fingerprint each round) — measure it: it's the reward path's biggest
+    # candidate for starving the event loop, not the loky marshalling (which the
+    # fingerprint cache already reduces to just the changed UIDs).
+    _t_fast = _time.perf_counter()
+    _n_remaining = sum(len(b) for b in batches)
+
+    # All UIDs cache-hit — no pool needed at all.
+    if not batches:
+        import bittensor as _bt
+        _bt.logging.info(
+            f"[REWARD-PROFILE kappa] cache={'on' if _cache_on else 'off'} "
+            f"uids_in={_n_in} hits={len(cache_hits)} "
+            f"to_loky=0 batches=0 | fastpath={_t_fast - _t0:.3f}s "
+            f"submit=0.000s collect=0.000s"
+        )
+        return cache_hits, {}
+
+    initializer = _get_worker_initializer(cores)
+    # max_workers is what triggers loky's pool-recreate check. Pin it to a
+    # value that doesn't vary with len(batches) so the pool stays warm across
+    # cycles. If cores is given (which reward.py always does), use its count;
+    # else fall back to batches. Also catches the BrokenPipeError case: if a
+    # prior worker died and left the manager pipe closed, force a fresh
+    # reuse=False rebuild instead of the failing shutdown path.
+    max_workers = len(cores) if cores else len(batches)
+    try:
+        pool = get_reusable_executor(
+            max_workers=max_workers,
+            initializer=initializer,
+            timeout=300,
+        )
+    except BrokenPipeError:
+        # Loky's manager thread pipe is dead (worker crash / OOM in prior
+        # cycle left it in a bad state). Force a clean rebuild.
+        from loky.reusable_executor import _ReusablePoolExecutor
+        _ReusablePoolExecutor._executor = None
+        pool = get_reusable_executor(
+            max_workers=max_workers,
+            initializer=initializer,
+            timeout=300,
+            reuse=False,
+        )
+
     tasks = [
         pool.submit(
             kappa_3_batch,
             {uid: realized_pnl_values.get(uid, {}) for uid in batch},
             tau, lookback, norm_min, norm_max, min_lookback, min_realized_observations,
             grace_period, deregistered_uids, book_count,
-            cache=cache
+            cache=cache, build_cache_updates=_cache_on, book_ids=book_ids
         )
         for batch in batches
     ]
     
-    result = {}
+    _t_submit = _time.perf_counter()
+    result = dict(cache_hits)  # merge fast-path hits with pool results
     cache_updates = {}
-    
+
     for task in tasks:
         batch_result, batch_cache_updates = task.result()
         for k, v in batch_result.items():
             result[int(k)] = v
         cache_updates.update(batch_cache_updates)
-    
+
+    _t_collect = _time.perf_counter()
+    import bittensor as _bt
+    _bt.logging.info(
+        f"[REWARD-PROFILE kappa] cache={'on' if _cache_on else 'off'} "
+        f"uids_in={_n_in} hits={len(cache_hits)} "
+        f"to_loky={_n_remaining} batches={len(batches)} | "
+        f"fastpath={_t_fast - _t0:.3f}s submit={_t_submit - _t_fast:.3f}s "
+        f"collect={_t_collect - _t_submit:.3f}s"
+    )
     return result, cache_updates

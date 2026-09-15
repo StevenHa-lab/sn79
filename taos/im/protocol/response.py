@@ -6,7 +6,7 @@ cancellations) into the AgentResponse synapse format consumed by the validator.
 """
 import bittensor as bt
 from pydantic import Field
-from typing import Annotated, Union, List
+from typing import Annotated, Union
 from annotated_types import Len
 from taos.im.protocol.instructions import UInt32
 from taos.im.protocol.simulator import *
@@ -39,16 +39,19 @@ class FinanceAgentResponse(AgentResponse):
     ] = []
 
     def market_order(
-        self, 
-        book_id: UInt32, 
-        direction: OrderDirection, 
-        quantity: float, 
-        delay: int = 0, 
-        clientOrderId: UInt32 | None = None, 
-        stp: STP = STP.CANCEL_OLDEST, 
+        self,
+        book_id: UInt32,
+        direction: OrderDirection,
+        quantity: float,
+        delay: int = 0,
+        clientOrderId: UInt32 | None = None,
+        stp: STP = STP.CANCEL_OLDEST,
         currency: OrderCurrency = OrderCurrency.BASE,
         leverage: float = 0.0,
-        settlement_option: LoanSettlementOption | int = LoanSettlementOption.NONE
+        settlement_option: LoanSettlementOption | int = LoanSettlementOption.NONE,
+        max_slippage: float | None = None,
+        stop_loss: float | None = None,
+        take_profit: float | None = None,
     ) -> None:
         """
         Add a market order instruction to the agent response.
@@ -71,45 +74,57 @@ class FinanceAgentResponse(AgentResponse):
                                 e.g. an order placed for 1.0 BASE with 0.5 leverage will be placed for a total quantity of 1.5 BASE, where 0.5 is borrowed from the exchange.
                                 Must be non-negative. Defaults to 0.0 (no leverage).
             settlement_option (LoanSettlementOption | int, optional): Strategy for settling outstanding margin loans using the proceeds of this order. Options:
-                                LoanSettlementOption.NONE : No loan repayments
-                                LoanSettlementOption.FIFO : Loans will be repaid, starting from the oldest
-                                int : An integer order id; this specifies that the proceeds of the order should be used to repay the loan associated with a specific order
+                                    - LoanSettlementOption.NONE : No loan repayments
+                                    - LoanSettlementOption.FIFO : Loans will be repaid, starting from the oldest
+                                    - int : An integer order id; this specifies that the proceeds of the order should be used to repay the loan associated with a specific order
                                 Defaults to NONE.
-                                Note that you can only settle loans using unleveraged orders (`leverage=0`) due to the restriction preventing to hold leveraged 
+                                Note that you can only settle loans using unleveraged orders (`leverage=0`) due to the restriction preventing to hold leveraged
                                 positions on both sides of the book simultaneously.
+            max_slippage (float | None, optional): Maximum acceptable slippage as a fraction of the best price at execution; a market BUY fills only up to
+                                `best_ask * (1 + max_slippage)` and a SELL only down to `best_bid * (1 - max_slippage)`.
+                                Defaults to None (no price limit).
+            stop_loss (float | None, optional): Stop-loss offset as a signed fraction of the entry price (negative places the stop below entry, as for a BUY).
+                                Defaults to None (no stop-loss).
+            take_profit (float | None, optional): Take-profit offset as a signed fraction of the entry price (positive places the target above entry, as for a BUY).
+                                Defaults to None (no take-profit).
 
         Returns:
             None
         """
         self.add_instruction(
             PlaceMarketOrderInstruction(
-                agentId=self.agent_id, 
-                delay=delay, 
-                bookId=book_id, 
-                direction=direction, 
-                quantity=quantity, 
-                clientOrderId=clientOrderId, 
-                stp=stp, 
+                agentId=self.agent_id,
+                delay=delay,
+                bookId=book_id,
+                direction=direction,
+                quantity=quantity,
+                clientOrderId=clientOrderId,
+                stp=stp,
                 currency=currency,
                 leverage=leverage,
-                settleFlag=settlement_option
+                settleFlag=settlement_option,
+                max_slippage=max_slippage,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
             )
         )
 
     def limit_order(
-        self, 
-        book_id: UInt32, 
-        direction: OrderDirection, 
-        quantity: float, 
-        price: float, 
-        delay: int = 0, 
-        clientOrderId: UInt32 | None = None, 
-        stp: STP = STP.CANCEL_OLDEST, 
-        postOnly: bool = False, 
-        timeInForce: TimeInForce = TimeInForce.GTC, 
+        self,
+        book_id: UInt32,
+        direction: OrderDirection,
+        quantity: float,
+        price: float,
+        delay: int = 0,
+        clientOrderId: UInt32 | None = None,
+        stp: STP = STP.CANCEL_OLDEST,
+        postOnly: bool = False,
+        timeInForce: TimeInForce = TimeInForce.GTC,
         expiryPeriod: int | None = None,
         leverage: float = 0.0,
-        settlement_option: LoanSettlementOption | int = LoanSettlementOption.NONE
+        settlement_option: LoanSettlementOption | int = LoanSettlementOption.NONE,
+        stop_loss: float | None = None,
+        take_profit: float | None = None,
     ) -> None:
         """
         Add a limit order instruction to the agent response.
@@ -144,8 +159,12 @@ class FinanceAgentResponse(AgentResponse):
                                     LoanSettlementOption.FIFO : Loans will be repaid, starting from the oldest
                                     int : An integer order id; this specifies that the proceeds of the order should be used to repay the loan associated with a specific order
                                 Defaults to NONE.
-                                Note that you can only settle loans using unleveraged orders (`leverage=0`) due to the restriction preventing to hold leveraged 
+                                Note that you can only settle loans using unleveraged orders (`leverage=0`) due to the restriction preventing to hold leveraged
                                 positions on both sides of the book simultaneously.
+            stop_loss (float | None, optional): Stop-loss offset as a signed fraction of the entry price (negative places the stop below entry, as for a BUY).
+                                Defaults to None (no stop-loss).
+            take_profit (float | None, optional): Take-profit offset as a signed fraction of the entry price (positive places the target above entry, as for a BUY).
+                                Defaults to None (no take-profit).
 
         Returns:
             None
@@ -172,19 +191,21 @@ class FinanceAgentResponse(AgentResponse):
 
         self.add_instruction(
             PlaceLimitOrderInstruction(
-                agentId=self.agent_id, 
-                delay=delay, 
-                bookId=book_id, 
-                direction=direction, 
-                quantity=quantity, 
-                price=price, 
-                clientOrderId=clientOrderId, 
-                stp=stp, 
-                postOnly=postOnly, 
-                timeInForce=timeInForce, 
+                agentId=self.agent_id,
+                delay=delay,
+                bookId=book_id,
+                direction=direction,
+                quantity=quantity,
+                price=price,
+                clientOrderId=clientOrderId,
+                stp=stp,
+                postOnly=postOnly,
+                timeInForce=timeInForce,
                 expiryPeriod=expiryPeriod,
                 leverage=leverage,
-                settleFlag=settlement_option
+                settleFlag=settlement_option,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
             )
         )
 

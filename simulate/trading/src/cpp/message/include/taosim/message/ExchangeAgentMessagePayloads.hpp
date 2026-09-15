@@ -5,6 +5,8 @@
 #pragma once
 
 #include <taosim/book/Book.hpp>
+#include <taosim/book/BookTradeStats.hpp>
+#include <taosim/book/serialization/BookTradeStats.hpp>
 #include <taosim/decimal/serialization/decimal.hpp>
 #include "Cancellation.hpp"
 #include "ClosePosition.hpp"
@@ -55,10 +57,26 @@ struct PlaceOrderMarketPayload : public MessagePayload
     taosim::decimal_t volume;
     taosim::decimal_t leverage;
     BookId bookId;
-    Currency currency;
-    std::optional<ClientOrderID> clientOrderId{};
+    Currency currency{Currency::BASE};
+    std::optional<ClientOrderID> clientOrderId;
     STPFlag stpFlag{STPFlag::CO};
     SettleFlag settleFlag{SettleType::FIFO};
+    // Agent-settable, same meaning as on the limit payload: when false, a swap that cannot be filled
+    // in full is refused rather than filled short. It matters here only because a SELL draws on ONE
+    // named delegate, so the executable size is the delegate's stake and not the summed free balance
+    // the agent sized against. Defaults true, which is the historical behaviour.
+    bool allowPartial{true};
+    taosim::decimal_t maxSlippage;
+    std::string delegate;
+    std::optional<taosim::decimal_t> stopLoss;
+    std::optional<taosim::decimal_t> takeProfit;
+    std::optional<taosim::decimal_t> placeholder;
+    bool skipMinSizeCheck{};
+    uint8_t closeReason{};        // 0=none, 1=SL, 2=TP — set by SL/TP dispatch only
+    OrderID originatingOrderId{}; // LOB ID of the position order that triggered SL/TP
+    // Set by sweepCrossing only, and deliberately NOT serialised: the sweep message is created and
+    // consumed inside this process, so this never has to survive a wire hop. See OrderClientContext.
+    std::optional<AgentId> initiatorAgentId;
 
     PlaceOrderMarketPayload() noexcept = default;
 
@@ -69,7 +87,10 @@ struct PlaceOrderMarketPayload : public MessagePayload
         Currency currency = Currency::BASE,
         std::optional<ClientOrderID> clientOrderId = {},
         STPFlag stpFlag = STPFlag::CO,
-        SettleFlag settleFlag = SettleType::FIFO) noexcept
+        SettleFlag settleFlag = SettleType::FIFO,
+        std::optional<taosim::decimal_t> stopLoss = {},
+        std::optional<taosim::decimal_t> takeProfit = {},
+        std::optional<taosim::decimal_t> placeholder = {}) noexcept
         : direction{direction},
           volume{volume},
           leverage{0_dec},
@@ -77,7 +98,10 @@ struct PlaceOrderMarketPayload : public MessagePayload
           currency{currency},
           clientOrderId{clientOrderId},
           stpFlag{stpFlag},
-          settleFlag{settleFlag}
+          settleFlag{settleFlag},
+          stopLoss{stopLoss},
+          takeProfit{takeProfit},
+          placeholder{placeholder}
     {}
 
     PlaceOrderMarketPayload(
@@ -88,7 +112,10 @@ struct PlaceOrderMarketPayload : public MessagePayload
         Currency currency = Currency::BASE,
         std::optional<ClientOrderID> clientOrderId = {},
         STPFlag stpFlag = STPFlag::CO,
-        SettleFlag settleFlag = SettleType::FIFO) noexcept
+        SettleFlag settleFlag = SettleType::FIFO,
+        std::optional<taosim::decimal_t> stopLoss = {},
+        std::optional<taosim::decimal_t> takeProfit = {},
+        std::optional<taosim::decimal_t> placeholder = {}) noexcept
         : direction{direction},
           volume{volume},
           leverage{leverage},
@@ -96,7 +123,10 @@ struct PlaceOrderMarketPayload : public MessagePayload
           currency{currency},
           clientOrderId{clientOrderId},
           stpFlag{stpFlag},
-          settleFlag{settleFlag}
+          settleFlag{settleFlag},
+          stopLoss{stopLoss},
+          takeProfit{takeProfit},
+          placeholder{placeholder}
     {}
 
     void L3Serialize(rapidjson::Document& json, const std::string& key = {}) const;
@@ -113,8 +143,14 @@ struct PlaceOrderMarketPayload : public MessagePayload
         bookId,
         currency,
         clientOrderId,
-        stpFlag,
-        settleFlag);
+        MSGPACK_NVP("stp", stpFlag),
+        settleFlag,
+        allowPartial,
+        MSGPACK_NVP("max_slippage", maxSlippage),
+        delegate,
+        MSGPACK_NVP("stopLoss", stopLoss),
+        MSGPACK_NVP("takeProfit", takeProfit),
+        MSGPACK_NVP("placeholder", placeholder));
 };
 
 //-------------------------------------------------------------------------
@@ -175,15 +211,24 @@ struct PlaceOrderLimitPayload : public MessagePayload
     OrderDirection direction;
     taosim::decimal_t volume;
     taosim::decimal_t price;
-    taosim::decimal_t leverage{};
+    taosim::decimal_t leverage;
     BookId bookId;
-    Currency currency;
-    std::optional<ClientOrderID> clientOrderId{};
+    Currency currency{Currency::BASE};
+    std::optional<ClientOrderID> clientOrderId;
     bool postOnly{};
+    // Agent-settable. When false, a marketable limit too large to fill entirely
+    // within its limit rests whole (all-or-nothing) instead of filling the
+    // marketable portion and resting the remainder. Defaults true.
+    bool allowPartial{true};
     taosim::TimeInForce timeInForce{taosim::TimeInForce::GTC};
-    std::optional<Timestamp> expiryPeriod{};
+    std::optional<Timestamp> expiryPeriod;
     STPFlag stpFlag{STPFlag::CO};
     SettleFlag settleFlag{SettleType::FIFO};
+    std::string delegate;
+    std::optional<uint64_t> interfaceOrderId;
+    std::optional<taosim::decimal_t> stopLoss;
+    std::optional<taosim::decimal_t> takeProfit;
+    std::optional<taosim::decimal_t> placeholder;
 
     PlaceOrderLimitPayload() noexcept = default;
 
@@ -196,9 +241,12 @@ struct PlaceOrderLimitPayload : public MessagePayload
         std::optional<ClientOrderID> clientOrderId = {},
         bool postOnly = false,
         taosim::TimeInForce timeInForce = taosim::TimeInForce::GTC,
-        std::optional<Timestamp> expiryPeriod = std::nullopt,
+        std::optional<Timestamp> expiryPeriod = {},
         STPFlag stpFlag = STPFlag::CO,
-        SettleFlag settleFlag = SettleType::FIFO) noexcept
+        SettleFlag settleFlag = SettleType::FIFO,
+        std::optional<taosim::decimal_t> stopLoss = {},
+        std::optional<taosim::decimal_t> takeProfit = {},
+        std::optional<taosim::decimal_t> placeholder = {}) noexcept
         : direction{direction},
           volume{volume},
           price{price},
@@ -209,7 +257,10 @@ struct PlaceOrderLimitPayload : public MessagePayload
           timeInForce{timeInForce},
           expiryPeriod{expiryPeriod},
           stpFlag{stpFlag},
-          settleFlag{settleFlag}
+          settleFlag{settleFlag},
+          stopLoss{stopLoss},
+          takeProfit{takeProfit},
+          placeholder{placeholder}
     {}
 
     PlaceOrderLimitPayload(
@@ -222,9 +273,12 @@ struct PlaceOrderLimitPayload : public MessagePayload
         std::optional<ClientOrderID> clientOrderId = {},
         bool postOnly = false,
         taosim::TimeInForce timeInForce = taosim::TimeInForce::GTC,
-        std::optional<Timestamp> expiryPeriod = std::nullopt,
+        std::optional<Timestamp> expiryPeriod = {},
         STPFlag stpFlag = STPFlag::CO,
-        SettleFlag settleFlag = SettleType::FIFO) noexcept
+        SettleFlag settleFlag = SettleType::FIFO,
+        std::optional<taosim::decimal_t> stopLoss = {},
+        std::optional<taosim::decimal_t> takeProfit = {},
+        std::optional<taosim::decimal_t> placeholder = {}) noexcept
         : direction{direction},
           volume{volume},
           price{price},
@@ -236,7 +290,10 @@ struct PlaceOrderLimitPayload : public MessagePayload
           timeInForce{timeInForce},
           expiryPeriod{expiryPeriod},
           stpFlag{stpFlag},
-          settleFlag{settleFlag}
+          settleFlag{settleFlag},
+          stopLoss{stopLoss},
+          takeProfit{takeProfit},
+          placeholder{placeholder}
     {}
 
     void L3Serialize(rapidjson::Document& json, const std::string& key = {}) const;
@@ -255,10 +312,16 @@ struct PlaceOrderLimitPayload : public MessagePayload
         currency,
         clientOrderId,
         postOnly,
+        allowPartial,
         timeInForce,
         expiryPeriod,
-        stpFlag,
-        settleFlag);
+        MSGPACK_NVP("stp", stpFlag),
+        settleFlag,
+        delegate,
+        MSGPACK_NVP("interfaceOrderId", interfaceOrderId),
+        MSGPACK_NVP("stopLoss", stopLoss),
+        MSGPACK_NVP("takeProfit", takeProfit),
+        MSGPACK_NVP("placeholder", placeholder));
 };
 
 //-------------------------------------------------------------------------
@@ -651,6 +714,92 @@ struct RetrieveL1ResponsePayload : public MessagePayload
 
 //-------------------------------------------------------------------------
 
+struct RetrieveL1ExtPayload : public MessagePayload
+{
+    using Ptr = std::shared_ptr<RetrieveL1ExtPayload>;
+
+    BookId bookId;
+
+    RetrieveL1ExtPayload() = default;
+
+    RetrieveL1ExtPayload(BookId bookId) noexcept : bookId{bookId} {}
+
+    virtual void jsonSerialize(
+        rapidjson::Document& json, const std::string& key = {}) const override;
+
+    [[nodiscard]] static Ptr fromJson(const rapidjson::Value& json);
+
+    MSGPACK_DEFINE_MAP(bookId);
+};
+
+//-------------------------------------------------------------------------
+
+// L1 plus the book's cumulative trade statistics. A separate message from
+// RETRIEVE_L1 rather than an extension of it, so existing pollers and any remote
+// client keep their wire format untouched.
+struct RetrieveL1ExtResponsePayload : public MessagePayload
+{
+    using Ptr = std::shared_ptr<RetrieveL1ExtResponsePayload>;
+
+    Timestamp time{};
+    taosim::decimal_t bestAskPrice{};
+    taosim::decimal_t bestAskVolume{};
+    taosim::decimal_t askTotalVolume{};
+    taosim::decimal_t bestBidPrice{};
+    taosim::decimal_t bestBidVolume{};
+    taosim::decimal_t bidTotalVolume{};
+    // Monotonic since the run began. Difference two reads for interval statistics;
+    // no normalization is applied here, so the reader owns the choice of whether
+    // realized variance is expressed per trade, per unit time, or annualized.
+    taosim::book::BookTradeStats tradeStats{};
+    BookId bookId{};
+
+    RetrieveL1ExtResponsePayload() noexcept = default;
+
+    RetrieveL1ExtResponsePayload(Timestamp time, BookId bookId) noexcept
+        : time{time}, bookId{bookId}
+    {}
+
+    RetrieveL1ExtResponsePayload(
+        Timestamp time,
+        taosim::decimal_t bestAskPrice,
+        taosim::decimal_t bestAskVolume,
+        taosim::decimal_t askTotalVolume,
+        taosim::decimal_t bestBidPrice,
+        taosim::decimal_t bestBidVolume,
+        taosim::decimal_t bidTotalVolume,
+        taosim::book::BookTradeStats tradeStats,
+        BookId bookId) noexcept
+        : time{time},
+          bestAskPrice{bestAskPrice},
+          bestAskVolume{bestAskVolume},
+          askTotalVolume{askTotalVolume},
+          bestBidPrice{bestBidPrice},
+          bestBidVolume{bestBidVolume},
+          bidTotalVolume{bidTotalVolume},
+          tradeStats{tradeStats},
+          bookId{bookId}
+    {}
+
+    virtual void jsonSerialize(
+        rapidjson::Document& json, const std::string& key = {}) const override;
+
+    [[nodiscard]] static Ptr fromJson(const rapidjson::Value& json);
+
+    MSGPACK_DEFINE_MAP(
+        MSGPACK_NVP("timestamp", time),
+        bestAskPrice,
+        bestAskVolume,
+        askTotalVolume,
+        bestBidPrice,
+        bestBidVolume,
+        bidTotalVolume,
+        tradeStats,
+        bookId);
+};
+
+//-------------------------------------------------------------------------
+
 struct SubscribeEventTradeByOrderPayload : public MessagePayload
 {
     using Ptr = std::shared_ptr<SubscribeEventTradeByOrderPayload>;
@@ -676,17 +825,24 @@ struct EventOrderMarketPayload : public MessagePayload
     using Ptr = std::shared_ptr<EventOrderMarketPayload>;
 
     MarketOrder order;
+    // Origin of the order. Defaulted for backward compatibility; populated at dispatch
+    // so subscribers can tell which book and which agent (incl. remote/miner) placed it.
+    BookId bookId{};
+    AgentId agentId{};
 
     EventOrderMarketPayload() noexcept = default;
 
     EventOrderMarketPayload(const MarketOrder& order) noexcept : order{order} {}
+
+    EventOrderMarketPayload(const MarketOrder& order, BookId bookId, AgentId agentId) noexcept
+        : order{order}, bookId{bookId}, agentId{agentId} {}
 
     virtual void jsonSerialize(
         rapidjson::Document& json, const std::string& key = {}) const override;
 
     [[nodiscard]] static Ptr fromJson(const rapidjson::Value& json);
 
-    MSGPACK_DEFINE_MAP(order);
+    MSGPACK_DEFINE_MAP(order, bookId, agentId);
 };
 
 //-------------------------------------------------------------------------
@@ -696,17 +852,24 @@ struct EventOrderLimitPayload : public MessagePayload
     using Ptr = std::shared_ptr<EventOrderLimitPayload>;
 
     LimitOrder order;
+    // Origin of the order. Defaulted for backward compatibility; populated at dispatch
+    // so subscribers can tell which book and which agent (incl. remote/miner) placed it.
+    BookId bookId{};
+    AgentId agentId{};
 
     EventOrderLimitPayload() noexcept = default;
 
     EventOrderLimitPayload(const LimitOrder& order) noexcept : order{order} {}
+
+    EventOrderLimitPayload(const LimitOrder& order, BookId bookId, AgentId agentId) noexcept
+        : order{order}, bookId{bookId}, agentId{agentId} {}
 
     virtual void jsonSerialize(
         rapidjson::Document& json, const std::string& key = {}) const override;
 
     [[nodiscard]] static Ptr fromJson(const rapidjson::Value& json);
 
-    MSGPACK_DEFINE_MAP(order);
+    MSGPACK_DEFINE_MAP(order, bookId, agentId);
 };
 
 //-------------------------------------------------------------------------
@@ -718,7 +881,10 @@ struct EventTradePayload : public MessagePayload
     Trade trade;
     TradeLogContext context;
     BookId bookId;
-    std::optional<ClientOrderID> clientOrderId{};
+    std::optional<ClientOrderID> clientOrderId;
+    std::string delegate;
+    Currency currency{Currency::QUOTE};
+    bool isResting{};
 
     EventTradePayload() noexcept = default;
 
@@ -726,8 +892,17 @@ struct EventTradePayload : public MessagePayload
         const Trade& trade,
         const TradeLogContext& context,
         BookId bookId,
-        std::optional<ClientOrderID> clientOrderId = {}) noexcept
-        : trade{trade}, context{context}, bookId{bookId}, clientOrderId{clientOrderId}
+        std::optional<ClientOrderID> clientOrderId = {},
+        std::string delegate = {},
+        Currency currency = Currency::QUOTE,
+        bool isResting = {}) noexcept
+        : trade{trade},
+          context{context},
+          bookId{bookId},
+          clientOrderId{clientOrderId},
+          delegate{std::move(delegate)},
+          currency{currency},
+          isResting{isResting}
     {}
 
     virtual void jsonSerialize(
@@ -735,7 +910,7 @@ struct EventTradePayload : public MessagePayload
 
     [[nodiscard]] static Ptr fromJson(const rapidjson::Value& json);
 
-    MSGPACK_DEFINE_MAP(trade, context, bookId, clientOrderId);
+    MSGPACK_DEFINE_MAP(trade, context, bookId, clientOrderId, delegate, currency);
 };
 
 //-------------------------------------------------------------------------
