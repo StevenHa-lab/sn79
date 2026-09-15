@@ -68,6 +68,12 @@ All parameters can be overridden with ``--agent.params key=value ...``:
   max_frozen      frozen books tolerated per validator           (default 36)
   unfreeze_after_s frozen this long before it may be cut         (default 1800)
   cut_every_s     minimum spacing between cuts on one book       (default 60)
+  reconcile       rebase the ledger to the account balance       (default 1)
+  rebase_after_ticks  discrepancy must persist this many ticks   (default 4)
+  unknown_margin_bps  extra exit margin over a synthetic lot's
+                  implied basis, since its true FIFO cost is
+                  unknown (the validator may hold older, dearer
+                  lots at the front of its queue)                (default 100)
 
 State (open lots, rolling volume in 5-minute buckets, last timestamp per validator) is
 persisted to agent_state/v6_state_<uid>.json from a background thread and reloaded on start,
@@ -123,19 +129,20 @@ def _f(x, default=0.0):
 
 
 class _Lot:
-    __slots__ = ("price", "qty", "fee", "ts")
+    __slots__ = ("price", "qty", "fee", "ts", "synthetic")
 
-    def __init__(self, price, qty, fee, ts):
+    def __init__(self, price, qty, fee, ts, synthetic=False):
         self.price = price
         self.qty = qty
         self.fee = fee      # total fee paid on the open leg for this lot
         self.ts = ts
+        self.synthetic = synthetic   # True when created by account reconciliation: real cost unknown
 
 
 class _BookState:
     """Per (validator, book) bookkeeping."""
     __slots__ = ("longs", "shorts", "vol", "vol_sum", "realized", "wins", "losses",
-                 "n_fills", "last_bid", "last_ask", "rejects", "mids", "frozen_since", "last_cut_ts")
+                 "n_fills", "last_bid", "last_ask", "rejects", "mids", "frozen_since", "last_cut_ts", "mismatch_streak")
 
     def __init__(self):
         self.longs = deque()      # FIFO lots
@@ -152,6 +159,7 @@ class _BookState:
         self.mids = deque()           # (ts, mid) for the trend window
         self.frozen_since = None
         self.last_cut_ts = 0
+        self.mismatch_streak = 0
 
     def inventory(self):
         return sum(l.qty for l in self.longs) - sum(l.qty for l in self.shorts)
@@ -200,8 +208,8 @@ class _BookState:
 
     # -- persistence ---------------------------------------------------------- #
     def to_json(self):
-        return {"L": [[l.price, l.qty, l.fee, l.ts] for l in self.longs],
-                "S": [[l.price, l.qty, l.fee, l.ts] for l in self.shorts],
+        return {"L": [[l.price, l.qty, l.fee, l.ts, l.synthetic] for l in self.longs],
+                "S": [[l.price, l.qty, l.fee, l.ts, l.synthetic] for l in self.shorts],
                 "V": list(self.vol),
                 "st": [self.realized, self.wins, self.losses, self.n_fills, self.rejects],
                 "fz": self.frozen_since}
@@ -285,6 +293,8 @@ class MinerAgent_V7(FinanceAgent):
         self._seen_tids = set()
         self._seen_order = deque()
         self.reconcile = self._p("reconcile", 1)
+        self.rebase_after_ticks = self._p("rebase_after_ticks", 4)
+        self.unknown_margin_bps = self._p("unknown_margin_bps", 100.0)
         self._load_state()
 
     # ---- persistence ------------------------------------------------------- #
@@ -478,7 +488,14 @@ class MinerAgent_V7(FinanceAgent):
         ledger_inv = bs.inventory()
         diff = acct_inv - ledger_inv
         if abs(diff) <= 1.5 * self.size:
+            bs.mismatch_streak = 0
             return
+        # a fill executed in the last second shows in the balance before its notice: only
+        # rebase when the same discrepancy persists for several ticks
+        bs.mismatch_streak += 1
+        if bs.mismatch_streak < self.rebase_after_ticks:
+            return
+        bs.mismatch_streak = 0
         self.diag_rebase += 1
         # Cost basis for the synthetic lot: the average price implied by the account's own
         # net quote/base movement (what the validator's FIFO is holding, on average), not the
@@ -500,7 +517,7 @@ class MinerAgent_V7(FinanceAgent):
                 if lot.qty <= 1e-9:
                     bs.shorts.popleft()
             if diff > 1e-9:
-                bs.longs.append(_Lot(basis, diff, 0.0, ts))
+                bs.longs.append(_Lot(basis, diff, 0.0, ts, synthetic=True))
         else:
             diff = -diff
             while diff > 1e-9 and bs.longs:
@@ -508,7 +525,7 @@ class MinerAgent_V7(FinanceAgent):
                 if lot.qty <= 1e-9:
                     bs.longs.popleft()
             if diff > 1e-9:
-                bs.shorts.append(_Lot(basis, diff, 0.0, ts))
+                bs.shorts.append(_Lot(basis, diff, 0.0, ts, synthetic=True))
 
     # ---- main -------------------------------------------------------------- #
     def respond(self, state):
@@ -611,11 +628,13 @@ class MinerAgent_V7(FinanceAgent):
         # FIFO-aware exits: the head lot must close at a profit after both legs' fees
         if bs.longs:
             head = bs.longs[0]
-            floor_ask = head.price + (head.fee / head.qty if head.qty > 0 else 0.0) + maker_fee_px + exit_edge
+            unk = head.price * self.unknown_margin_bps * 1e-4 if head.synthetic else 0.0
+            floor_ask = head.price + unk + (head.fee / head.qty if head.qty > 0 else 0.0) + maker_fee_px + exit_edge
             ask_px = max(ask_px, self._round_up(floor_ask, tick))
         if bs.shorts:
             head = bs.shorts[0]
-            cap_bid = head.price - (head.fee / head.qty if head.qty > 0 else 0.0) - maker_fee_px - exit_edge
+            unk = head.price * self.unknown_margin_bps * 1e-4 if head.synthetic else 0.0
+            cap_bid = head.price - unk - (head.fee / head.qty if head.qty > 0 else 0.0) - maker_fee_px - exit_edge
             bid_px = min(bid_px, self._round_down(cap_bid, tick))
 
         # gating: inventory cap and the rolling 24 h notional budget, paced linearly
