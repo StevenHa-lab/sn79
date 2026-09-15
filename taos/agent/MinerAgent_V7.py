@@ -217,8 +217,10 @@ class _BookState:
     @classmethod
     def from_json(cls, d):
         bs = cls()
-        bs.longs = deque(_Lot(*x) for x in d.get("L", []))
-        bs.shorts = deque(_Lot(*x) for x in d.get("S", []))
+        longs = [_Lot(*x) for x in d.get("L", [])]
+        shorts = [_Lot(*x) for x in d.get("S", [])]
+        bs.longs = deque([l for l in longs if l.synthetic] + [l for l in longs if not l.synthetic])
+        bs.shorts = deque([l for l in shorts if l.synthetic] + [l for l in shorts if not l.synthetic])
         bs.vol = deque((int(t), float(n)) for t, n in d.get("V", []))
         bs.vol_sum = sum(n for _, n in bs.vol)
         st = d.get("st") or [0.0, 0, 0, 0, 0]
@@ -517,7 +519,7 @@ class MinerAgent_V7(FinanceAgent):
                 if lot.qty <= 1e-9:
                     bs.shorts.popleft()
             if diff > 1e-9:
-                bs.longs.append(_Lot(basis, diff, 0.0, ts, synthetic=True))
+                bs.longs.appendleft(_Lot(basis, diff, 0.0, ts, synthetic=True))
         else:
             diff = -diff
             while diff > 1e-9 and bs.longs:
@@ -525,7 +527,7 @@ class MinerAgent_V7(FinanceAgent):
                 if lot.qty <= 1e-9:
                     bs.longs.popleft()
             if diff > 1e-9:
-                bs.shorts.append(_Lot(basis, diff, 0.0, ts, synthetic=True))
+                bs.shorts.appendleft(_Lot(basis, diff, 0.0, ts, synthetic=True))
 
     # ---- main -------------------------------------------------------------- #
     def respond(self, state):
@@ -636,6 +638,40 @@ class MinerAgent_V7(FinanceAgent):
             unk = head.price * self.unknown_margin_bps * 1e-4 if head.synthetic else 0.0
             cap_bid = head.price - unk - (head.fee / head.qty if head.qty > 0 else 0.0) - maker_fee_px - exit_edge
             bid_px = min(bid_px, self._round_down(cap_bid, tick))
+
+        # Unknown-cost inventory under water: ANY sell would close the validator's oldest
+        # (dearest) lot at a loss, and new entries would queue behind it. Quote nothing on
+        # this book until the market clears the implied basis plus the unknown-cost margin.
+        blocked = False
+        syn_long = [l for l in bs.longs if l.synthetic]
+        syn_short = [l for l in bs.shorts if l.synthetic]
+        if syn_long and mid < max(l.price for l in syn_long) * (1 + self.unknown_margin_bps * 1e-4):
+            blocked = True
+        if syn_short and mid > min(l.price for l in syn_short) * (1 - self.unknown_margin_bps * 1e-4):
+            blocked = True
+        # same test straight from the account: net position and the average price it cost
+        bb = _attr(account, "base_balance", "bb", default=None)
+        qb = _attr(account, "quote_balance", "qb", default=None)
+        if bb is not None and qb is not None:
+            b_tot = _f(_attr(bb, "total", "t", default=float("nan")), float("nan")); b_ini = _f(_attr(bb, "initial", "i", default=float("nan")), float("nan"))
+            q_tot = _f(_attr(qb, "total", "t", default=float("nan")), float("nan")); q_ini = _f(_attr(qb, "initial", "i", default=float("nan")), float("nan"))
+            if all(x == x for x in (b_tot, b_ini, q_tot, q_ini)):
+                net = b_tot - b_ini
+                if abs(net) > 0.5 * size:
+                    implied = (q_ini - q_tot) / net
+                    if 0.3 * mid < implied < 3.0 * mid:
+                        if net > 0 and mid < implied * (1 + self.unknown_margin_bps * 1e-4):
+                            blocked = True
+                        if net < 0 and mid > implied * (1 - self.unknown_margin_bps * 1e-4):
+                            blocked = True
+        if blocked:
+            bs.frozen_since = bs.frozen_since or ts
+            my_orders = _attr(account, "orders", "o", default=[]) or []
+            ids = [oid for oid in (_attr(o, "id", "i", default=None) for o in my_orders) if oid is not None]
+            if ids:
+                response.cancel_orders(book_id, ids)
+            bs.last_bid, bs.last_ask = None, None
+            return
 
         # gating: inventory cap and the rolling 24 h notional budget, paced linearly
         # through the simulation day so the cap is never exhausted early
