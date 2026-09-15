@@ -281,6 +281,7 @@ class MinerAgent_V7(FinanceAgent):
         self.diag_side_mismatch = 0
         self.diag_rebase = 0
         self.diag_dup_fills = 0
+        self.diag_event_fills = 0
         self._seen_tids = set()
         self._seen_order = deque()
         self.reconcile = self._p("reconcile", 1)
@@ -395,49 +396,72 @@ class MinerAgent_V7(FinanceAgent):
             b = _attr(ev, "bookId", "b", default=None)
             if b is None:
                 continue
-            # the validator may re-deliver a fill notice in consecutive states: dedupe by trade id
             tid = _attr(ev, "tradeId", "i", default=None)
-            if tid is not None:
-                key = (b, int(tid))
-                if key in self._seen_tids:
-                    self.diag_dup_fills += 1
-                    continue
-                self._seen_tids.add(key)
-                self._seen_order.append(key)
-                if len(self._seen_order) > 200_000:
-                    old = self._seen_order.popleft()
-                    self._seen_tids.discard(old)
             taker = _attr(ev, "takerAgentId", "Ta", default=-1)
             maker = _attr(ev, "makerAgentId", "Ma", default=-1)
-            is_taker = taker == self.uid
-            is_maker = maker == self.uid
-            if not (is_taker or is_maker):
-                continue
-            side = int(_attr(ev, "side", "s", default=0))
-            # validator convention: side is the taker's direction, 0 = buy
-            is_buy = (is_taker and side == 0) or (is_maker and side == 1)
-            price = _f(_attr(ev, "price", "p", default=0.0))
-            qty = _f(_attr(ev, "quantity", "q", default=0.0))
-            fee = _f(_attr(ev, "takerFee", "Tf", default=0.0) if is_taker else _attr(ev, "makerFee", "Mf", default=0.0))
-            ets = int(_attr(ev, "timestamp", "t", default=ts) or ts)
-            if qty <= 0 or price <= 0:
+            if taker != self.uid and maker != self.uid:
                 continue
             bs = books.get(b)
             if bs is None:
                 bs = books[b] = _BookState()
-            # diagnostics: does the wire side agree with which of my quotes the fill price is nearest?
-            if bs.last_bid is not None and bs.last_ask is not None:
-                nearest_is_bid = abs(price - bs.last_bid) < abs(price - bs.last_ask)
-                self.diag_fills += 1
-                if nearest_is_bid != is_buy:
-                    self.diag_side_mismatch += 1
-                    if self.diag_side_mismatch <= 5:
-                        bt.logging.warning(f"V7 side-check: book {b} price {price} side={side} taker={is_taker} maker={is_maker} "
-                                           f"is_buy={is_buy} but nearest quote is {'bid' if nearest_is_bid else 'ask'} "
-                                           f"(bid {bs.last_bid} ask {bs.last_ask})")
-            bs.apply_fill(is_buy, qty, price, fee, ets)
-            bs.add_volume(ets, qty * price)
+            ets = int(_attr(ev, "timestamp", "t", default=ts) or ts)
+            self._apply_trade(bs, b, tid, taker, maker, _attr(ev, "side", "s", default=0),
+                              _f(_attr(ev, "price", "p", default=0.0)), _f(_attr(ev, "quantity", "q", default=0.0)),
+                              _attr(ev, "takerFee", "Tf", default=0.0), _attr(ev, "makerFee", "Mf", default=0.0), ets)
         return restarted
+
+    def _apply_trade(self, bs, b, tid, taker, maker, side, price, qty, fee_taker, fee_maker, ets):
+        """Apply one trade (from a notice or a book event) to the ledger, deduped by trade id."""
+        is_taker = taker == self.uid
+        is_maker = maker == self.uid
+        if not (is_taker or is_maker):
+            return False
+        if tid is not None:
+            key = (b, int(tid))
+            if key in self._seen_tids:
+                self.diag_dup_fills += 1
+                return False
+            self._seen_tids.add(key)
+            self._seen_order.append(key)
+            if len(self._seen_order) > 200_000:
+                old = self._seen_order.popleft()
+                self._seen_tids.discard(old)
+        side = int(side)
+        is_buy = (is_taker and side == 0) or (is_maker and side == 1)
+        fee = _f(fee_taker if is_taker else fee_maker)
+        if qty <= 0 or price <= 0:
+            return False
+        if bs.last_bid is not None and bs.last_ask is not None:
+            nearest_is_bid = abs(price - bs.last_bid) < abs(price - bs.last_ask)
+            self.diag_fills += 1
+            if nearest_is_bid != is_buy:
+                self.diag_side_mismatch += 1
+        bs.apply_fill(is_buy, qty, price, fee, ets)
+        bs.add_volume(ets, qty * price)
+        return True
+
+    def _fills_from_book_events(self, bs, book_id, book, ts):
+        """The book's L3 event list carries every trade with both agent ids: a complete
+        record of my fills even when a notice is missing."""
+        events = _attr(book, "events", "e", default=None)
+        if not events:
+            return
+        for ev in events:
+            y = _attr(ev, "y", "type", default=None)
+            if y not in ("t", "trade"):
+                # TradeInfo has taker/maker ids; orders and cancellations do not
+                if _attr(ev, "Ta", "taker_agent_id", default=None) is None:
+                    continue
+            taker = _attr(ev, "Ta", "taker_agent_id", default=-1)
+            maker = _attr(ev, "Ma", "maker_agent_id", default=-1)
+            if taker != self.uid and maker != self.uid:
+                continue
+            tid = _attr(ev, "i", "id", default=None)
+            ets = int(_attr(ev, "t", "timestamp", default=ts) or ts)
+            if self._apply_trade(bs, book_id, tid, taker, maker, _attr(ev, "s", "side", default=0),
+                                 _f(_attr(ev, "p", "price", default=0.0)), _f(_attr(ev, "q", "quantity", default=0.0)),
+                                 _attr(ev, "Tf", "taker_fee", default=0.0), _attr(ev, "Mf", "maker_fee", default=0.0), ets):
+                self.diag_event_fills += 1
 
     def _reconcile_inventory(self, bs, account, book_id, mid, ts):
         """The account on every state update is the authority. If the FIFO ledger's net
@@ -548,6 +572,7 @@ class MinerAgent_V7(FinanceAgent):
         if bs is None:
             bs = books[book_id] = _BookState()
 
+        self._fills_from_book_events(bs, book_id, book, ts)
         if self.reconcile:
             self._reconcile_inventory(bs, account, book_id, mid, ts)
 
@@ -724,7 +749,7 @@ class MinerAgent_V7(FinanceAgent):
             f"V7 [{vh[:8]}] t={ts // 1_000_000_000}s books={n} scored>=3:{active} frozen={frozen} "
             f"fills={fills} wins={wins} losses={losses} realized={realized:.4f} "
             f"|inv|={inv_abs:.2f} vol24h={vol:,.0f} rejects={rejects} "
-            f"side_mismatch={self.diag_side_mismatch}/{self.diag_fills} rebases={self.diag_rebase} dup_fills={self.diag_dup_fills}"
+            f"side_mismatch={self.diag_side_mismatch}/{self.diag_fills} rebases={self.diag_rebase} dup_fills={self.diag_dup_fills} event_only_fills={self.diag_event_fills}"
         )
 
 
