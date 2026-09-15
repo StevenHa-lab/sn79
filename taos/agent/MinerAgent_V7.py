@@ -441,16 +441,27 @@ class MinerAgent_V7(FinanceAgent):
         if abs(diff) <= 1.5 * self.size:
             return
         self.diag_rebase += 1
+        # Cost basis for the synthetic lot: the average price implied by the account's own
+        # net quote/base movement (what the validator's FIFO is holding, on average), not the
+        # current mid -- rebasing at mid made exits realise the OLD lots' losses on 2026-09-15.
+        qb = _attr(account, "quote_balance", "qb", default=None)
+        q_total = _f(_attr(qb, "total", "t", default=float("nan")), float("nan")) if qb is not None else float("nan")
+        q_init = _f(_attr(qb, "initial", "i", default=float("nan")), float("nan")) if qb is not None else float("nan")
+        basis = mid
+        if q_total == q_total and q_init == q_init and abs(acct_inv) > 1e-9:
+            implied = (q_init - q_total) / acct_inv          # quote spent per unit of net base held
+            if 0.3 * mid < implied < 3.0 * mid:
+                basis = implied
         if self.diag_rebase <= 5 or self.diag_rebase % 200 == 0:
             bt.logging.warning(f"V7 rebase: book {book_id} ledger inv {ledger_inv:+.2f} vs account {acct_inv:+.2f} "
-                               f"(total {total:.2f} initial {init:.2f}); rebasing by {diff:+.2f} at mid {mid:.2f}")
+                               f"(total {total:.2f} initial {init:.2f}); rebasing by {diff:+.2f} at basis {basis:.2f} (mid {mid:.2f})")
         if diff > 0:
             while diff > 1e-9 and bs.shorts:
                 lot = bs.shorts[0]; take = min(diff, lot.qty); lot.qty -= take; diff -= take
                 if lot.qty <= 1e-9:
                     bs.shorts.popleft()
             if diff > 1e-9:
-                bs.longs.append(_Lot(mid, diff, 0.0, ts))
+                bs.longs.append(_Lot(basis, diff, 0.0, ts))
         else:
             diff = -diff
             while diff > 1e-9 and bs.longs:
@@ -458,7 +469,7 @@ class MinerAgent_V7(FinanceAgent):
                 if lot.qty <= 1e-9:
                     bs.longs.popleft()
             if diff > 1e-9:
-                bs.shorts.append(_Lot(mid, diff, 0.0, ts))
+                bs.shorts.append(_Lot(basis, diff, 0.0, ts))
 
     # ---- main -------------------------------------------------------------- #
     def respond(self, state):
@@ -660,11 +671,12 @@ class MinerAgent_V7(FinanceAgent):
             response.cancel_orders(book_id, to_cancel)
         if cut is not None:
             # one small IOC lot at the touch: realises a small, bounded loss on the FIFO head
+            cut_qty = round(max(min(size, 0.25), 10.0 ** (-vol_dec)), vol_dec)   # always the smallest lot
             if cut == "sell":
-                response.limit_order(book_id=book_id, direction=OrderDirection.SELL, quantity=size,
+                response.limit_order(book_id=book_id, direction=OrderDirection.SELL, quantity=cut_qty,
                                      price=round(best_bid, price_dec), timeInForce=TimeInForce.IOC)
             else:
-                response.limit_order(book_id=book_id, direction=OrderDirection.BUY, quantity=size,
+                response.limit_order(book_id=book_id, direction=OrderDirection.BUY, quantity=cut_qty,
                                      price=round(best_ask, price_dec), timeInForce=TimeInForce.IOC)
             bs.last_cut_ts = ts
         if want_bid and not have_bid:
