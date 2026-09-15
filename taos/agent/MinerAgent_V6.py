@@ -36,6 +36,11 @@ All parameters can be overridden with ``--agent.params key=value ...``:
                   linear daily pace (0.05 = 5%)                  (default 0.05)
   max_resting     hard cap on my resting orders per book         (default 6)
   log_every       ticks between summary log lines                (default 30)
+  save_every      ticks between state snapshots to disk          (default 60, 0 = off)
+
+State (open lots, rolling volume in 5-minute buckets, last timestamp per validator) is
+persisted to agent_state/v6_state_<uid>.json from a background thread and reloaded on start,
+so a process restart neither loses the cost basis of open lots nor under-counts the cap.
 
 Pacing: the validator's cap is a rolling 24 h window per book that survives the daily
 simulation restart, so the agent keeps its per-book volume history across restarts and only
@@ -43,7 +48,10 @@ quotes new entries while the rolling notional is below cap_frac * cap * (day_pro
 pace_headroom).  Exits (quotes that reduce inventory) are always allowed.
 """
 
+import json
 import math
+import os
+import threading
 from collections import deque
 
 import bittensor as bt
@@ -52,6 +60,7 @@ from taos.im.agents import FinanceAgent
 from taos.im.protocol.response import OrderDirection, TimeInForce
 
 DAY_NS = 86_400_000_000_000
+VOL_BUCKET_NS = 300_000_000_000      # rolling-volume resolution (5 sim-minutes)
 
 
 # --------------------------------------------------------------------------- #
@@ -147,9 +156,31 @@ class _BookState:
         return pnl
 
     def add_volume(self, ts, notional):
-        self.vol.append((ts, notional))
+        b = (ts // VOL_BUCKET_NS) * VOL_BUCKET_NS
+        if self.vol and self.vol[-1][0] == b:
+            self.vol[-1] = (b, self.vol[-1][1] + notional)
+        else:
+            self.vol.append((b, notional))
         self.vol_sum += notional
         self._trim(ts)
+
+    # -- persistence ---------------------------------------------------------- #
+    def to_json(self):
+        return {"L": [[l.price, l.qty, l.fee, l.ts] for l in self.longs],
+                "S": [[l.price, l.qty, l.fee, l.ts] for l in self.shorts],
+                "V": list(self.vol),
+                "st": [self.realized, self.wins, self.losses, self.n_fills, self.rejects]}
+
+    @classmethod
+    def from_json(cls, d):
+        bs = cls()
+        bs.longs = deque(_Lot(*x) for x in d.get("L", []))
+        bs.shorts = deque(_Lot(*x) for x in d.get("S", []))
+        bs.vol = deque((int(t), float(n)) for t, n in d.get("V", []))
+        bs.vol_sum = sum(n for _, n in bs.vol)
+        st = d.get("st") or [0.0, 0, 0, 0, 0]
+        bs.realized, bs.wins, bs.losses, bs.n_fills, bs.rejects = st
+        return bs
 
     def volume_24h(self, ts):
         self._trim(ts)
@@ -194,11 +225,59 @@ class MinerAgent_V6(FinanceAgent):
         self.pace_headroom = self._p("pace_headroom", 0.05)
         self.max_resting = self._p("max_resting", 6)
         self.log_every = self._p("log_every", 30)
+        self.save_every = self._p("save_every", 60)
 
         # per validator hotkey -> {book_id: _BookState}
         self.state_by_validator = {}
         self.last_ts = {}
         self.ticks = 0
+        self._save_lock = threading.Lock()
+        self._load_state()
+
+    # ---- persistence ------------------------------------------------------- #
+    def _state_path(self):
+        os.makedirs("agent_state", exist_ok=True)
+        return f"agent_state/v6_state_{self.uid}.json"
+
+    def _load_state(self):
+        path = self._state_path()
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            for vh, books in data.get("books", {}).items():
+                self.state_by_validator[vh] = {int(b): _BookState.from_json(d) for b, d in books.items()}
+            self.last_ts = {vh: int(t) for vh, t in data.get("last_ts", {}).items()}
+            n = sum(len(b) for b in self.state_by_validator.values())
+            bt.logging.info(f"V6: restored state for {len(self.state_by_validator)} validator(s), {n} books from {path}")
+        except Exception as e:
+            bt.logging.warning(f"V6: could not restore state from {path}: {e!r}; starting fresh")
+            self.state_by_validator, self.last_ts = {}, {}
+
+    def _save_state_async(self):
+        # snapshot on the request thread (cheap), serialise + write on a helper thread
+        data = {"books": {vh: {str(b): bs.to_json() for b, bs in books.items()}
+                          for vh, books in self.state_by_validator.items()},
+                "last_ts": dict(self.last_ts)}
+        path = self._state_path()
+
+        def _write():
+            if not self._save_lock.acquire(blocking=False):
+                return
+            try:
+                tmp = path + ".tmp"
+                with open(tmp, "w") as f:
+                    json.dump(data, f)
+                os.replace(tmp, path)
+            except Exception as e:
+                bt.logging.warning(f"V6: state save failed: {e!r}")
+            finally:
+                self._save_lock.release()
+
+        t = threading.Thread(target=_write, daemon=True)
+        t.start()
+        return t
 
     # ---- lean per-tick plumbing (bypass the base class debug rendering) ---- #
     def update(self, state):
@@ -327,6 +406,8 @@ class MinerAgent_V6(FinanceAgent):
 
         if self.log_every and self.ticks % self.log_every == 0:
             self._log_summary(vh, books, ts)
+        if self.save_every and self.ticks % self.save_every == 0:
+            self._save_state_async()
         return response
 
     def _quote_book(self, response, book_id, book, account, books, ts,
