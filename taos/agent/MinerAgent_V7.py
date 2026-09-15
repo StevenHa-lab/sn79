@@ -277,6 +277,10 @@ class MinerAgent_V7(FinanceAgent):
         self.last_ts = {}
         self.ticks = 0
         self._save_lock = threading.Lock()
+        self.diag_fills = 0
+        self.diag_side_mismatch = 0
+        self.diag_rebase = 0
+        self.reconcile = self._p("reconcile", 1)
         self._load_state()
 
     # ---- persistence ------------------------------------------------------- #
@@ -406,9 +410,55 @@ class MinerAgent_V7(FinanceAgent):
             bs = books.get(b)
             if bs is None:
                 bs = books[b] = _BookState()
+            # diagnostics: does the wire side agree with which of my quotes the fill price is nearest?
+            if bs.last_bid is not None and bs.last_ask is not None:
+                nearest_is_bid = abs(price - bs.last_bid) < abs(price - bs.last_ask)
+                self.diag_fills += 1
+                if nearest_is_bid != is_buy:
+                    self.diag_side_mismatch += 1
+                    if self.diag_side_mismatch <= 5:
+                        bt.logging.warning(f"V7 side-check: book {b} price {price} side={side} taker={is_taker} maker={is_maker} "
+                                           f"is_buy={is_buy} but nearest quote is {'bid' if nearest_is_bid else 'ask'} "
+                                           f"(bid {bs.last_bid} ask {bs.last_ask})")
             bs.apply_fill(is_buy, qty, price, fee, ets)
             bs.add_volume(ets, qty * price)
         return restarted
+
+    def _reconcile_inventory(self, bs, account, book_id, mid, ts):
+        """The account on every state update is the authority. If the FIFO ledger's net
+        inventory drifts from (base total - base initial) by more than one lot, rebase the
+        ledger with a synthetic lot at the current mid so the caps bind on REAL inventory."""
+        bb = _attr(account, "base_balance", "bb", default=None)
+        if bb is None:
+            return
+        total = _f(_attr(bb, "total", "t", default=float("nan")), float("nan"))
+        init = _f(_attr(bb, "initial", "i", default=float("nan")), float("nan"))
+        if not (total == total and init == init):
+            return
+        acct_inv = total - init
+        ledger_inv = bs.inventory()
+        diff = acct_inv - ledger_inv
+        if abs(diff) <= 1.5 * self.size:
+            return
+        self.diag_rebase += 1
+        if self.diag_rebase <= 5 or self.diag_rebase % 200 == 0:
+            bt.logging.warning(f"V7 rebase: book {book_id} ledger inv {ledger_inv:+.2f} vs account {acct_inv:+.2f} "
+                               f"(total {total:.2f} initial {init:.2f}); rebasing by {diff:+.2f} at mid {mid:.2f}")
+        if diff > 0:
+            while diff > 1e-9 and bs.shorts:
+                lot = bs.shorts[0]; take = min(diff, lot.qty); lot.qty -= take; diff -= take
+                if lot.qty <= 1e-9:
+                    bs.shorts.popleft()
+            if diff > 1e-9:
+                bs.longs.append(_Lot(mid, diff, 0.0, ts))
+        else:
+            diff = -diff
+            while diff > 1e-9 and bs.longs:
+                lot = bs.longs[0]; take = min(diff, lot.qty); lot.qty -= take; diff -= take
+                if lot.qty <= 1e-9:
+                    bs.longs.popleft()
+            if diff > 1e-9:
+                bs.shorts.append(_Lot(mid, diff, 0.0, ts))
 
     # ---- main -------------------------------------------------------------- #
     def respond(self, state):
@@ -471,6 +521,9 @@ class MinerAgent_V7(FinanceAgent):
         bs = books.get(book_id)
         if bs is None:
             bs = books[book_id] = _BookState()
+
+        if self.reconcile:
+            self._reconcile_inventory(bs, account, book_id, mid, ts)
 
         maker_rate, taker_rate = self._fees(account)
         # signed when rebate_aware: a negative maker rate (rebate) lowers the exit floor
@@ -643,7 +696,8 @@ class MinerAgent_V7(FinanceAgent):
         bt.logging.info(
             f"V7 [{vh[:8]}] t={ts // 1_000_000_000}s books={n} scored>=3:{active} frozen={frozen} "
             f"fills={fills} wins={wins} losses={losses} realized={realized:.4f} "
-            f"|inv|={inv_abs:.2f} vol24h={vol:,.0f} rejects={rejects}"
+            f"|inv|={inv_abs:.2f} vol24h={vol:,.0f} rejects={rejects} "
+            f"side_mismatch={self.diag_side_mismatch}/{self.diag_fills} rebases={self.diag_rebase}"
         )
 
 
